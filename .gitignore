@@ -1,0 +1,44 @@
+HELP.md
+target/
+bin
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**
+!**/src/test/**
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+.vscode
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+
+### VS Code ###
+.vscode/
+.cx-index.db
+
+### macOS ###
+.DS_Store
+
+### Temporary archives ###
+*.tar.gz
+
+### Local worktrees ###
+.worktrees/
+.pi-subagents/
