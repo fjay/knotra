@@ -1,8 +1,25 @@
 # 新 JAR 已经加载，旧路由为什么还在运行：用 Knotra 改造动态物流路由系统
 
-分拨中心还在进件，上海仓的承运商路由插件要从 v1 换到 v2。把新 JAR 加载进 JVM 只解决代码装载；旧消费者何时停止、在途任务由谁等待、HTTP 连接和订阅何时释放、失败后哪个版本可见，仍需要一套明确的运行时语义。本文用一个示例物流系统说明 Knotra 适合解决什么，并写出从能力声明、仓库级覆盖到插件排空卸载的完整路径。
+包裹处理进程还在运行，上海站的路由规则插件要从 v1 换到 v2。把新 JAR 加载进 JVM 只解决代码装载；旧消费者何时停止、在途任务由谁等待、HTTP 连接和订阅何时释放、失败后哪个版本可见，仍需要一套明确的运行时语义。本文用一个示例物流系统说明 Knotra 适合解决什么，并写出从能力声明、仓库级覆盖到插件排空卸载的完整路径。
 
 > 文中的物流系统用于解释设计，不对应某个线上项目。Knotra API 与行为以当前仓库的 `0.1.0-SNAPSHOT` 为准；文中不虚构吞吐量、延迟或生产运行结论。
+
+## 先把物流业务说清楚
+
+这个示例系统可以理解成“快递中转站的自动分拣程序”。它不搬运实体包裹，而是持续处理一条条包裹任务记录：任务进入队列后，程序判断包裹下一步交给哪家承运商、走什么配送服务，然后把决策写回任务记录。
+
+- **包裹（Parcel）**：一条待处理的快递任务记录，至少包含目的地和包裹属性。
+- **分拨中心（distribution center）**：快递网络里的中转场地；包裹在这里按目的地和承运商分流。
+- **仓库（warehouse）**：案例中的一个站点或租户，例如上海站、深圳站；不同站点可以使用不同路由规则。
+- **承运商（carrier）**：负责运输和配送的公司，例如案例里的 `CarrierClient` 表示调用承运商规则服务的 HTTP 客户端。
+- **路由（routing / `RoutePlanner`）**：决定“这个包裹交给谁送、走哪种服务”的规则引擎；这正是案例中会动态替换的组件。
+- **包裹队列（`ParcelInbox`）**：存放待处理包裹任务的消息队列入口；任务没有被确认前不会被丢弃。
+- **任务消费者（`ParcelDispatcher`）**：后台处理程序，从队列取任务，调用当前路由规则，并确认处理结果。
+- **v1 / v2 插件**：两版上海路由规则实现的 JAR 包；升级时要保证旧任务收尾、新任务使用新规则。
+
+后文的 Knotra 术语也按这个业务理解：`Capability` 是“路由规则、队列入口”这类可被发现的服务合约；`Context` 是“全国默认规则、上海本地规则”的可见范围；`Activation` 是组件按某一版规则的一次运行；`drain` 是停止前把已经接下的任务处理完。
+
+代码里还有几个角色名：provider 是服务提供方，本例中的 `RoutePlanner` 实现就是 provider；consumer 是服务消费方，本例中的 `ParcelDispatcher` 就是 consumer；artifact 是独立发布的 JAR；handle 是稳定挂载句柄；registration 是一次能力注册；BindingSet 是组件启动时固定下来的依赖绑定集合。
 
 ## 加载器不知道谁还拿着旧对象
 
@@ -11,7 +28,9 @@
 最常见的注册表实现只做两件事：替换当前对象，再关闭旧对象。
 
 ```java
+// 只替换注册表里的当前值；已经保存 oldPlanner 的消费者不会自动换到新对象。
 RoutePlanner oldPlanner = registry.put("route-planner", plannerV2);
+// 立即关闭会打断仍在 oldPlanner 上执行的请求；不关闭又会延迟释放旧资源。
 oldPlanner.close();
 ```
 
@@ -33,25 +52,26 @@ oldPlanner.close();
 
 ```mermaid
 flowchart TB
-    V1["PF4J artifact<br/>上海路由 v1"]
+    V1["PF4J artifact：上海路由规则插件 v1<br/>独立发布的 JAR"]
 
-    subgraph ROOT["Root Context"]
-        INBOX["ParcelInbox<br/>持久队列入口"]
-        DEFAULT["RoutePlanner<br/>全国默认实现"]
+    subgraph ROOT["Root Context：全国默认规则范围"]
+        INBOX["ParcelInbox<br/>包裹任务队列入口"]
+        DEFAULT["RoutePlanner<br/>全国默认路由规则引擎"]
     end
 
-    subgraph SH["warehouse-shanghai Context"]
-        LOCAL["RoutePlanner<br/>上海专用实现"]
-        SH_DISPATCHER["ParcelDispatcher<br/>上海任务消费方"]
+    subgraph SH["warehouse-shanghai Context：上海站点范围"]
+        LOCAL["RoutePlanner<br/>上海本地路由规则引擎"]
+        SH_DISPATCHER["ParcelDispatcher<br/>上海任务消费者"]
     end
 
-    subgraph SZ["warehouse-shenzhen Context"]
-        SZ_DISPATCHER["ParcelDispatcher<br/>深圳任务消费方"]
+    subgraph SZ["warehouse-shenzhen Context：深圳站点范围"]
+        SZ_DISPATCHER["ParcelDispatcher<br/>深圳任务消费者"]
     end
 
     V1 --> LOCAL
-    LOCAL -->|遮蔽父级能力| SH_DISPATCHER
-    DEFAULT -->|父级能力| SZ_DISPATCHER
+    LOCAL -->|遮蔽全国默认规则| SH_DISPATCHER
+    DEFAULT -->|上海本地规则不存在时继承| SH_DISPATCHER
+    DEFAULT -->|父级默认规则| SZ_DISPATCHER
     INBOX --> SH_DISPATCHER
     INBOX --> SZ_DISPATCHER
 ```
@@ -79,7 +99,12 @@ package com.acme.logistics.contract;
 
 import java.util.concurrent.CompletionStage;
 
+/**
+ * 路由规则引擎：输入一条包裹记录，输出“交给哪家承运商、走哪种配送服务”。
+ * 宿主和插件必须加载共享包中的同一个 JVM Class。
+ */
 public interface RoutePlanner {
+    /** 对一个包裹做一次路由决策；stage 完成表示决策结果已产生。 */
     CompletionStage<Route> plan(Parcel parcel);
 }
 
@@ -89,6 +114,7 @@ package com.acme.logistics.contract;
 import java.net.URI;
 import java.time.Duration;
 
+/** 路由组件挂载配置：endpoint 是承运商规则服务地址，timeout 是单次决策超时。 */
 public record RouterConfig(URI endpoint, Duration timeout) {}
 
 // ParcelInbox.java
@@ -97,19 +123,27 @@ package com.acme.logistics.contract;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Function;
 
+/** 包裹任务队列入口；实现由宿主提供，Knotra 只把它当作一个 Capability 传递。 */
 public interface ParcelInbox extends AutoCloseable {
+    /**
+     * 为指定站点注册处理函数。队列每取出一条包裹任务就调用一次 handler；
+     * 已交给 handler 但未 complete 的消息由队列重新投递。
+     */
     ParcelSubscription consume(
             String warehouseId,
             Function<ParcelDelivery, CompletionStage<Void>> handler);
 }
 
+/** 关闭订阅前已经接受的任务完成后，closeAsync 才会完成。 */
 public interface ParcelSubscription {
     CompletionStage<Void> closeAsync();
 }
 
+/** 一条已经从队列取出、等待业务确认的包裹任务。 */
 public interface ParcelDelivery {
     Parcel parcel();
 
+    /** 把路由决策写回任务记录；complete 成功后队列才会移除这条消息。 */
     CompletionStage<Void> complete(Route route);
 }
 
@@ -119,9 +153,11 @@ package com.acme.logistics.contract;
 import io.knotra.CapabilityKey;
 
 public final class LogisticsCapabilities {
+    /** 名称加精确 RoutePlanner Class 共同构成路由能力身份。 */
     public static final CapabilityKey<RoutePlanner> ROUTE_PLANNER =
             CapabilityKey.of("logistics.route-planner", RoutePlanner.class);
 
+    /** 消费方通过同一个 key 找到宿主提供的持久队列入口。 */
     public static final CapabilityKey<ParcelInbox> PARCEL_INBOX =
             CapabilityKey.of("logistics.parcel-inbox", ParcelInbox.class);
 
@@ -134,8 +170,7 @@ public final class LogisticsCapabilities {
 `RoutePlanner`、`RouterConfig` 或 `ParcelInbox` 若由插件自己的 `ClassLoader` 私下加载，即使类名相同，也不是同一个 JVM 类型。`knotra-pf4j` 会拒绝这类跨 artifact 合约，避免插件私有类型进入 Runtime 的全局类型表。
 
 ## 第二步：让路由组件原子发布能力
-
-路由组件在 `start()` 中创建 HTTP 客户端和规则刷新线程，并把它们登记到当前 Activation 的 `LifecycleScope`。以下为组件节选；`CarrierClient` 与 `HttpRoutePlanner` 是案例业务类型，Knotra 调用均来自公开 API。
+这一步实现“路由规则引擎”这个 provider。它在 `start()` 中创建调用承运商规则服务的 HTTP 客户端和规则刷新线程，并把它们登记到当前 Activation 的 `LifecycleScope`。以下为组件节选；`CarrierClient` 与 `HttpRoutePlanner` 是案例业务类型，Knotra 调用均来自公开 API。
 
 ```java
 package com.acme.logistics.router;
@@ -155,6 +190,7 @@ import java.util.concurrent.ScheduledExecutorService;
 public final class RoutePlannerFactory implements ComponentFactory<RouterConfig> {
     @Override
     public String factoryId() {
+        // factoryId 表示实现来源；同一个 handle 重新激活时它不变。
         return "regional-route-planner";
     }
 
@@ -163,21 +199,28 @@ public final class RoutePlannerFactory implements ComponentFactory<RouterConfig>
         return new Component<>() {
             @Override
             public ComponentDescriptor descriptor() {
+                // 这个组件只发布能力，不消费其他 Capability。
                 return ComponentDescriptor.of("regional-route-planner");
             }
 
             @Override
             public void start(ActivationContext context, RouterConfig config)
                     throws Exception {
+                // ActivationContext 只在本次 start 内有效，不能保存到字段。
+                // CarrierClient：调用承运商规则服务的 HTTP 客户端。
+                // manage 登记资源并返回原对象；Activation 释放时会调用 close()。
                 CarrierClient client = context.lifecycle().manage(
                         "carrier-http-client",
                         CarrierClient.open(config.endpoint(), config.timeout()));
 
+                // 后登记的 refresher 会先释放，避免规则刷新继续使用已关闭客户端。
                 ScheduledExecutorService refresher = context.lifecycle().manage(
                         "rule-refresh-executor",
                         Executors.newSingleThreadScheduledExecutor());
 
+                // HttpRoutePlanner：具体的路由规则引擎，用客户端查询规则并做包裹决策。
                 RoutePlanner planner = new HttpRoutePlanner(client, refresher);
+                // 把这代路由规则引擎暂存发布；start 失败或启动依据过期时，其他组件看不到它。
                 context.provide(ROUTE_PLANNER, planner);
             }
         };
@@ -185,6 +228,7 @@ public final class RoutePlannerFactory implements ComponentFactory<RouterConfig>
 
     @Override
     public Optional<ConfigSchema<RouterConfig>> configSchema() {
+        // mount 和 reconfigure 都会先经过这段归一化，坏配置不会进入 start()。
         return Optional.of(raw -> {
             if (!(raw instanceof RouterConfig config)) {
                 throw new IllegalArgumentException("RouterConfig is required");
@@ -211,7 +255,7 @@ public final class RoutePlannerFactory implements ComponentFactory<RouterConfig>
 
 ## 第三步：让消费方声明自己绑定了谁
 
-`ParcelDispatcher` 同时依赖路由能力和持久队列入口。用途明确的 descriptor 让 Runtime 能计算 provider 变化会影响哪些组件。
+`ParcelDispatcher` 是包裹任务消费者：它从队列取任务，调用当前 `RoutePlanner` 得出承运商和配送服务，然后确认队列消息。descriptor 里声明依赖，Runtime 才能知道路由规则换代时哪些消费者需要退出并重新启动。
 
 ```java
 package com.acme.logistics.dispatcher;
@@ -241,6 +285,8 @@ public final class ParcelDispatcherFactory implements ComponentFactory<NoConfig>
         return new Component<>() {
             @Override
             public ComponentDescriptor descriptor() {
+                // 声明出的两个 REQUIRED 依赖会进入固定 BindingSet；
+                // 任一绑定的 registration id 变化都会触发本组件重新激活。
                 return ComponentDescriptor.of(
                         "parcel-dispatcher",
                         CapabilityRequirement.required(ROUTE_PLANNER),
@@ -249,15 +295,20 @@ public final class ParcelDispatcherFactory implements ComponentFactory<NoConfig>
 
             @Override
             public void start(ActivationContext context, NoConfig config) {
+                // planner 是本代路由规则引擎；require 读取启动时捕获的绑定，不做最新查询。
                 RoutePlanner planner = context.require(ROUTE_PLANNER);
                 ParcelInbox inbox = context.require(PARCEL_INBOX);
+                // warehouseId 是站点标识；上海 Context 下的 Dispatcher 只消费上海队列分区。
                 String warehouseId = context.contextInfo().name();
 
+                // plan 为包裹选择承运商和配送服务；complete 写回结果并确认队列消息。
+                // 回调捕获的是本代 planner，provider 换代后旧回调随旧 Activation 退出。
                 ParcelSubscription subscription = inbox.consume(
                         warehouseId,
                         delivery -> planner.plan(delivery.parcel())
                                 .thenCompose(delivery::complete));
 
+                // 订阅交给 LifecycleScope 后，provider 替换或插件卸载会等待已接受任务。
                 context.lifecycle().manageAsync(
                         "parcel-inbox-subscription",
                         subscription::closeAsync);
@@ -273,9 +324,10 @@ public final class ParcelDispatcherFactory implements ComponentFactory<NoConfig>
 
 ## 第四步：一次事务创建仓库结构
 
-先用 classpath 中的工厂创建拓扑，便于看清 Core API。以下为宿主方法内的节选，import、配置构造器和 `openDurableInbox()` 省略。宿主拥有 `ParcelInbox` 的物理连接，所以资源声明顺序让 Runtime 先关闭，队列连接后关闭。
+下面把业务结构搭出来：Root 放全国默认路由规则，上海和深圳各建一个站点 Context；上海额外挂本地规则，用来覆盖默认规则。先用 classpath 中的工厂创建拓扑，便于看清 Core API。以下为宿主方法内的节选，import、配置构造器和 `openDurableInbox()` 省略。宿主拥有 `ParcelInbox` 的物理连接，所以资源声明顺序让 Runtime 先关闭，队列连接后关闭。
 
 ```java
+// 汇总本示例需要长期观察的 Context 与 ComponentHandle。
 record Topology(
         ContextHandle shanghai,
         ContextHandle shenzhen,
@@ -284,28 +336,36 @@ record Topology(
         ComponentHandle<NoConfig> shanghaiDispatcher,
         ComponentHandle<NoConfig> shenzhenDispatcher) {}
 
+// try-with-resources 按声明逆序关闭：先收敛 Runtime，再关闭队列连接。
 try (ParcelInbox inbox = openDurableInbox();
      KnotraRuntime runtime = KnotraRuntime.create()) {
 
+    // mutate 内的所有 provide/context/mount 是一组 intents；任一校验失败都整体拒绝。
     MutationResult<Topology> created = runtime.mutate(tx -> {
         ContextHandle root = runtime.rootContext();
+        // 站点 Context 只划分“这个站点能看到哪些规则”，不创建线程池或 ClassLoader。
         ContextHandle shanghai = tx.childContext(root, "warehouse-shanghai");
         ContextHandle shenzhen = tx.childContext(root, "warehouse-shenzhen");
 
+        // 队列连接由宿主提供；Runtime 关闭时先让组件停下，再执行 inbox.close()。
         tx.provide(root, PARCEL_INBOX, inbox);
 
+        // Root 的默认路由对两个仓库都可见。
         ComponentHandle<RouterConfig> defaultRouter = tx.mount(
                 root,
                 "route-planner",
                 new RoutePlannerFactory(),
                 defaultRouterConfig());
 
+        // 挂载键是 contextId + mountId；两个 Context 可以各自拥有 route-planner。
+        // 上海本地路由发布后，会遮蔽 Root 默认路由。
         ComponentHandle<RouterConfig> shanghaiRouter = tx.mount(
                 shanghai,
                 "route-planner",
                 new RoutePlannerFactory(),
                 shanghaiRouterConfigV1());
 
+        // Dispatcher 声明 REQUIRED ROUTE_PLANNER；所需 provider 提交后才会启动。
         ComponentHandle<NoConfig> shanghaiDispatcher = tx.mount(
                 shanghai,
                 "parcel-dispatcher",
@@ -327,6 +387,7 @@ try (ParcelInbox inbox = openDurableInbox();
                 shenzhenDispatcher);
     });
 
+    // committed 只说明结构事务发布；组件启动是异步的。
     if (!created.committed()) {
         throw new IllegalStateException(created.diagnostics().toString());
     }
@@ -339,6 +400,7 @@ try (ParcelInbox inbox = openDurableInbox();
             topology.shenzhenDispatcher()
     };
     for (ComponentHandle<?> handle : handles) {
+        // whenSettled 返回结算后的状态；这里必须确认是 ACTIVE，不能只等 get() 返回。
         ComponentState settled = handle.whenSettled()
                 .toCompletableFuture()
                 .get(30, TimeUnit.SECONDS);
@@ -359,24 +421,28 @@ try (ParcelInbox inbox = openDurableInbox();
 
 ## 配置变化：保留 handle，创建新 Activation
 
-承运商地址或超时配置变化时，不需要替换 factory。以下为同一宿主方法内的节选，`runtime`、`topology` 和配置构造器沿用前文；事务更新上海路由的配置，并等待同一个 handle 完成换代。
+承运商规则服务地址或超时时间变化时，不需要替换路由工厂。以下为同一宿主方法内的节选，`runtime`、`topology` 和配置构造器沿用前文；事务更新上海路由的配置，并等待同一个 handle 完成换代。
 
 ```java
+// reconfigure 保留同一个 ComponentHandle，只创建新的配置代际和 Activation。
 MutationResult<ComponentHandle<RouterConfig>> update = runtime.mutate(tx ->
         tx.reconfigure(
                 topology.shanghaiRouter(),
                 shanghaiRouterConfigV2()));
 
+// 事务被拒绝时，新配置不会部分生效。
 if (!update.committed()) {
     throw new IllegalStateException(update.diagnostics().toString());
 }
 
+// 等待旧资源释放、新配置启动完成；返回值就是结算后的组件状态。
 ComponentState state = topology.shanghaiRouter()
         .whenSettled()
         .toCompletableFuture()
         .get(30, TimeUnit.SECONDS);
 
 if (state != ComponentState.ACTIVE) {
+    // 非 ACTIVE 不是可忽略状态：WAITING/FAILED 都需要看绑定或清理诊断。
     runtime.snapshot().diagnostics().forEach(System.err::println);
 }
 ```
@@ -387,7 +453,7 @@ if (state != ComponentState.ACTIVE) {
 
 ## JAR 变化：先排空 owned mount，再卸载 artifact
 
-插件需要从共享 SPI 导出带配置 token 的工厂。以下代码是插件内的 PF4J extension，`RouterConfig.class` 来自共享合约包。
+当路由规则变化不只是改地址，而是要换整版算法时，就把新算法打成独立 JAR，通过 PF4J artifact 发布。插件需要从共享 SPI 导出带配置 token 的工厂；下面代码中的 `RouterConfig.class` 来自共享合约包。
 
 ```java
 package com.acme.logistics.plugin;
@@ -402,10 +468,13 @@ import org.pf4j.Extension;
 import java.util.Collection;
 import java.util.List;
 
+// PF4J 通过这个 extension 点发现插件导出的工厂。
 @Extension
 public final class RegionalRouterProvider implements RuntimeComponentProvider {
     @Override
     public Collection<ExportedComponentFactory<?>> factories() {
+        // RouterConfig.class 是跨 artifact 配置 token；
+        // 它必须来自共享合约包，不能由插件私下打包。
         return List.of(ExportedComponentFactory.of(
                 RouterConfig.class,
                 new RoutePlannerFactory()));
@@ -418,23 +487,28 @@ public final class RegionalRouterProvider implements RuntimeComponentProvider {
 当上海路由来自插件 JAR 时，用下面的受控挂载替代前文对 `RoutePlannerFactory` 的直接 `tx.mount()`。以下为宿主方法内的节选，import、配置构造器和 topology 初始化省略；代码让 v1 完成排空，通过 Runtime snapshot 确认 Dispatcher 已绑定默认能力，再加载和挂载 v2。
 
 ```java
+// sharedContractPackages 中的类型由宿主 ClassLoader 提供，避免插件私有副本进入合约。
 try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
         Path.of("plugins"),
         runtime,
         Set.of("com.acme.logistics.contract"))) {
 
+    // loadArtifact 只启动 PF4J 插件并登记工厂目录；它不会挂载业务组件。
     ArtifactSnapshot artifactV1 = adapter.loadArtifact(
             Path.of("plugins/regional-router-v1.jar")).join();
 
+    // typed resolve 必须携带精确 RouterConfig Class；token 不匹配会立即失败。
     ArtifactFactoryHandle<RouterConfig> factoryV1 = adapter.resolver()
             .resolve("regional-route-planner", RouterConfig.class)
             .orElseThrow();
 
+    // mount 是宿主的显式决策：挂到上海 Context，并遮蔽 Root 默认路由。
     ComponentHandle<RouterConfig> localRouter = factoryV1.mount(
             topology.shanghai(),
             "route-planner",
             shanghaiRouterConfigV1());
 
+    // 先确认 v1 已经 ACTIVE，后续排空才有确定的起点。
     ComponentState v1State = localRouter.whenSettled()
             .toCompletableFuture()
             .get(30, TimeUnit.SECONDS);
@@ -442,7 +516,10 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
         throw new IllegalStateException("v1 router settled as " + v1State);
     }
 
+    // unload 是 drain：等待 in-flight mount，先释放依赖方和 owned mount，再停 PF4J 插件。
     adapter.unloadArtifact(artifactV1.artifactId()).join();
+
+    // 本地路由消失后，上海 Dispatcher 应重新激活并绑定 Root 默认路由。
     ComponentState fallbackState = topology.shanghaiDispatcher()
             .whenSettled()
             .toCompletableFuture()
@@ -458,6 +535,7 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
                 "Shanghai dispatcher did not bind the root planner");
     }
 
+    // v1 卸载后其 factoryId 目录条目已释放，v2 可以导出同名 factoryId。
     ArtifactSnapshot artifactV2 = adapter.loadArtifact(
             Path.of("plugins/regional-router-v2.jar")).join();
 
@@ -470,6 +548,7 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
             "route-planner",
             shanghaiRouterConfigV2());
 
+    // 分别确认 v2 provider 和上海 Dispatcher 都已 ACTIVE。
     ComponentState v2State = upgradedRouter.whenSettled()
             .toCompletableFuture()
             .get(30, TimeUnit.SECONDS);
@@ -477,6 +556,8 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
             .whenSettled()
             .toCompletableFuture()
             .get(30, TimeUnit.SECONDS);
+
+    // 再用 snapshot 证明 Dispatcher 绑定的是上海 Context 中的 v2 registration。
     RuntimeSnapshot upgradedSnapshot = runtime.snapshot();
     if (v2State != ComponentState.ACTIVE
             || upgradedDispatcherState != ComponentState.ACTIVE
@@ -492,6 +573,7 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
     // 宿主继续运行；进程退出时关闭 adapter，并排空 v2。
 }
 
+/** 检查 handle 当前 Activation 绑定的指定能力是否来自指定 provider Context。 */
 private static boolean isBoundToContext(
         RuntimeSnapshot snapshot,
         String handleId,
@@ -501,10 +583,13 @@ private static boolean isBoundToContext(
             .filter(item -> item.handleId().equals(handleId))
             .findFirst()
             .orElseThrow();
+
+    // currentActivationId 为空表示组件没有可检查的当前运行代。
     if (component.currentActivationId() == null) {
         return false;
     }
 
+    // 先找到当前 Activation，再读取它启动时固定的 BindingSet。
     return snapshot.activations().stream()
             .filter(item -> item.activationId().equals(
                     component.currentActivationId()))
@@ -512,6 +597,7 @@ private static boolean isBoundToContext(
             .filter(RuntimeSnapshot.BindingSnapshot::present)
             .filter(binding -> binding.capability().name()
                     .equals(capabilityName))
+            // binding 只记录 registration id；还要回到 registration 表确认它挂在哪个 Context。
             .anyMatch(binding -> snapshot.registrations().stream()
                     .anyMatch(registration ->
                             registration.registrationId().equals(
@@ -556,9 +642,11 @@ Knotra 保证的是组件代际、依赖顺序和资源清理。持续进件依�
 `knotra-events` 适合进程内通知，例如路由完成后刷新统计面板。以下为消费方 `start()` 方法的节选，`ROUTE_FINISHED` 事件定义和 `metrics` 业务对象省略；订阅仍应交给消费方的 LifecycleScope，关闭时会等待关闭请求前已接受的 dispatch。
 
 ```java
+// serial listener 返回 future；前一个 stage 完成后，EventBus 才调用下一个 listener。
 EventSubscription subscription = bus.onSerial(ROUTE_FINISHED, event ->
         metrics.record(event).thenApply(ignored -> true));
 
+// 订阅关闭会等待关闭请求前已接受的 dispatch；组件换代不会留下孤儿回调。
 context.lifecycle().manageAsync(
         "route-finished-listener",
         subscription::closeAsync);
