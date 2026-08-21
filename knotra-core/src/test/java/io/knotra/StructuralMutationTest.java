@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -223,6 +224,44 @@ final class StructuralMutationTest {
         TestKit.assertCommitted(result);
         assertEquals(2, result.value().configRevision());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(result.value()).call());
+    }
+
+    @Test
+    void reconfigureRejectsSchemaNullResult() throws Exception {
+        AtomicReference<String> lastConfig = new AtomicReference<>();
+        ComponentFactory<String> schemaFactory = new ComponentFactory<>() {
+            @Override
+            public String factoryId() {
+                return "null-schema";
+            }
+
+            @Override
+            public Component<String> create() {
+                return new TestKit.Scripted<>(
+                        ComponentDescriptor.of("null-schema"),
+                        (context, config) -> lastConfig.set(config));
+            }
+
+            @Override
+            public Optional<ConfigSchema<String>> configSchema() {
+                return Optional.of(raw -> "one".equals(raw) ? (String) raw : null);
+            }
+        };
+        MutationResult<ComponentHandle<String>> mounted = runtime.mutate(mutation ->
+                mutation.mount(runtime.rootContext(), "null-schema", schemaFactory, "one"));
+        TestKit.assertCommitted(mounted);
+        ComponentHandle<String> handle = mounted.value();
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
+        assertEquals("one", lastConfig.get());
+
+        MutationResult<ComponentHandle<String>> rejected = runtime.mutate(mutation ->
+                mutation.reconfigure(handle, "two"));
+        assertFalse(rejected.committed());
+        assertEquals(DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
+                rejected.diagnostics().getFirst().code());
+        assertEquals(1, handle.configRevision());
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
+        assertEquals("one", lastConfig.get());
     }
 
     @Test

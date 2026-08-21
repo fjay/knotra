@@ -2500,7 +2500,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             PreparedComponent<?> prepared = preparedFor(typed);
             ProvisionalConfig current = provisionalConfigFor(typed, prepared);
-            Object normalized = normalizeFor(prepared, config);
+            Object normalized = Objects.requireNonNull(
+                    normalizeFor(prepared, config),
+                    "config schema returned null");
             long expectedRevision = current.revision();
             boolean equivalent = Objects.equals(normalized, current.config());
             if (!equivalent) {
