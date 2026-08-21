@@ -6,7 +6,7 @@ import java.util.Map;
 import io.knotra.ComponentOrigin;
 import io.knotra.MountOptions;
 
-/** Stable artifact facts attached to every root and descendant mount. */
+/** 附加到每个 artifact 根挂载与子挂载上的稳定来源事实。 */
 record ArtifactMetadata(
         String artifactId,
         String version,

@@ -9,10 +9,10 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
- * Serializes all PF4J mutations and PF4J-facing reads.
+ * 串行化所有 PF4J 变更与面向 PF4J 的读取的单线程协调器。
  *
- * <p>Nested submissions from a coordinator callback run inline under the
- * reentrant lock, so artifact callbacks can safely inspect the catalog.</p>
+ * <p>协调器回调中的嵌套提交会在同一可重入锁下内联执行，使 artifact 回调可以安全
+ * 查看目录；回调外部的提交仍进入唯一协调线程，避免 PF4J 状态被并发修改。</p>
  */
 final class ArtifactCoordinator {
 
@@ -30,11 +30,14 @@ final class ArtifactCoordinator {
         });
     }
 
+    /** 提交 PF4J 相关操作；协调线程内的嵌套调用会内联执行以保持可重入语义。 */
     <T> CompletableFuture<T> submit(Supplier<T> operation) {
+        // stop 与提交共用生命周期锁，避免“检查后执行”窗口内向已关闭 executor 提交。
         synchronized (lifecycleLock) {
             if (stopped) {
                 return CompletableFuture.failedFuture(stopped());
             }
+            // 协调线程内的读取若再排队会自等待；内联加同一把可重入锁保持串行语义。
             if (isCoordinatorThread()) {
                 return inline(operation);
             }
@@ -72,6 +75,7 @@ final class ArtifactCoordinator {
     private <T> T asCoordinatorThread(Supplier<T> operation) {
         Thread current = Thread.currentThread();
         coordinatorThread.compareAndSet(null, current);
+        // 单线程 executor 也显式校验线程身份，防止实现漂移破坏可重入判断。
         if (coordinatorThread.get() != current) {
             throw new IllegalStateException("artifact coordinator executor changed threads");
         }

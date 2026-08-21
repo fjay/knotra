@@ -2,6 +2,13 @@ package io.knotra.internal;
 
 import io.knotra.RegistrationHandle;
 
+
+/**
+ * 一个注册身份的内核句柄。
+ *
+ * <p>Capability 值可以相等，但撤销和重发布会产生新的注册 ID，并因此形成新的绑定代际。
+ * 句柄只绑定到所属 Runtime 和注册 ID，实际数据保存在 {@link RuntimeView}。</p>
+ */
 final class RegistrationHandleImpl implements RegistrationHandle {
     final DefaultKnotraRuntime runtime;
     final String id;

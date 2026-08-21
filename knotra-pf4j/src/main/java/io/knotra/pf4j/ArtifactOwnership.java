@@ -2,7 +2,7 @@ package io.knotra.pf4j;
 
 import io.knotra.ComponentState;
 
-/** Immutable ownership fact for one component originating from an artifact. */
+/** 单个来源于 artifact 的组件当前归属事实；这是运行时快照的不可变投影。 */
 public record ArtifactOwnership(
         String artifactId,
         String factoryId,

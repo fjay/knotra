@@ -1,10 +1,10 @@
 package io.knotra.pf4j;
 
 /**
- * Read-only metadata for one active artifact factory.
+ * 一个活跃 artifact 工厂的只读目录元数据。
  *
- * <p>The tokenless catalog deliberately exposes stable text only. It cannot mount,
- * normalize configuration, or retain an executable factory or configuration schema.</p>
+ * <p>无 token 的目录刻意只暴露稳定文本，不能挂载组件、归一化配置，也不能保留
+ * 可执行工厂或配置 schema。</p>
  */
 public interface ArtifactFactoryCatalogEntry {
 
@@ -16,6 +16,6 @@ public interface ArtifactFactoryCatalogEntry {
 
     String factoryId();
 
-    /** Binary-independent configuration token name used for catalog display and diagnostics. */
+    /** 与二进制无关的配置 token 名称，仅用于目录展示与诊断。 */
     String configTypeName();
 }

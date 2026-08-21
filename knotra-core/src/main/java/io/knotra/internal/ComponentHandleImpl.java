@@ -7,6 +7,13 @@ import io.knotra.ComponentState;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
+
+/**
+ * ComponentHandle 的内核实现，是跨多次 Activation 保持稳定的逻辑挂载点。
+ *
+ * <p>句柄本身不保存组件实例或资源，全部状态读取和生命周期操作都委托给创建它的
+ * {@link DefaultKnotraRuntime}。身份只由 Runtime 实例和 handle ID 组成；同一挂载点重新激活不会更换句柄。</p>
+ */
 final class ComponentHandleImpl<C> implements ComponentHandle<C> {
     final DefaultKnotraRuntime runtime;
     final String id;

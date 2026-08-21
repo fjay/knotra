@@ -2,6 +2,14 @@ package io.knotra;
 
 import java.util.Objects;
 
+/**
+ * 类型化 Capability 的标识，由名称与合约 Java 类型组成。
+ *
+ * <p>Capability 是类型化的命名值：名称在 Runtime 生命周期内绑定唯一的合约类型，
+ * 即使以相等的值重新注册，也会为消费方产生新的绑定代际。本记录不可变且具有值相等语义；
+ * 自然顺序先按名称、再按类型二进制名排序，保证输出稳定。紧凑构造函数要求名称非空非空白，
+ * 类型非空且不支持 primitive。
+ */
 public final record CapabilityKey<T>(String name, Class<T> type) implements Comparable<CapabilityKey<T>> {
 
     public CapabilityKey {
@@ -19,10 +27,12 @@ public final record CapabilityKey<T>(String name, Class<T> type) implements Comp
         return new CapabilityKey<>(name, type);
     }
 
+    /** 返回合约 Java 类型的二进制名，用于快照、诊断与稳定排序。 */
     public String typeName() {
         return type.getName();
     }
 
+    /** 先按名称、再按类型名比较；用类型名字符串排序，保证顺序与具体 Class 实例无关。 */
     @Override
     public int compareTo(CapabilityKey<T> other) {
         int byName = name.compareTo(other.name);

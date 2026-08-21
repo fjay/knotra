@@ -12,6 +12,12 @@ import java.util.Set;
 import org.pf4j.PluginWrapper;
 import io.knotra.ComponentHandle;
 
+/**
+ * 适配器内部的单个受管 artifact 状态机与所有权记录。
+ *
+ * <p>该类型只保存弱引用形式的 PF4J 包装器和 ClassLoader；生成 Snapshot 与诊断时
+ * 输出稳定描述文本，卸载后主动清空视图，避免公开数据钉住插件 ClassLoader。</p>
+ */
 final class ManagedArtifact {
 
     final String artifactId;

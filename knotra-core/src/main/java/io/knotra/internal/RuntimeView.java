@@ -25,7 +25,16 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
+
+/**
+ * 已提交 Runtime 状态的不可变快照，代际由 {@code generation} 标识。
+ *
+ * <p>{@link DefaultKnotraRuntime} 只在协调器锁内通过 {@link Draft#publishOnce} 替换整份视图，
+ * 无锁读取方拿到旧快照时仍能看到一个自洽的结构组合。草稿中的暂存 Capability、子挂载和状态迁移
+ * 不会影响旧代际。视图持有 Capability 值和组件合约数据，但不持有 LifecycleScope 或释放器。</p>
+ */
 final class RuntimeView {
+    // 每次成功发布整体递增；拒绝的事务复用旧视图，不产生代际。
     final long generation;
     final Map<String, ContextData> contexts;
     final Map<String, RegistrationData> registrations;
@@ -163,12 +172,14 @@ final class RuntimeView {
         return resolve(contextId, key, Map.of());
     }
 
+    // 从当前 Context 向根解析；子 Context 中的注册先于父注册被采纳，从而形成遮蔽。
     Optional<RegistrationData> resolve(
             String contextId,
             CapabilityKey<?> key,
             Map<String, RegistrationData> tentative) {
         String current = contextId;
         while (current != null) {
+            // 提交前验证允许暂存注册参与解析；仍按当前层级过滤，不能跨过更近的提交注册。
             for (RegistrationData registration : tentative.values()) {
                 if (registration.contextId().equals(current)
                         && registration.key().equals(key)) {
@@ -176,6 +187,7 @@ final class RuntimeView {
                 }
             }
             RegistrationData committed = null;
+            // 事务阶段保证同一 Context 的 Capability 槽位唯一；这里保留首个候选作为已提交代际。
             for (RegistrationData candidate : registrations.values()) {
                 if (candidate.contextId().equals(current)
                         && candidate.key().equals(key)) {
@@ -212,6 +224,7 @@ final class RuntimeView {
         return bindings;
     }
 
+    // 只有仍在跟踪依赖图的 Activation 参与环检测；STOPPING 的绑定已被脱离，不能继续约束新图。
     Map<String, Set<String>> dependencyGraph(Map<String, RegistrationData> tentative) {
         Map<String, Set<String>> graph = new TreeMap<>();
         Map<String, String> activationOwner = new HashMap<>();
@@ -255,6 +268,7 @@ final class RuntimeView {
         return graph;
     }
 
+    // Tarjan 强连通分量检测；非候选图外节点忽略，因此只判定本次提交可能形成的依赖环。
     static boolean hasCycle(Map<String, Set<String>> graph) {
         Map<String, Integer> index = new HashMap<>();
         Map<String, Integer> low = new HashMap<>();
@@ -335,6 +349,7 @@ final class RuntimeView {
         return false;
     }
 
+    // 父 Activation 拥有其提交的整棵子挂载树；换代时必须一起处置，不能只断开直接子节点。
     Set<String> ownershipDescendants(String handleId) {
         Set<String> result = new LinkedHashSet<>();
         collectOwnershipDescendants(handleId, null, result);
@@ -374,6 +389,7 @@ final class RuntimeView {
         }
     }
 
+    // 从直接受影响组件闭包到全部传递依赖方，保证提供方释放前所有依赖方都已脱离。
     Set<String> dependentsClosure(Set<String> initial) {
         Set<String> result = new LinkedHashSet<>(initial);
         boolean changed = true;
@@ -592,6 +608,13 @@ final class RuntimeView {
         }
     }
 
+
+    /**
+     * 协调器临界区内的私有可变草稿。
+     *
+     * <p>草稿复制当前视图后可反复试算绑定、所有权和依赖闭包；任意校验失败都直接丢弃，
+     * 只有 {@link #publishOnce()} 才会生成新代际并替换 Runtime 的 volatile 视图。</p>
+     */
     static final class Draft {
         final long generation;
         final Map<String, ContextData> contexts;
@@ -611,6 +634,7 @@ final class RuntimeView {
             this.diagnostics = new ArrayList<>(view.diagnostics);
         }
 
+        // 复用 RuntimeView 的不可变快照语义做图计算，保证草稿查询与最终发布使用同一解析规则。
         private RuntimeView asView() {
             return new RuntimeView(
                     generation,
@@ -671,6 +695,7 @@ final class RuntimeView {
             return asView().registrationsOwnedBy(handleIds);
         }
 
+        // 唯一发布点：构造不可变拷贝并推进代际；调用方随后在同一个协调器临界区替换 volatile 引用。
         RuntimeView publishOnce() {
             return new RuntimeView(
                     generation + 1,

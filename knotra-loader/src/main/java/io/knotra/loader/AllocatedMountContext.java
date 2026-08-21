@@ -12,6 +12,15 @@ import io.knotra.MountOptions;
 import io.knotra.KnotraRuntime;
 import io.knotra.MutationResult;
 
+/**
+ * {@link ControlledMountContext} 的 Loader 内部实现：绑定一次受控挂载所需的
+ * 运行时、分配的 Context 与挂载 ID。
+ *
+ * <p>该实现维护受控边界的两条硬约束：挂载槽位单次使用（原子标记，重复挂载
+ * 直接拒绝），以及分配的 Context 必须处于 ACTIVE。挂载本身通过宿主事务提交
+ * 给 Core，事务被拒绝时把核心诊断包装为 {@link ControlledMountException}
+ * 传回策略，保留结构化原因。
+ */
 final class AllocatedMountContext implements ControlledMountContext {
 
     private final KnotraRuntime runtime;

@@ -44,24 +44,44 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+
+/**
+ * Runtime 内核的默认实现，拥有宿主事务、Activation 状态机和组件过渡调度。
+ *
+ * <p>已提交结构保存在 volatile 的 {@link RuntimeView} 中；所有草稿校验、代际发布和可执行索引同步
+ * 都在 {@code coordinator} 临界区内完成。工厂、schema 和用户 {@code start()} 不持有协调器锁，因此
+ * 慢用户代码只能阻塞自身 Activation，不能阻塞其他宿主事务或 Snapshot。Activation 提交前把注册和
+ * 子挂载留在 {@link ActivationRuntime}，验证成功后随同一代际发布；stale 候选则回滚其 LifecycleScope，
+ * 并按最新 BindingSet 重新调度。</p>
+ *
+ * <p>锁顺序约定：协调器锁优先；Context 处置临界区会在协调器内再取 {@code contextFutures}；
+ * 完成组件过渡时协调器可嵌套 {@link ComponentRuntime} 的过渡链锁。LifecycleScope 释放器、
+ * 用户回调和 Future 回调不得反向获取协调器锁。</p>
+ */
 public final class DefaultKnotraRuntime implements KnotraRuntime {
     private final KnotraConfig configuration;
+    // 结构一致性主锁：保护视图草稿、代际发布、可执行索引同步和过渡状态裁决。
     private final Object coordinator = new Object();
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    // 只在协调器内整体替换；无锁读取方始终解析某个完整代际，而不是混合结构。
     private volatile RuntimeView view = RuntimeView.initial();
 
+    // 组件与激活索引的写入口在协调器内；并发读取用于驱动状态机或校验句柄归属。
     private final Map<String, ComponentRuntime> components = new ConcurrentHashMap<>();
     private final Map<String, ComponentHandleImpl<?>> componentHandles =
             new ConcurrentHashMap<>();
+    // 组件移出主视图后仍需为旧句柄报告稳定的终态。
     private final Map<String, ComponentState> terminalComponents = new ConcurrentHashMap<>();
     private final Map<String, ActivationRuntime> activations = new ConcurrentHashMap<>();
     private final Map<String, RegistrationHandleImpl> registrationHandles =
             new ConcurrentHashMap<>();
     private final Map<String, ContextHandleImpl> contextHandles = new ConcurrentHashMap<>();
+    // Context 处置去重在协调器内嵌套 contextFutures；单组件 dispose 用独立请求锁合并并发调用。
     private final Map<String, CompletableFuture<Void>> contextFutures =
             new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<ComponentState>> disposeRequests =
             new ConcurrentHashMap<>();
+    // close 先于新事务置位；失败的未来可被替换以便重试关闭，成功后复用同一结果。
     private final AtomicBoolean closing = new AtomicBoolean();
     private final AtomicReference<CompletableFuture<Void>> closeFuture =
             new AtomicReference<>();
@@ -94,6 +114,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             partial = view.snapshotWithoutScopes();
             activationCopy = new HashMap<>(activations);
         }
+        // Scope 树有独立锁；先在协调器内复制激活集合，再在锁外生成稳定 DTO。
         List<RuntimeSnapshot.LifecycleScopeSnapshot> scopes = activationCopy.values().stream()
                 .flatMap(activation ->
                         activation.scope.snapshots(activation.activationId).stream())
@@ -114,6 +135,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     public <R> MutationResult<R> mutate(Function<RuntimeMutation, R> action) {
         Objects.requireNonNull(action, "action");
         MutationRecorder recorder = new MutationRecorder();
+        // 宿主回调和工厂/schema 用户代码在协调器锁外执行；此阶段只记录意图，失败不会产生代际。
         R callbackValue;
         try {
             callbackValue = action.apply(recorder);
@@ -129,6 +151,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         long committedGeneration = -1;
         Set<String> postCommitDirty = new LinkedHashSet<>();
         Set<String> contextDisposals = new LinkedHashSet<>();
+        // 临界区只做确定性校验和发布；任何 Reject 都丢弃草稿，不能留下部分结构或可执行索引。
         synchronized (coordinator) {
             if (closing.get()) {
                 return MutationResult.rejected(List.of(new RuntimeDiagnostic(
@@ -143,6 +166,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         CompletableFuture.completedFuture(null));
             }
 
+            // 先在草稿中应用全部意图并计算绑定影响，再决定是否发布，保证多操作事务是原子的。
             RuntimeView.Draft draft = new RuntimeView.Draft(view);
             ExecutableCommitPlan executable = new ExecutableCommitPlan();
             Set<String> dirty = new LinkedHashSet<>();
@@ -163,6 +187,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                             view.generation,
                             CompletableFuture.completedFuture(null));
                 }
+                // 视图替换和可执行索引同步留在同一临界区，外部观察只能看到提交前或提交后的组合。
                 RuntimeView next = draft.publishOnce();
                 view = next;
                 commitExecutable(next, recorder.intents, executable);
@@ -174,6 +199,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
         }
 
+        // 过渡调度和用户 start() 必须离开协调器，事务 settlement 只聚合这些异步结果。
         List<CompletableFuture<?>> componentSettlements =
                 new ArrayList<>(schedule(postCommitDirty));
         CompletableFuture<Void> componentSettlement = componentSettlements.isEmpty()
@@ -201,6 +227,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         : new CompletableFuture<>());
         closing.set(true);
         ContextHandleImpl root = contextHandles.get("ctx-root");
+        // Runtime close 复用根 Context 处置路径；只有全树清理成功才关闭执行器。
         disposeContextInView(root, true).whenComplete((ignored, error) -> {
             if (error == null) {
                 executor.shutdown();
@@ -214,6 +241,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
 
     <T> Optional<T> findInContext(String contextId, CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
+        // 固定本地视图引用，同一次 require/find 不会被并发发布拆到两个代际。
         RuntimeView current = view;
         RuntimeView.RegistrationData registration =
                 current.resolve(contextId, key).orElse(null);
@@ -334,6 +362,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 && componentGoal(handle.handleId()) == ComponentGoal.DISPOSED) {
             return CompletableFuture.completedFuture(ComponentState.DISPOSED);
         }
+        // 合并并发 dispose：所有调用方共享一个请求 Future，失败请求可被下一次尝试替换。
         synchronized (disposeRequests) {
             CompletableFuture<ComponentState> existing =
                     disposeRequests.get(handle.handleId());
@@ -360,6 +389,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     private void settleDisposeRequest(
             String handleId,
             CompletableFuture<ComponentState> request) {
+        // whenSettled 可能观察到 STOPPING 的中间态；重新排队直到旧 Activation 清理完成。
         whenSettled(handleId).whenComplete((state, error) -> {
             if (state == ComponentState.STOPPING) {
                 executor.execute(() -> settleDisposeRequest(handleId, request));
@@ -614,6 +644,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     "disposed component cannot be reconfigured");
         }
         ensureActiveContext(draft, data.contextId());
+        // 期望配置代际是事务内乐观锁：其他提交先改变同一句柄时，本事务整体拒绝。
         if (data.configRevision() != intent.expectedRevision()) {
             throw reject(
                     DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
@@ -657,6 +688,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     handle.handleId(),
                     parent.withGoal(ComponentGoal.DISPOSED));
         }
+        // 先处置该 Activation 拥有的子树，再闭包到外部依赖方；二者共同决定 STOPPING 顺序。
         Set<String> live = disposeOwnershipForActivation(
                 draft,
                 handle.handleId(),
@@ -696,6 +728,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 subtree.contains(registration.contextId())
                         && registration.owner() instanceof RuntimeView.OwnerData.Host);
 
+        // 处置范围包含子树内每个根组件拥有的后代，而不仅是直接位于这些 Context 中的组件。
         Set<String> handles = draft.components.values().stream()
                 .filter(component -> subtree.contains(component.contextId()))
                 .flatMap(component ->
@@ -728,6 +761,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return true;
     }
 
+    // 注册身份或 OPTIONAL 出现/消失都会改变 BindingSet；这里统一把受影响 Activation 标记 stale。
     private void markBindingImpacts(
             RuntimeView.Draft draft,
             Set<String> dirty,
@@ -777,6 +811,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             detachInView(draft, closure, dirty, executable);
         }
 
+        // 曾因拓扑失败而压制的 WAITING 组件，只有在相关拓扑确实变化后才能重置重试预算。
         RuntimeView old = view;
         for (RuntimeView.ComponentData component : draft.components.values()) {
             if (component.state() == ComponentState.WAITING
@@ -813,6 +848,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return true;
     }
 
+    // 只比较注册身份和存在性；值 equals 不构成新 BindingSet，但新注册 ID 会构成新代际。
     private boolean bindingIdentityEqual(
             RuntimeView.BindingData left,
             RuntimeView.BindingData right) {
@@ -847,6 +883,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         return result;
     }
+    // 换代只处置属于旧 Activation 的子挂载；其他 Activation 创建的同名层后代不能被误删。
     private Set<String> disposeOwnershipForActivation(
             RuntimeView.Draft draft,
             String parentHandleId,
@@ -876,6 +913,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return live;
     }
 
+    // 视图中先脱离绑定并标记 STOPPING；实际 LifecycleScope teardown 延迟到依赖方清理完成后。
     private void detachInView(
             RuntimeView.Draft draft,
             Set<String> handles,
@@ -979,6 +1017,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return handle;
     }
 
+    // 该方法只在视图发布后、仍在协调器内调用；失败路径必须在进入前完成全部可预期校验。
     private void commitExecutable(
             RuntimeView next,
             List<Intent> intents,
@@ -1056,6 +1095,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         registrationHandles.keySet().retainAll(next.registrations.keySet());
     }
 
+    // 先在协调器内按最新视图预约并合并过渡，再离开锁提交虚拟线程执行用户代码。
     private List<CompletableFuture<ComponentState>> schedule(Set<String> dirty) {
         Set<String> stopping = new LinkedHashSet<>();
         Set<String> starting = new LinkedHashSet<>();
@@ -1103,6 +1143,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
+    // Kahn 拓扑排序先排无提供方的组件，再整体反转，得到依赖方先于提供方的停止顺序。
     private List<String> orderForStop(RuntimeView current, Set<String> handles) {
         if (handles.isEmpty()) {
             return List.of();
@@ -1143,6 +1184,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return ordered;
     }
 
+    // 将注册归属还原为提供方 ComponentHandle，只保留本次也在停止集合内的内部依赖。
     private Map<String, Set<String>> stopProviders(
             RuntimeView current,
             Set<String> handles) {
@@ -1191,6 +1233,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 && registration.owner() instanceof RuntimeView.OwnerData.Activation owner) {
             ownerActivationId = owner.activationId();
         } else {
+            // 正在启动的提供方可能仍未发布注册；用暂存表识别它，避免新依赖方与提供方重叠清理。
             for (ActivationRuntime activation : activations.values()) {
                 boolean owns = activation.stagedRegistrations.values().stream()
                         .map(RuntimeView.RegistrationData::registrationId)
@@ -1204,6 +1247,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return ownerActivationId == null ? null : activationOwners.get(ownerActivationId);
     }
 
+    // 单组件状态机入口：锁内只选择/登记候选 Activation，用户 start() 随后在锁外执行。
     void driveTransition(String handleId, CompletableFuture<ComponentState> future) {
         ComponentRuntime component = components.get(handleId);
         if (component == null) {
@@ -1250,6 +1294,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             component.finishTransition(future, state);
             return;
         }
+        // 锁外复核：若结构事务已使候选 stale 或作用域开始清理，直接走回滚路径。
         if (activation.scope.state() != LifecycleState.OPEN
                 || view.components.get(handleId) == null
                 || view.components.get(handleId).currentActivationId() == null
@@ -1295,6 +1340,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         view.resolve(data.contextId(), requirement.key()).isPresent());
     }
 
+    // 在协调器内为 WAITING 组件创建 STARTING 代际，并把 BindingSet 与值一起固定到候选中。
     private ActivationRuntime beginActivationLocked(ComponentRuntime component) {
         RuntimeView.Draft draft = new RuntimeView.Draft(view);
         RuntimeView.ComponentData data = draft.components.get(component.handleId);
@@ -1344,6 +1390,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return activation;
     }
 
+    // Activation 事务：锁外执行 start()，重新获取协调器后基于最新视图做提交或回滚裁决。
     private void runActivation(
             ComponentRuntime runtime,
             ActivationRuntime activation,
@@ -1354,6 +1401,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 activation,
                 plans);
         Throwable startError = null;
+        // 用户代码不持有协调器锁；期间的结构事务可以通过 stale 位召回本候选。
         try {
             runtime.prepared.start(context, activation.config);
         } catch (Throwable error) {
@@ -1361,10 +1409,12 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         activation.closed.set(true);
 
+        // 无论 start() 成功或失败都先关闭上下文，提交临界区是最后一次能消费暂存副作用的窗口。
         PostCommitPlan postCommit;
         CommitDecision decision;
         boolean emergencyRollback = false;
         boolean cleanupRequired = false;
+        // 重新获取协调器后，先验证候选代际，再一次性发布注册、子挂载和组件状态。
         synchronized (coordinator) {
             RuntimeView previous = view;
             RuntimeView published = null;
@@ -1398,6 +1448,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                             componentState(runtime.handleId));
                 }
             } catch (Throwable unexpected) {
+                // 提交路径自身异常时先回退已发布的视图，再按失败 Activation 走清理。
                 cleanupRequired = true;
                 if (published != null) {
                     view = previous;
@@ -1460,6 +1511,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
+    // 常规回滚草稿也失败时的最后防线：至少把组件和 Activation 置入可清理的 STOPPING 状态。
     private void emergencyRollbackActivation(
             ComponentRuntime runtime,
             ActivationRuntime activation) {
@@ -1481,6 +1533,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         view = draft.publishOnce();
     }
 
+    // 父 Activation 失败时，未提交的临时子句柄立即转入终态，挂载 ID 可在后续代际复用。
     private void discardProvisionalChildren(List<ChildMountPlan<?>> plans) {
         for (ChildMountPlan plan : plans) {
             String handleId = plan.handle().handleId();
@@ -1494,6 +1547,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
+    // 基于最新代际裁决候选；stale/配置/绑定检查排在用户 startError 之前，避免把召回误报为业务失败。
     private CommitDecision validateActivation(
             ComponentRuntime runtime,
             ActivationRuntime activation,
@@ -1579,6 +1633,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             RuntimeView current,
             String contextId,
             List<ChildMountPlan<?>> plans) {
+        // 类型检查覆盖其他仍在 STARTING 的暂存 Activation，防止并发批次合 publish 后破坏名称类型固定。
         Map<String, Class<?>> tentativeTypes = new HashMap<>(current.capabilityTypes);
         for (RuntimeView.RegistrationData staged
                 : activationRegistrationsForValidation(current, plans).values()) {
@@ -1629,6 +1684,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         return registrations;
     }
+    // 把裁决写入草稿：成功时暂存注册、子挂载和 ACTIVE 状态同代际发布；失败时脱离并保留清理责任。
     private PostCommitPlan publishActivationDecision(
             RuntimeView.Draft draft,
             ComponentRuntime runtime,
@@ -1642,6 +1698,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             return new PostCommitPlan(List.of(), Set.of(), new ExecutableCommitPlan());
         }
         if (decision.success()) {
+            // 提交成功才把暂存注册复制到已发布视图；子挂载同批进入 WAITING。
             for (RuntimeView.RegistrationData staged
                     : activation.stagedRegistrations.values()) {
                 draft.registrations.put(
@@ -1683,6 +1740,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     runtime.handleId,
                     data.withState(ComponentState.ACTIVE));
 
+            // 新注册可能遮蔽已有提供方；提交时同步找出 BindingSet 变化的外部消费方。
             Set<String> changed = new LinkedHashSet<>();
             for (RuntimeView.ComponentData component : draft.components.values()) {
                 if (component.currentActivationId() == null
@@ -1732,6 +1790,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             return new PostCommitPlan(plans, dirty, executable);
         }
 
+        // 失败路径不发布暂存内容；Activation 脱离绑定后由 LifecycleScope 回滚已接受资源。
         draft.activations.put(
                 activation.activationId,
                 activationData.detached());
@@ -1746,6 +1805,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return new PostCommitPlan(List.of(), dirty, new ExecutableCommitPlan());
     }
 
+    // 视图已发布后的 Activation 侧索引同步；stale 标记必须覆盖提交造成的所有外部消费方。
     private void commitActivationExecutable(
             RuntimeView next,
             ComponentRuntime runtime,
@@ -1785,6 +1845,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return data != null && data.state() == ComponentState.STOPPING;
     }
 
+    // 提供方自身 teardown 前，先等待直接和间接依赖方完成旧 Activation 清理。
     private void finishCleanupAfterDependents(
             ComponentRuntime runtime,
             ActivationRuntime activation,
@@ -1804,6 +1865,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 finishCleanup(runtime, activation, future));
     }
 
+    // 从提供方反向扩散到所有传递依赖，并纳入其拥有的子挂载，但只调度仍处 STOPPING 的目标。
     private List<ComponentRuntime> dependentsForProvider(String providerHandleId) {
         RuntimeView current = view;
         Map<String, Set<String>> dependencies = stopProviders(
@@ -1843,6 +1905,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 .collect(Collectors.toList());
     }
 
+    // LifecycleScope teardown 在协调器外执行；完成回调重新取锁，把清理结果收敛为终态或重试安排。
     private void finishCleanup(
             ComponentRuntime runtime,
             ActivationRuntime activation,
@@ -1867,6 +1930,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     RuntimeView.ActivationData activationData =
                             draft.activations.get(activation.activationId);
                     if (failed) {
+                        // 保留 failedCleanup 和 FAILED Activation，阻止新代际启动，直到 retry 收敛。
                         String cleanupDetail = cleanupError == null
                                 ? activation.scope.lastCleanupError()
                                 : LifecycleScopeImpl.safeError(cleanupError);
@@ -1886,6 +1950,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         state = ComponentState.FAILED;
                         restart = false;
                     } else {
+                        // 清理成功后才能移除 Activation 索引，避免 Snapshot 或停止图丢失待清理资源。
                         runtime.lastCleanupError = "";
                         runtime.failedCleanup = null;
                         draft.activations.remove(activation.activationId);
@@ -1923,6 +1988,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 }
                 refreshDiagnostics(draft);
                 view = draft.publishOnce();
+                // 仍在协调器内替换过渡链，随后到锁外提交新 Activation，保证旧请求先有结果。
                 if (restart) {
                     restartReservation = runtime.replaceTransition();
                 } else {
@@ -1947,6 +2013,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         });
     }
 
+    // stale 回滚后的自动收敛：拓扑指纹变化才重置计数，避免同一无效图反复启动。
     private boolean planReconcile(
             RuntimeView.Draft draft,
             RuntimeView.ComponentData data,
@@ -1987,6 +2054,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         .collect(Collectors.joining(","));
     }
 
+    // 第一轮调度直接受影响者；提交后可能新出现的 WAITING 组件再补一轮，避免漏掉级联收敛。
     private void scheduleAfterCommit(Set<String> dirty) {
         schedule(dirty);
         RuntimeView current = view;
@@ -1998,6 +2066,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         schedule(waiting);
     }
 
+    // Context 处置先原子发布 DISPOSING 与停止图；命名空间要等全子树清理成功后才移除。
     CompletionStage<Void> disposeContextInView(
             ContextHandleImpl handle,
             boolean rootClose) {
@@ -2072,6 +2141,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return future;
     }
 
+    // 清理失败时保留 FAILED Context 与诊断供重试；成功时才释放名称和句柄索引。
     private void finalizeContext(
             Set<String> subtree,
             CompletableFuture<Void> future) {
@@ -2114,6 +2184,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
+    // 同一事务中嵌套处置 Context 时只保留最外层，避免子树 settlement 被重复聚合。
     private Set<String> outermostContextDisposals(Set<String> requested) {
         RuntimeView current = view;
         Set<String> result = new LinkedHashSet<>();
@@ -2130,6 +2201,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return result;
     }
 
+    // 事务内处置在组件收敛完成后才结算；这里为外层 Context 创建去重的最终化 Future。
     private CompletableFuture<Void> settleContextDisposal(
             String contextId,
             CompletableFuture<Void> prerequisite) {
@@ -2165,6 +2237,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 finalizeContext(subtree, future));
         return future;
     }
+    // 诊断随代际整体重建并排序；只保存稳定 DTO，不引用 Throwable、实例或 Class。
     private void refreshDiagnostics(RuntimeView.Draft draft) {
         List<RuntimeDiagnostic> diagnostics = new ArrayList<>();
         for (RuntimeView.ComponentData component : draft.components.values()) {
@@ -2253,6 +2326,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     private record ComponentTerminal(ComponentState state) {
     }
 
+    // stale 表示按最新代际重试；非 stale 失败才作为组件启动失败保留并要求显式 retry。
     private record CommitDecision(
             boolean success,
             boolean stale,
@@ -2325,6 +2399,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
+    // 宿主事务回调的私有记录器：只积累 Intent，不直接修改视图，失败事务中的临时句柄随之失效。
     private final class MutationRecorder implements RuntimeMutation {
         private final List<Intent> intents = new ArrayList<>();
         private final Map<String, ProvisionalConfig> provisionalConfigs = new HashMap<>();

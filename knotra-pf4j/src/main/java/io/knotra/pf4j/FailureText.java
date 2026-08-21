@@ -1,5 +1,8 @@
 package io.knotra.pf4j;
 
+/**
+ * 把异常压缩为稳定文本的工具，避免诊断和 Snapshot 持有 Throwable 或插件类。
+ */
 final class FailureText {
 
     private FailureText() {

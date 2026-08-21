@@ -13,6 +13,15 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
+
+/**
+ * 交给用户组件 {@code start()} 的 ActivationContext 实现。
+ *
+ * <p>读取只允许访问启动前固定的 BindingSet 及其捕获值，未声明的 Capability 会被拒绝，避免组件
+ * 绕过依赖声明参与一致性检查。{@code provide} 与 {@code mountChild} 写入的是
+ * {@link ActivationRuntime} 的暂存状态，父 Activation 验证并原子发布前对其他读取方不可见。
+ * {@code start()} 返回后上下文立即关闭；若协调器已将候选标记为 stale，则新的暂存也会被拒绝。</p>
+ */
 final class ActivationContextImpl implements ActivationContext {
     private final DefaultKnotraRuntime runtime;
     private final ActivationRuntime activation;
@@ -45,6 +54,7 @@ final class ActivationContextImpl implements ActivationContext {
         if (!binding.present()) {
             return Optional.empty();
         }
+        // 只读取启动代际捕获的值，避免用户代码在 start() 中观察到后续发布的新注册。
         Object value = activation.capturedValues.get(key.name());
         return Optional.ofNullable(key.type().cast(value));
     }
@@ -59,6 +69,7 @@ final class ActivationContextImpl implements ActivationContext {
             throw new IllegalArgumentException(
                     "capability value is not an instance of " + key.typeName());
         }
+        // 先按已发布视图做类型检查；槽位占用和并发注册在 Activation 提交临界区内最终裁决。
         runtime.validateCapabilityType(key);
         if (activation.stagedRegistrations.containsKey(key.name())) {
             throw new IllegalArgumentException("capability already staged: " + key.name());
@@ -97,6 +108,7 @@ final class ActivationContextImpl implements ActivationContext {
                 factory,
                 config,
                 effectiveOptions);
+        // 挂载 ID 采用乐观查重：用户工厂代码在协调器锁外执行，提交时必须基于最新视图重试冲突判定。
         if (runtime.mountIdReserved(activation.owner.contextId, mountId)) {
             throw new IllegalArgumentException("mountId is already in use: " + mountId);
         }

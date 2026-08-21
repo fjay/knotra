@@ -13,7 +13,13 @@ import io.knotra.ContextInfo;
 import io.knotra.LifecycleScope;
 import io.knotra.MountOptions;
 
-/** Wraps every activation edge and recursively guards child mounts. */
+/**
+ * artifact 组件启动时的受控 ActivationContext 边界。
+ *
+ * <p>所有 Capability 合约类型在进入 Core 类型表之前都会校验共享合约身份；子挂载
+ * 会被递归包装，并强制继承 artifact 来源，防止插件改写 provenance 或借宿主挂载
+ * 逃逸出受控边界。</p>
+ */
 final class GuardedActivationContext implements ActivationContext {
 
     private final ActivationContext delegate;
@@ -61,7 +67,7 @@ final class GuardedActivationContext implements ActivationContext {
             ComponentFactory<C> factory,
             C config,
             MountOptions options) {
-        // Ignore a caller-supplied origin. Artifact provenance is inherited exactly.
+        // 忽略调用方传入的 origin；artifact 来源必须被精确继承到所有子挂载。
         ComponentFactory<C> guarded = GuardedComponentFactory.wrap(
                 factory,
                 policy,

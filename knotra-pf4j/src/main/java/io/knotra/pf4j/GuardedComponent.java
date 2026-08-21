@@ -9,7 +9,12 @@ import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
 import io.knotra.ConfigSchema;
 
-/** Fixes one descriptor and guards all user start calls for that component instance. */
+/**
+ * 固定描述符并守护一个组件实例所有用户 start 调用的包装器。
+ *
+ * <p>包装时先校验描述符声明的依赖合约类型；启动时只替换 ActivationContext 边界，
+ * 不改变组件配置和 Core 生命周期语义。</p>
+ */
 final class GuardedComponent<C> implements Component<C> {
 
     private final Component<C> delegate;

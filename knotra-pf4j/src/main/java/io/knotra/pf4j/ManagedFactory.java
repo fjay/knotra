@@ -8,6 +8,13 @@ import io.knotra.ContextHandle;
 import java.util.Objects;
 import java.util.Optional;
 
+/**
+ * 活跃 artifact 工厂的内部句柄实现。
+ *
+ * <p>句柄只在 artifact 处于 ACTIVE 时有效；drain 会清空工厂与 schema，使陈旧句柄
+ * 无法继续挂载。挂载前重新执行配置 token 与实例类型校验，防止 raw cast 绕过类型化
+ * 解析。</p>
+ */
 final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
 
     final DefaultPf4jArtifactAdapter owner;

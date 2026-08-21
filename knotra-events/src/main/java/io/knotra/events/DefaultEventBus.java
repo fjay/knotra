@@ -15,6 +15,13 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * EventBus 的默认实现。注册、分发接受、取消订阅和关闭都在写锁下建立线性顺序；分发一旦被接受，
+ * 就持有固定监听集合与规范事件绑定，后续注册或取消订阅不会改变本次分发的可见结果。
+ *
+ * <p>总线可以拥有执行器，也可以复用调用方执行器。关闭总是等待关闭请求被观察到之前已接受的分发；
+ * 只有自有执行器会在这些分发收敛后被停止。</p>
+ */
 final class DefaultEventBus implements EventBus {
     private static final AtomicLong BUS_IDS = new AtomicLong();
 
@@ -22,7 +29,9 @@ final class DefaultEventBus implements EventBus {
     private final ClassLoader hostContextClassLoader;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private final Map<SubscriptionIndex, List<RegisteredSubscription>> subscriptions = new HashMap<>();
+    // 事件名到规范 JVM Class 的绑定。只要订阅或已接受分发仍引用该名称，绑定就必须保留。
     private final Map<String, EventBinding> eventBindings = new HashMap<>();
+    // 每个已接受分发对应一个收敛租约；whenIdle/closeAsync 只等待调用前已经进入该队列的租约。
     private final ConcurrentLinkedQueue<CompletableFuture<Void>> acceptedDispatches =
             new ConcurrentLinkedQueue<>();
     private final AtomicLong sequences = new AtomicLong();
@@ -96,6 +105,7 @@ final class DefaultEventBus implements EventBus {
     @Override
     public <T> EventDispatch<T> emit(EventDefinition<T> definition, T event) {
         Accepted<T> accepted = accept(definition, event, EventMode.SYNC);
+        // accepted.listeners 已被固化，同步回调即使修改注册表也不会改变本次分发的监听集合。
         try {
             List<EventFailure> failures = new ArrayList<>();
             for (RegisteredSubscription subscription : accepted.listeners()) {
@@ -125,8 +135,10 @@ final class DefaultEventBus implements EventBus {
             for (RegisteredSubscription subscription : accepted.listeners()) {
                 futures.add(parallelListener(subscription, accepted.event()));
             }
+            // 先提交 accepted 固化出的全部监听，再等待整体收敛，避免一个监听失败短路其他监听。
             CompletableFuture<Void> all = CompletableFuture.allOf(
                     futures.toArray(CompletableFuture[]::new));
+            // 所有监听结束后再聚合结果，保证 completedCount 与 failures 描述同一个收敛时刻。
             return all.thenApply(ignored -> {
                 int completed = 0;
                 List<EventFailure> failures = new ArrayList<>();
@@ -176,6 +188,7 @@ final class DefaultEventBus implements EventBus {
         try {
             DispatchState<T> state = DispatchState.initial(
                     accepted.event(), mode, accepted.listeners().size());
+            // 把固定监听集合折叠成一条 stage 链；每个节点基于上一个 DispatchState 决定是否继续。
             for (RegisteredSubscription subscription : accepted.listeners()) {
                 state = composeListener(state, subscription);
             }
@@ -189,6 +202,7 @@ final class DefaultEventBus implements EventBus {
 
     @Override
     public EventBusSnapshot snapshot() {
+        // 读锁内只读取注册表并生成不可变数据，避免 Snapshot 暴露后续变更或部分构建状态。
         lock.readLock().lock();
         try {
             List<EventBusSnapshot.Item> items = new ArrayList<>();
@@ -211,6 +225,7 @@ final class DefaultEventBus implements EventBus {
 
     @Override
     public CompletionStage<Void> whenIdle() {
+        // 使用写锁截取待等待租约，保证快照完成前不会有新的分发被接受；空快照可顺带清理空绑定。
         lock.writeLock().lock();
         try {
             List<CompletableFuture<Void>> pending = snapshotAcceptedDispatches();
@@ -227,6 +242,7 @@ final class DefaultEventBus implements EventBus {
     public CompletionStage<Void> closeAsync() {
         List<CompletableFuture<Void>> pending;
         boolean owner = false;
+        // 写锁内设置 closed 就是关闭观察边界：此前进入 accept 的分发会被等待，之后的新工作被拒绝。
         lock.writeLock().lock();
         try {
             if (closeFuture == null) {
@@ -240,6 +256,7 @@ final class DefaultEventBus implements EventBus {
                     }
                 }
                 subscriptions.clear();
+                // 只清空注册表；已接受分发仍直接持有 EventBinding，可等待结束后自行释放规范身份。
                 eventBindings.clear();
             } else {
                 pending = List.of();
@@ -248,6 +265,7 @@ final class DefaultEventBus implements EventBus {
             lock.writeLock().unlock();
         }
 
+        // 只有第一个关闭者负责收敛和停止执行器；后续调用直接复用同一个 closeFuture。
         if (owner) {
             whenDispatchesSettle(pending).whenComplete((ignored, error) -> {
                 if (error != null) {
@@ -271,6 +289,7 @@ final class DefaultEventBus implements EventBus {
             return;
         }
 
+        // 此时已接受分发已经收敛；shutdownNow 只用于丢弃不再需要的排队工作，终止结果仍需异步确认。
         executor.shutdownNow();
         Thread terminator = new Thread(() -> {
             try {
@@ -293,6 +312,7 @@ final class DefaultEventBus implements EventBus {
             DispatchState<T> state,
             RegisteredSubscription subscription) {
         CompletableFuture<DispatchState<T>> current = state.future();
+        // 各模式共用状态机：已完成计数、失败列表和停止位沿 stage 链传递，监听失败不会让外层 stage 异常完成。
         switch (state.mode()) {
             case SERIAL -> {
                 return DispatchState.of(state, current.thenCompose(next -> {
@@ -308,6 +328,7 @@ final class DefaultEventBus implements EventBus {
                     if (next.stopped()) {
                         return CompletableFuture.completedFuture(next);
                     }
+                    // bail 的返回值是“是否认领”，状态机需要反转为“是否继续”，认领即停止。
                     return bailListener(subscription, next).thenApply(outcome ->
                             next.afterListener(!outcome.continueDispatch(), outcome.failure()));
                 }));
@@ -338,6 +359,7 @@ final class DefaultEventBus implements EventBus {
             if (closed) {
                 throw new IllegalStateException("event bus is closed: " + busId);
             }
+            // 注册前获取规范绑定，防止同名事件在存活期间被另一个 ClassLoader 的同名 Class 重绑。
             EventBinding binding = acquireEventBinding(definition);
             Class<?> eventType = binding.eventType();
             RegisteredSubscription subscription = new RegisteredSubscription(
@@ -367,8 +389,10 @@ final class DefaultEventBus implements EventBus {
             }
             EventBinding binding = acquireEventBinding(definition);
             try {
+                // 在类型转换和租约入队前占用规范绑定；这条路径上的任何异常都必须走 releaseAcceptedBinding。
                 binding.dispatchAccepted();
                 Class<?> eventType = binding.eventType();
+                // 写锁下复制监听集合，随后 unsubscribe 不影响本次分发，但会影响下一次分发。
                 List<RegisteredSubscription> matching = subscriptions
                         .getOrDefault(new SubscriptionIndex(definition.name(), eventType, mode), List.of())
                         .stream()
@@ -378,6 +402,7 @@ final class DefaultEventBus implements EventBus {
                 for (RegisteredSubscription subscription : matching) {
                     subscription.accept(dispatch);
                 }
+                // 总线租约最后入队；到这里所有订阅的关闭租约也已记录，跳过的监听同样会被等待。
                 acceptedDispatches.add(dispatch);
                 return new Accepted<>(typedEvent, matching, dispatch, binding);
             } catch (Throwable error) {
@@ -392,9 +417,11 @@ final class DefaultEventBus implements EventBus {
     private EventBinding acquireEventBinding(EventDefinition<?> definition) {
         Class<?> candidate = definition.eventType();
         EventBinding binding = eventBindings.get(definition.name());
+        // 按事件名查找规范 Class 绑定；绑定存在时后续判断必须使用对象身份。
         if (binding == null) {
             binding = new EventBinding(candidate);
             eventBindings.put(definition.name(), binding);
+            // 必须用对象身份比较 Class：不同 artifact ClassLoader 中的同名 Class 不是同一事件身份。
         } else if (binding.eventType() != candidate) {
             throw new IllegalArgumentException("event name is already bound to a different Class: "
                     + definition.name() + " ["
@@ -404,6 +431,7 @@ final class DefaultEventBus implements EventBus {
     }
 
     private void releaseAcceptedBinding(EventBinding binding) {
+        // 分发计数归零且无订阅才移除绑定，避免在途分发期间允许同名不同 Class 重绑。
         if (binding.dispatchFinished()) {
             eventBindings.values().removeIf(current -> current == binding && current.isIdle());
         }
@@ -418,6 +446,7 @@ final class DefaultEventBus implements EventBus {
     }
 
     private void finish(Accepted<?> accepted) {
+        // finish 是收敛点：先移除总线租约并释放规范绑定，再清理订阅租约，最后完成 dispatch。
         lock.writeLock().lock();
         try {
             acceptedDispatches.remove(accepted.dispatch());
@@ -475,6 +504,7 @@ final class DefaultEventBus implements EventBus {
             RegisteredSubscription subscription,
             T event) {
         try {
+            // supplyAsync 的同步抛错和返回 stage 的异步失败都归一为 ListenerOutcome，供最终聚合。
             CompletableFuture<CompletionStage<ListenerOutcome<T>>> submitted =
                     CompletableFuture.supplyAsync(() -> {
                         try {
@@ -583,6 +613,7 @@ final class DefaultEventBus implements EventBus {
             RegisteredSubscription subscription,
             ContextCallback<R> callback) throws Throwable {
         ClassLoader previous = Thread.currentThread().getContextClassLoader();
+        // 回调期间切换到监听实现的 ClassLoader，finally 恢复调用线程原状态，避免污染执行器线程。
         Thread.currentThread().setContextClassLoader(subscription.listenerClassLoader());
         try {
             return callback.run();
@@ -599,6 +630,7 @@ final class DefaultEventBus implements EventBus {
 
     private static Exception asException(Throwable error) {
         Throwable cause = error;
+        // 层层组合 stage 会引入 Completion/Execution 包装，诊断和异常完成都应面向原始原因。
         while ((cause instanceof java.util.concurrent.CompletionException
                 || cause instanceof java.util.concurrent.ExecutionException)
                 && cause.getCause() != null) {
@@ -620,6 +652,7 @@ final class DefaultEventBus implements EventBus {
     private record SubscriptionIndex(String name, Class<?> eventType, EventMode mode) {
     }
 
+    /** 一次已接受分发的固定输入：事件值、监听集合、收敛租约与规范事件绑定。 */
     private record Accepted<T>(
             T event,
             List<RegisteredSubscription> listeners,
@@ -631,6 +664,7 @@ final class DefaultEventBus implements EventBus {
         }
     }
 
+    /** 单个监听的模式化结果：串行的继续标记、瀑布的下一个事件值或失败诊断。 */
     private record ListenerOutcome<T>(
             boolean continueDispatch,
             T event,
@@ -645,6 +679,10 @@ final class DefaultEventBus implements EventBus {
         }
     }
 
+    /**
+     * 串行、应急与瀑布共享的不可变分发状态。每执行一个监听就派生下一个状态，并沿同一个
+     * completion chain 传递；因此停止、失败和完成计数不会受并发注册或取消订阅影响。
+     */
     private static final class DispatchState<T> {
         private final T initialEvent;
         private final T event;
@@ -728,6 +766,7 @@ final class DefaultEventBus implements EventBus {
             return future;
         }
 
+        /** 记录串行/应急监听结果：失败不计完成并停止，无错误停止只标记 stopped。 */
         private DispatchState<T> afterListener(boolean continueDispatch, EventFailure failure) {
             boolean failed = failure != null;
             return new DispatchState<>(
@@ -741,6 +780,7 @@ final class DefaultEventBus implements EventBus {
                     CompletableFuture.completedFuture(null));
         }
 
+        /** 瀑布监听成功才推进事件值；失败保留上一个成功值并停止后续变换。 */
         private DispatchState<T> afterTransform(T nextEvent, EventFailure failure) {
             boolean failed = failure != null;
             return new DispatchState<>(
@@ -772,6 +812,7 @@ final class DefaultEventBus implements EventBus {
         }
     }
 
+    /** 事件名当前锁定的规范 JVM Class，以及仍引用该身份的订阅和分发计数。 */
     private static final class EventBinding {
         private final Class<?> eventType;
         private int subscriptions;
@@ -806,6 +847,10 @@ final class DefaultEventBus implements EventBus {
         }
     }
 
+    /**
+     * 总线内部的一次注册。除注册表条目外，还记录每个订阅已接受的分发租约，
+     * 使订阅关闭可以独立等待自己的在途工作。
+     */
     private final class RegisteredSubscription implements EventSubscription {
         private final String subscriptionId;
         private final EventDefinition<?> definition;
@@ -841,6 +886,7 @@ final class DefaultEventBus implements EventBus {
 
         @Override
         public long sequence() {
+            // 订阅 ID 内嵌写锁下分配的原子序号；从唯一标识解析可避免维护第二份排序来源。
             return Long.parseLong(subscriptionId.substring(subscriptionId.lastIndexOf('-') + 1));
         }
 
@@ -851,6 +897,7 @@ final class DefaultEventBus implements EventBus {
 
         @Override
         public void unsubscribe() {
+            // 先原子抢占状态，保证重复取消和回调内自取消都幂等，同时避免阻塞在总线写锁上。
             if (!active.compareAndSet(true, false)) {
                 return;
             }
@@ -879,6 +926,7 @@ final class DefaultEventBus implements EventBus {
         @Override
         public synchronized CompletionStage<Void> closeAsync() {
             unsubscribe();
+            // unsubscribe 只影响未来分发；这里快照并等待本订阅在关闭观察前已接受的租约。
             if (closeFuture == null) {
                 List<CompletableFuture<Void>> pending = new ArrayList<>();
                 for (CompletableFuture<Void> dispatch : acceptedDispatches) {
@@ -898,6 +946,7 @@ final class DefaultEventBus implements EventBus {
         }
 
         private void accept(CompletableFuture<Void> dispatch) {
+            // 即使串行/瀑布链最终跳过该监听，已入队的租约也由 finish 统一释放。
             acceptedDispatches.add(dispatch);
         }
 
@@ -910,6 +959,7 @@ final class DefaultEventBus implements EventBus {
         }
 
         private ClassLoader listenerClassLoader() {
+            // 使用监听实现的 ClassLoader，而不是事件类型或总线创建者的 ClassLoader。
             return listener.getClass().getClassLoader();
         }
 

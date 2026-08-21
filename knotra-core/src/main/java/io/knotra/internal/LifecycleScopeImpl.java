@@ -16,7 +16,20 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicLong;
 
+
+/**
+ * Activation 拥有的可逆资源作用域实现。
+ *
+ * <p>每个 {@link ActivationRuntime} 持有一个根作用域，子作用域和受管条目作为树中的
+ * {@link Node} 记录。所有节点使用同一个全局序列，释放时按序列倒序执行，形成跨嵌套层的 LIFO 顺序；
+ * 显式 parallelChild 只并行其直接条目，不把并行性扩展到后续兄弟节点。释放是异步聚合的，失败条目
+ * 保持 {@code FAILED} 并保留释放器，供 ComponentHandle.retry() 只重试失败部分。</p>
+ *
+ * <p>锁约定：新增子节点时先锁父再锁子，保证父状态检查与树插入有序；释放器本身在作用域锁外执行。
+ * {@link DefaultKnotraRuntime} 先完成依赖方清理，再触发提供方 {@code teardown()}。</p>
+ */
 final class LifecycleScopeImpl implements LifecycleScope {
+    // 节点创建顺序全局唯一；LIFO 不依赖各作用域本地列表的嵌套时机。
     private static final AtomicLong SEQUENCE = new AtomicLong();
 
     private final String id;
@@ -25,9 +38,11 @@ final class LifecycleScopeImpl implements LifecycleScope {
     private final boolean parallel;
     private final long sequence;
     private final Object lock = new Object();
+    // 只在各自 lock 内修改；teardown 先复制快照，再在锁外执行释放器。
     private final List<Node> nodes = new ArrayList<>();
 
     private LifecycleState state = LifecycleState.OPEN;
+    // 错误只保留文本，不保存 Throwable，避免诊断路径延长用户对象生命周期。
     private final List<String> cleanupErrors = new ArrayList<>();
     private LifecycleScopeImpl(
             String id,
@@ -103,6 +118,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
             AsyncDisposer async,
             boolean asynchronous) {
         String safeDescription = safeText(description);
+        // 先父后子：父作用域已经停止时，子作用域不能再接受晚到资源。
         synchronized (parent == null ? lock : parent.lock) {
             if (parent != null && parent.state != LifecycleState.OPEN) {
                 throw new IllegalStateException(
@@ -168,6 +184,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
         }
     }
 
+    // 先关闭整棵树的准入，再异步释放；所有边界完成后按收集时的反序汇总最终状态。
     CompletableFuture<Void> teardown() {
         markStopping();
         List<LifecycleScopeImpl> descendants = descendants();
@@ -178,6 +195,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
         });
     }
 
+    // 递归传播 STOPPING 也遵守父到子的方向；该状态会拒绝清理期间的晚到 manage。
     private void markStopping() {
         synchronized (lock) {
             if (state != LifecycleState.OPEN) {
@@ -197,8 +215,10 @@ final class LifecycleScopeImpl implements LifecycleScope {
         synchronized (boundary.lock) {
             direct = new ArrayList<>(boundary.nodes);
         }
+        // 使用全局序列倒序，而不是列表插入顺序，保证嵌套创建也得到确定性的 LIFO。
         direct.sort(Comparator.comparingLong(Node::sequence).reversed());
 
+        // parallel 组只放宽其直接节点的互斥；边界之间仍按父作用域的 LIFO 进入。
         if (boundary.parallel) {
             List<CompletableFuture<Void>> work = direct.stream()
                     .map(boundary::cleanupNode)
@@ -206,6 +226,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
             return CompletableFuture.allOf(work.toArray(CompletableFuture[]::new));
         }
 
+        // 失败会被转换成已完成的 null，因此串行链继续执行后续兄弟条目而不是短路。
         CompletableFuture<Void> result = CompletableFuture.completedFuture(null);
         for (Node node : direct) {
             result = result.thenCompose(ignored -> boundary.cleanupNode(node));
@@ -220,6 +241,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
         return cleanupBoundary(((ScopeNode) node).scope());
     }
 
+    // 临界区只负责幂等状态迁移；实际同步/异步释放器必须在作用域锁外执行。
     private CompletableFuture<Void> runEntry(Entry entry) {
         synchronized (lock) {
             if (entry.state() == CleanupState.SUCCEEDED) {
@@ -245,6 +267,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
                 result = CompletableFuture.completedFuture(null);
             }
         } catch (Throwable error) {
+            // 同步失败也走同一结算路径，并返回完成值让串行释放继续。
             settleEntry(entry, error);
             return CompletableFuture.completedFuture(null);
         }
@@ -254,6 +277,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
         });
     }
 
+    // 成功会清空释放引用；失败保留在 Entry 中，retry 时只重开 FAILED 条目。
     private void settleEntry(Entry entry, Throwable error) {
         synchronized (lock) {
             if (error == null) {
@@ -266,6 +290,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
         }
     }
 
+    // 汇总所有嵌套作用域的失败；任一 Entry 失败都会让该边界保持 FAILED 以便重试。
     private void finish() {
         synchronized (lock) {
             boolean failed = nodes.stream().anyMatch(node -> {
@@ -434,6 +459,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
     private record ScopeNode(LifecycleScopeImpl scope, long sequence) implements Node {
     }
 
+    // 单个受管条目；释放器字段只在成功后清空，失败时保留用于 ComponentHandle.retry()。
     private static final class Entry implements Node {
         private final String id;
         private final String description;

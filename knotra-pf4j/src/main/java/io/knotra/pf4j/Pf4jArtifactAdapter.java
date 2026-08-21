@@ -8,7 +8,12 @@ import java.util.concurrent.CompletableFuture;
 
 import io.knotra.KnotraRuntime;
 
-/** PF4J artifact boundary. The mutable PF4J plugin manager is never exposed. */
+/**
+ * PF4J artifact 边界的公开适配器合约。
+ *
+ * <p>适配器负责 artifact 加载/启动、类型化受控挂载、只读工厂目录、drain、卸载与
+ * ClassLoader 防护；它不暴露可变 PF4J 插件管理器，也不会在加载时隐式挂载组件。</p>
+ */
 public interface Pf4jArtifactAdapter extends AutoCloseable {
 
     static Pf4jArtifactAdapter create(

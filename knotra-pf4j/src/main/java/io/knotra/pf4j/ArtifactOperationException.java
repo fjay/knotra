@@ -1,6 +1,6 @@
 package io.knotra.pf4j;
 
-/** Structured adapter failure containing stable text only. */
+/** 结构化 artifact 操作失败，只携带稳定的 artifact 标识、阶段与文本。 */
 public final class ArtifactOperationException extends RuntimeException {
 
     private final String artifactId;

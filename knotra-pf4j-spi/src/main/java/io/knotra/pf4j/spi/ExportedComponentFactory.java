@@ -6,9 +6,12 @@ import io.knotra.ComponentFactory;
 import io.knotra.NoConfig;
 
 /**
- * A factory exported by an artifact together with its cross-boundary config token.
+ * 由 PF4J artifact 导出的受控工厂及其跨边界配置 token。
  *
- * @param <C> configuration type shared by the artifact and host
+ * <p>配置 token 必须来自宿主或共享合约包；适配器会在 artifact 发现、类型化解析和挂载
+ * 前逐层校验该 token，避免插件私有类型进入 Capability 合约。</p>
+ *
+ * @param <C> artifact 与宿主共享的配置类型
  */
 public record ExportedComponentFactory<C>(
         Class<C> configType,

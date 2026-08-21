@@ -12,6 +12,15 @@ import java.lang.invoke.MethodType;
 import java.util.Objects;
 import java.util.Optional;
 
+
+/**
+ * 挂载前准备完成的组件实例及其冻结合约。
+ *
+ * <p>准备阶段在宿主事务回调中执行，会调用工厂、schema 与组件描述符等用户代码，并发生在
+ * {@link DefaultKnotraRuntime} 协调器锁外。descriptor、factoryId、MountOptions 和初始归一化配置在
+ * 此后不再跟随有状态组件对象变化；后续 reconfigure 只复用 schema 的归一化句柄。组件实例和配置由
+ * {@link ComponentRuntime} 持有，直到该 ComponentHandle 终止并被移除。</p>
+ */
 final class PreparedComponent<C> {
     private final String factoryId;
     private final ComponentDescriptor descriptor;
@@ -51,14 +60,17 @@ final class PreparedComponent<C> {
         if (factoryId.isBlank()) {
             throw new IllegalArgumentException("factoryId must not be blank");
         }
+        // 工厂和描述符都是用户代码；准备发生在协调器锁外，慢实现不能阻塞其他宿主事务。
         Component<C> component = Objects.requireNonNull(
                 factory.create(), "factory.create() returned null");
+        // descriptor 只读取一次并冻结，防止有状态组件随后改变依赖声明破坏 BindingSet 语义。
         ComponentDescriptor descriptor = component.descriptor();
         for (String failure : descriptor.validate()) {
             throw new IllegalArgumentException(failure);
         }
         Optional<ConfigSchema<C>> optionalSchema = factory.configSchema();
         ConfigSchema<C> validator = optionalSchema.orElse(null);
+        // 配置在进入视图前归一化；失败停留在事务回调中，不会留下部分提交的挂载。
         C config;
         try {
             config = validator == null

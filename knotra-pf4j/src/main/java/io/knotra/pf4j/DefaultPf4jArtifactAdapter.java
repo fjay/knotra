@@ -37,12 +37,21 @@ import org.pf4j.PluginState;
 import org.pf4j.PluginWrapper;
 import org.pf4j.PropertiesPluginDescriptorFinder;
 
+/**
+ * {@link Pf4jArtifactAdapter} 的默认实现，也是 artifact 生命周期的唯一编排点。
+ *
+ * <p>加载在协调器中解析依赖闭包、按拓扑顺序加载并启动 PF4J 插件，然后只发布
+ * guarded 工厂；组件挂载仍必须由宿主显式完成。卸载先进入 drain，停止新挂载、等待
+ * in-flight 挂载、按依赖闭包 dispose owned handle，最后停止并卸载 PF4J 插件。任何
+ * 清理失败都会保留 {@code DRAIN_FAILED} 与诊断，供后续 close/retryDrain 重试。</p>
+ */
 final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
     private final PluginManager pluginManager;
     private final ArtifactCoordinator coordinator;
     private final KnotraRuntime runtime;
     private final KnotraClassLoaderPolicy classLoaderPolicy;
+    // 协调器串行化入口；drain 的异步等待会释放协调线程，因此内存状态仍需独立锁保护。
     private final Object stateLock = new Object();
     private final Map<String, ManagedArtifact> artifacts = new LinkedHashMap<>();
     private final Map<String, ArtifactDiagnostic> loadFailures = new LinkedHashMap<>();
@@ -76,6 +85,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                                 + handle.configType().getName()
                                 + ", not " + configType.getName());
             }
+            // 前面的精确 token 相等保证工厂泛型与调用方请求一致，这里只是恢复编译期类型。
             @SuppressWarnings("unchecked")
             ArtifactFactoryHandle<C> typed = (ArtifactFactoryHandle<C>) handle;
             return Optional.of(typed);
@@ -115,23 +125,28 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             return CompletableFuture.failedFuture(new IllegalStateException("adapter is closed"));
         }
         return coordinator.submit(() -> {
+            // 只记录本次新加载的插件；复用 artifact 不能被目标加载失败回滚掉。
             LoadJournal journal = new LoadJournal();
             String targetId = null;
             try {
+                // 先离线解析完整闭包与拓扑顺序，缺失/环/版本冲突在加载任何插件前失败。
                 ArtifactClosure closure = resolveClosure(target);
                 targetId = closure.targetId();
                 loadMissing(closure, journal);
+                // 依赖先启动，目标插件最后一个启动，保证扩展发现看到的是可用闭包。
                 for (String id : closure.loadOrder()) {
                     PluginState state = pluginManager.startPlugin(id);
                     if (state != PluginState.STARTED) {
                         throw new IllegalStateException("PF4J start returned " + state + " for " + id);
                     }
                 }
+                // 全闭包启动成功后才发布目录；加载/启动阶段不会给宿主留下可挂载句柄。
                 for (String id : closure.loadOrder()) {
                     publishIfAbsent(id, id.equals(targetId));
                 }
                 return snapshotCoordinated(targetId);
             } catch (Throwable failure) {
+                // 按加载逆序回滚本次变更；回滚本身失败则保留残余诊断，不伪造成功。
                 rollback(journal, targetId, failure);
                 String id = targetId == null ? "unknown" : targetId;
                 String detail = FailureText.describe(failure);
@@ -295,8 +310,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 .toList();
         CompletableFuture.allOf(drains.toArray(CompletableFuture[]::new)).whenComplete((ignored, failure) -> {
             if (failure != null) {
-                // Keep the coordinator and all diagnostics alive so a new close
-                // attempt can retry failed cleanup after the caller observes it.
+                // 保留协调器与诊断；调用方观察到失败后，新的 close 才能重试清理。
                 clearFailedCloseAttempt(attempt);
                 attempt.completeExceptionally(unwrap(failure));
                 return;
@@ -336,6 +350,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                     factory,
                     classLoaderPolicy,
                     handle.artifact.metadata);
+            // 提交 Core 事务不持有内存状态锁；组件启动仍由 Core 控制在协调器之外。
             MutationResult<ComponentHandle<C>> result = runtime.mutate(mutation ->
                     mutation.mount(
                             context,
@@ -353,8 +368,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             }
             component = result.value();
             synchronized (stateLock) {
-                // A committed Core handle is owned by the artifact even when a
-                // concurrent drain changed the artifact state before this lock.
+                // Core 已提交的句柄即使撞上并发 drain，也必须先记入所有权再决定回滚。
                 handle.artifact.directHandles.put(component.handleId(), component);
                 if (handle.artifact.acceptingMounts
                         && handle.artifact.state == ArtifactState.ACTIVE) {
@@ -362,12 +376,14 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 }
                 lostRace = true;
             }
+        // 正常路径在此解除 in-flight 计数；输给 drain 的路径等补偿 dispose 完成后解除。
         } finally {
             if (!lostRace) {
                 endMount(handle.artifact);
             }
         }
 
+        // mount 提交后撞上 drain：先保留所有权，异步 dispose 完成前不能卸载插件。
         ComponentHandle<C> rejected = component;
         rejected.dispose().whenComplete((ignored, disposalFailure) ->
                 endMount(handle.artifact));
@@ -419,6 +435,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         Map<String, CatalogEntry> repository = new LinkedHashMap<>();
         Map<Path, CatalogEntry> byPath = new LinkedHashMap<>();
         LinkedHashSet<Path> roots = new LinkedHashSet<>();
+        // 同时扫描配置 roots、目标所在目录和已加载 wrapper，才能复用依赖并识别同 ID 冲突。
         for (Path root : safePluginRoots()) {
             roots.add(root.toAbsolutePath().normalize());
         }
@@ -483,7 +500,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 return new CatalogEntry(path, descriptor);
             }
         } catch (RuntimeException ignored) {
-            // Fall through to the stable malformed-artifact failure below.
+            // 统一落到下方稳定失败，避免把 finder 的各种运行时异常泄漏给宿主。
         }
         throw new IllegalStateException("cannot read a valid PF4J descriptor from " + path);
     }
@@ -544,6 +561,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             return;
         }
         selected.put(id, entry);
+        // optional 依赖只要在仓库中就参与解析；完全缺失时才允许被跳过。
         for (PluginDependency dependency : entry.descriptor().getDependencies()) {
             if (repository.containsKey(dependency.getPluginId()) || !dependency.isOptional()) {
                 collectClosure(
@@ -571,6 +589,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
     private void loadMissing(ArtifactClosure closure, LoadJournal journal) {
         for (String id : closure.loadOrder()) {
+            // 只加载 PF4J 尚未持有的插件，并验证实际 ID，防止描述符与 jar 内容漂移。
             if (pluginManager.getPlugin(id) != null) {
                 continue;
             }
@@ -592,6 +611,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         Path path = wrapper.getPluginPath().toAbsolutePath().normalize();
         String version = wrapper.getDescriptor().getVersion();
 
+        // 扩展发现会执行插件代码，因此候选对象在锁外构建，发布时再复查当前受管状态。
         synchronized (stateLock) {
             ManagedArtifact existing = artifacts.get(artifactId);
             if (existing != null && existing.state != ArtifactState.UNLOADED) {
@@ -608,6 +628,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 wrapper);
         candidate.pf4jStateView = () -> pf4jState(artifactId);
         List<ManagedFactory<?>> discovered = discoverFactories(candidate, requireProvider);
+        // 锁外发现期间同 ID 可能已被并发协调发布；只有最终检查通过才提交目录。
         synchronized (stateLock) {
             ManagedArtifact existing = artifacts.get(artifactId);
             if (existing != null && existing.state != ArtifactState.UNLOADED) {
@@ -676,6 +697,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         Set<String> localIds = new LinkedHashSet<>();
         List<ManagedFactory<?>> result = new ArrayList<>();
         for (RuntimeComponentProvider provider : providers) {
+            // 先保证 provider 扩展点身份来自宿主，再调用插件代码，避免被私有副本分派。
             classLoaderPolicy.validateInterface(
                     provider.getClass(),
                     RuntimeComponentProvider.class,
@@ -702,6 +724,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             Set<String> localIds,
             ManagedArtifact artifact,
             ExportedComponentFactory<C> exported) {
+        // 配置 token 是跨边界合约，必须在工厂进入目录前完成宿主身份校验。
         classLoaderPolicy.validateContractType(exported.configType(), artifact.artifactId);
         ComponentFactory<C> factory = exported.factory();
         Optional<ConfigSchema<C>> configSchema = factory.configSchema();
@@ -725,6 +748,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     private void rollback(LoadJournal journal, String targetId, Throwable failure) {
+        // 逆序停止并卸载本次 journal 记录的插件；残余插件必须留下 FAILED 诊断。
         List<String> rollbackFailures = new ArrayList<>();
         boolean residual = false;
         List<String> loaded = journal.loaded();
@@ -815,6 +839,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             return CompletableFuture.failedFuture(new IllegalStateException("adapter is closed"));
         }
         CompletableFuture<Void> result = new CompletableFuture<>();
+        // 先在协调器上完成状态切换；后续等待和 dispose 异步执行，不占用唯一协调线程。
         CompletableFuture<Void> scheduled = coordinator.execute(() -> {
             DrainRequest request;
             synchronized (stateLock) {
@@ -824,6 +849,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                             artifactId, phase, "artifact is not managed"));
                     return;
                 }
+                // 复用同一个 drain future，使并发 unload/retry 观察到同一结果。
                 if (target.state == ArtifactState.DRAINING && target.drainFuture != null) {
                     target.drainFuture.whenComplete((ignored, error) -> {
                         if (error == null) {
@@ -859,6 +885,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             ManagedArtifact target,
             CompletableFuture<Void> result,
             String phase) {
+        // 卸载依赖会先 drain 全部未卸载下游 artifact，避免下游仍引用已释放插件类。
         List<ManagedArtifact> closure = dependentClosure(target);
         for (ManagedArtifact artifact : closure) {
             artifact.state = ArtifactState.DRAINING;
@@ -903,6 +930,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     private void waitAndDispose(DrainRequest request) {
+        // drain 的顺序是等待 in-flight 挂载，再刷新归属并异步 dispose owned root。
         List<CompletableFuture<Void>> waits = request.artifacts().stream()
                 .map(this::waitForMounts)
                 .toList();
@@ -932,6 +960,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         for (ManagedArtifact artifact : request.artifacts()) {
             refreshOwnership(artifact.artifactId);
         }
+        // 只 dispose 适配器直接提交的根；来源标记像 artifact 的宿主根不能被悄悄夺走。
         ArtifactOperationException missingRoots = verifyKnownArtifactRoots(request);
         if (missingRoots != null) {
             completeDrainFailure(request, missingRoots);
@@ -976,7 +1005,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     private CompletableFuture<ComponentState> disposeRootHandle(ComponentHandle<?> handle) {
         boolean failedDisposedGoal = handle.state() == ComponentState.FAILED
                 && handle.goal() == io.knotra.ComponentGoal.DISPOSED;
-        // A failed disposed goal means only cleanup remains retryable.
+        // FAILED 且目标是 DISPOSED 时，只剩可重试的清理，不应重新启动组件。
         CompletableFuture<ComponentState> attempt = failedDisposedGoal
                 ? handle.retry().toCompletableFuture()
                 : handle.dispose().toCompletableFuture();
@@ -984,7 +1013,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             if (!isRuntimeClosing()) {
                 return CompletableFuture.failedFuture(error);
             }
-            // The enclosing runtime close owns this disposal; wait for its settlement.
+            // runtime.close 已拥有该清理；适配器等待其收敛，避免重复 dispose 争抢。
             return handle.whenSettled().toCompletableFuture();
         });
     }
@@ -1043,6 +1072,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     private void finishDrain(DrainRequest request) {
+        // 所有 dispose settled 后重新进入协调器；最终 stop/unload 不能与读或其他 drain 交错。
         CompletableFuture<Void> scheduled = coordinator.execute(() -> {
             try {
                 stopAndUnload(request);
@@ -1123,6 +1153,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         (left, right) -> right,
                         LinkedHashMap::new));
         synchronized (stateLock) {
+            // Runtime 快照是存活句柄的权威来源；已 dispose 且消失的本地记录可以清理。
             artifact.directHandles.keySet().removeIf(handleId ->
                     artifact.directHandles.get(handleId) != null
                             && artifact.directHandles.get(handleId).state() == ComponentState.DISPOSED

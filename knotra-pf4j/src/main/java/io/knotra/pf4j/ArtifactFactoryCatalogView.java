@@ -1,6 +1,6 @@
 package io.knotra.pf4j;
 
-/** Package-private immutable projection of a managed factory into catalog metadata. */
+/** 包内不可变投影：把受管工厂压缩成目录可见的安全元数据。 */
 record ArtifactFactoryCatalogView(
         String artifactId,
         String artifactVersion,

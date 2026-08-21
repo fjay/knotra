@@ -6,6 +6,13 @@ import io.knotra.RuntimeContext;
 
 import java.util.Optional;
 
+
+/**
+ * 宿主读取指定 Context 可见 Capability 的边界。
+ *
+ * <p>该对象只是 {@link DefaultKnotraRuntime} 的无状态视图，每次读取解析当时已发布的
+ * {@link RuntimeView}；它不缓存 Capability 值，也不暴露组件实例或 LifecycleScope。</p>
+ */
 final class RuntimeContextImpl implements RuntimeContext {
     private final DefaultKnotraRuntime runtime;
     private final String contextId;

@@ -2,6 +2,13 @@ package io.knotra.internal;
 
 import java.util.concurrent.atomic.AtomicLong;
 
+
+/**
+ * 进程级 ID 序列，用于保证 Runtime 内部实体 ID 不依赖对象相等性。
+ *
+ * <p>序列跨多个 Runtime 实例全局单调递增；Context 名称会被规范化后拼入 ID，
+ * 以便诊断可读，但唯一性仍来自序列值。</p>
+ */
 final class Sequences {
     private static final AtomicLong REGISTRATIONS = new AtomicLong();
     private static final AtomicLong ACTIVATIONS = new AtomicLong();

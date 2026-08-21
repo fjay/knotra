@@ -32,6 +32,25 @@ import io.knotra.NoConfig;
 import io.knotra.RuntimeDiagnostic;
 import io.knotra.RuntimeSnapshot;
 
+/**
+ * 基于 Core 的声明式期望状态收敛器。
+ *
+ * <p>Loader 把每个期望条目映射到一个稳定路径，并为其分配专属的子 Context 与
+ * 挂载 ID。reconcile 时，Loader 将期望树与运行时当前状态对比，按“完全准备
+ * 校验 → 同步外部释放的记账 → 处理失败的期望 Context → 释放多余条目 →
+ * 替换实现变化的条目 → 补挂缺失条目 → 重配置既有条目”的顺序收敛。准备阶段
+ * 的失败不会触碰现有树；新增批次失败会回滚本批已挂载的句柄与新 Context，
+ * 而不是留下部分挂载。
+ *
+ * <p>所有结构变更都通过宿主短事务提交给 Runtime，Loader 自身只保存“路径 →
+ * Context/句柄”的记账信息。两种挂载范围：owned 模式在根 Context 下创建
+ * 专属基础 Context，关闭时整体释放该子树；over 模式挂接宿主提供的 Context，
+ * 只管理自己创建的子结构，绝不认领路径上已有的外来 Context 或挂载点。
+ *
+ * <p>操作在单线程协调器上串行执行，保证并发 reconcile 看到一致的树状态；
+ * 协调器线程内的重入调用会被拒绝，避免受控策略回调造成自等待死锁。
+ * FAILED 的组件不会被自动重试，需通过 {@link #retry(String)} 显式恢复。
+ */
 public final class KnotraLoader implements AutoCloseable {
 
     private static final AtomicLong NEXT_ID = new AtomicLong();
@@ -45,8 +64,11 @@ public final class KnotraLoader implements AutoCloseable {
     private final AtomicReference<Thread> coordinatorThread = new AtomicReference<>();
     private final Object closeGate = new Object();
 
+    /** 稳定路径 → 受管条目（句柄、定义、配置）记账，仅在协调器线程上变更。 */
     private final TreeMap<String, ManagedEntry> current = new TreeMap<>();
+    /** 稳定路径 → Loader 创建的 Context 记账，仅在协调器线程上变更。 */
     private final TreeMap<String, ContextHandle> contexts = new TreeMap<>();
+    /** 发布给 snapshot() 的不可变视图。 */
     private volatile LoaderView view = LoaderView.EMPTY;
     private volatile List<LoaderDiagnostic> latestDiagnostics = List.of();
     private volatile boolean closed;
@@ -79,12 +101,26 @@ public final class KnotraLoader implements AutoCloseable {
         publish(List.of());
     }
 
+    /**
+     * 创建 owned 模式的 Loader：在根 Context 下创建以 loaderId 命名的专属
+     * 基础 Context。
+     *
+     * <p>该基础 Context 及其全部子结构都由 Loader 拥有；close 时整体释放，
+     * 不影响根 Context 本身与其他宿主结构。
+     */
     public static KnotraLoader owned(
             KnotraRuntime runtime,
             ComponentFactoryResolver resolver) {
         return new KnotraLoader(runtime, null, resolver, true);
     }
 
+    /**
+     * 创建 over 模式的 Loader：挂接到宿主提供的 baseContext。
+     *
+     * <p>Loader 只在该 Context 下创建并管理自己的子结构；close 时仅释放自己
+     * 创建的顶层子树，baseContext 保持不变。期望路径上已存在的外来 Context
+     * 或挂载会被判定为冲突并拒绝，不会隐式认领。
+     */
     public static KnotraLoader over(
             KnotraRuntime runtime,
             ContextHandle context,
@@ -92,18 +128,38 @@ public final class KnotraLoader implements AutoCloseable {
         return new KnotraLoader(runtime, context, resolver, false);
     }
 
+    /** Loader 实例 ID；owned 模式下同时用作专属基础 Context 的名称。 */
     public String loaderId() {
         return loaderId;
     }
 
+    /** 是否为 owned 模式（拥有专属基础 Context）。 */
     public boolean owned() {
         return owned;
     }
 
+    /** 当前基础 Context：owned 模式为 Loader 专属 Context，over 模式为宿主提供。 */
     public ContextHandle baseContext() {
         return baseContext;
     }
 
+    /**
+     * 异步收敛期望树。
+     *
+     * <p>流程分两个层次：先把期望树完全准备并校验（路径归一化、父完整性、
+     * 与运行时状态的冲突预检、工厂解析、配置归一化），任何准备失败都不会
+     * 触碰现有树；随后按“先清理后建设”的顺序执行结构事务：释放期望树中
+     * 已不存在的条目、整句柄替换实现身份变化的条目、挂载缺失条目，并对
+     * 身份不变的条目应用配置重配置。
+     *
+     * <p>契约：操作在协调器上串行执行；收敛拒绝以结构化诊断返回而不是抛出，
+     * 协调器内部错误与协调器线程上的重入调用仍以异常抛出；新增批次失败时
+     * 本批已挂载的句柄与新 Context 按 LIFO 回滚；FAILED 组件不做自动重试。
+     * Loader 已关闭时立即完成并携带 CLOSED 诊断。
+     *
+     * @param desired 完整的期望组件树；每次调用都是全量状态而非增量
+     * @return 收敛结果（converged、变更列表、诊断列表）
+     */
     public CompletionStage<ReconcileResult> reconcileAsync(ComponentTree desired) {
         Objects.requireNonNull(desired, "desired");
         if (closed) {
@@ -118,6 +174,12 @@ public final class KnotraLoader implements AutoCloseable {
         return enqueue(() -> performReconcile(desired));
     }
 
+    /**
+     * 阻塞执行 {@link #reconcileAsync(ComponentTree)}。
+     *
+     * <p>协调器上的运行时异常原样抛出，其他异常包装为 IllegalStateException；
+     * 等待被中断时恢复中断标记并抛出 IllegalStateException。
+     */
     public ReconcileResult reconcile(ComponentTree desired) {
         try {
             return reconcileAsync(desired).toCompletableFuture().get();
@@ -133,6 +195,17 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 对指定路径执行显式恢复。
+     *
+     * <p>组件处于 FAILED 时触发 ComponentHandle.retry 重新激活；条目对应的
+     * Context 处于 FAILED 时释放该子树，让下一次 reconcile 重建。两者之外的
+     * 请求记为 INVALID_TREE。与 reconcile 不同，retry 不重读期望树，
+     * 只作用于当前记账中该路径的状态。
+     *
+     * @param path 条目的归一化路径
+     * @return 恢复结果；已关闭时返回 CLOSED 诊断
+     */
     public CompletionStage<ReconcileResult> retryAsync(String path) {
         String normalized = normalizePath(path, "");
         if (closed) {
@@ -147,6 +220,7 @@ public final class KnotraLoader implements AutoCloseable {
         return enqueue(() -> performRetry(normalized));
     }
 
+    /** 阻塞执行 {@link #retryAsync(String)}；异常约定与 {@link #reconcile(ComponentTree)} 一致。 */
     public ReconcileResult retry(String path) {
         try {
             return retryAsync(path).toCompletableFuture().get();
@@ -162,6 +236,13 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 返回 Loader 当前状态的不可变快照。
+     *
+     * <p>快照只包含数据：条目路径、Context 与挂载标识、实现身份、配置代际、
+     * 组件状态与最近诊断，不暴露存活组件实例或内部记账结构。可在协调器
+     * 之外随时调用，读取的是最近一次发布的一致视图。
+     */
     public LoaderSnapshot snapshot() {
         LoaderView local = view;
         List<LoaderSnapshot.EntrySnapshot> entries = local.entries().values().stream()
@@ -186,6 +267,15 @@ public final class KnotraLoader implements AutoCloseable {
                 latestDiagnostics);
     }
 
+    /**
+     * 异步关闭 Loader 并释放其管理的结构。
+     *
+     * <p>owned 模式整体释放基础 Context；over 模式只释放自己创建的顶层子树。
+     * 清理失败不会伪造成功：close future 异常完成，closed 状态与诊断保留，
+     * 可再次调用 close 重试。与运行时 close 的竞态会收敛：若运行时已在释放
+     * 根 Context，Loader 只同步记账，不把该竞态报告为失败。重复调用返回
+     * 同一个未完成（或已成功）的 close future。
+     */
     public CompletionStage<Void> closeAsync() {
         rejectReentrant("close");
         synchronized (closeGate) {
@@ -199,11 +289,16 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** 阻塞等待 {@link #closeAsync()} 完成；清理异常直接上抛，可再次调用重试。 */
     @Override
     public void close() throws Exception {
         closeAsync().toCompletableFuture().get();
     }
 
+    /**
+     * 把操作排入单线程协调器。coordinatorThread 用于识别协调器线程本身，
+     * 拒绝受控策略或组件代码在协调器线程内重入调用 Loader，防止自等待死锁。
+     */
     private <T> CompletableFuture<T> enqueue(Callable<T> operation) {
         rejectReentrant("coordinator operation");
         CompletableFuture<T> outcome = new CompletableFuture<>();
@@ -235,6 +330,12 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * reconcile 主体。阶段刻意“先校验、后清理、再建设”：prepare 阶段的任何
+     * 失败都不会触碰现有树；清理失败会立即中止，避免在未收敛的运行时上继续
+     * 挂载；工厂替换在配置更新之前完成，后者只处理实现身份已匹配的条目。
+     * 最后统一收集 FAILED 诊断，把重试决策留给显式 retry。
+     */
     private ReconcileResult performReconcile(ComponentTree desired) {
         List<LoaderDiagnostic> diagnostics = new ArrayList<>();
         List<ReconcileResult.Change> changes = new ArrayList<>();
@@ -270,6 +371,10 @@ public final class KnotraLoader implements AutoCloseable {
         return finish(proposed && diagnostics.isEmpty(), changes, diagnostics);
     }
 
+    /**
+     * 显式恢复单条路径：FAILED 组件走 handle.retry 重新激活；FAILED Context
+     * 先整树释放，让下一次 reconcile 重建，避免在失败的 Context 上反复挂载。
+     */
     private ReconcileResult performRetry(String path) {
         List<LoaderDiagnostic> diagnostics = new ArrayList<>();
         List<ReconcileResult.Change> changes = new ArrayList<>();
@@ -321,6 +426,10 @@ public final class KnotraLoader implements AutoCloseable {
         return finish(false, changes, diagnostics);
     }
 
+    /**
+     * 关闭主体。若运行时已在释放根 Context，说明运行时 close 已经负责本次
+     * teardown，Loader 只清空记账并停机，避免把竞态误报为清理失败。
+     */
     private Void performClose() throws Exception {
         List<LoaderDiagnostic> diagnostics = new ArrayList<>();
         pruneExternallyDisposed();
@@ -352,6 +461,7 @@ public final class KnotraLoader implements AutoCloseable {
         throw new IllegalStateException("loader close did not settle");
     }
 
+    /** 判断基础 Context 的释放是否源于运行时整体关闭（根 Context 已在释放中）。 */
     private boolean isRuntimeClosingBase() {
         ContextState baseState = baseContext.state();
         if (baseState != ContextState.DISPOSING && baseState != ContextState.DISPOSED) {
@@ -366,7 +476,7 @@ public final class KnotraLoader implements AutoCloseable {
                         || runtime.rootContext().state() == ContextState.DISPOSED);
     }
 
-    /** True when an in-flight runtime close is already responsible for this teardown. */
+    /** 运行时整体关闭已经接管本次释放时为 true；此时等待其完成而不是重复报错。 */
     private boolean runtimeOwnsDisposalNow() {
         ContextState baseState = baseContext.state();
         if (baseState != ContextState.DISPOSING && baseState != ContextState.DISPOSED) {
@@ -381,6 +491,7 @@ public final class KnotraLoader implements AutoCloseable {
                 .orElse(true);
     }
 
+    /** 有界等待运行时接管的句柄释放完成；未在时限内到达 DISPOSED 视为失败。 */
     private boolean awaitRuntimeOwnedHandleDisposal(ComponentHandle<?> handle) {
         try {
             ComponentState state = handle.whenSettled()
@@ -391,6 +502,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** 有界等待运行时接管的 Context 释放完成。 */
     private boolean awaitRuntimeOwnedContextDisposal(ContextHandle context) {
         CompletableFuture<Void> settled = new CompletableFuture<>();
         pollContextDisposal(context, settled, 3_000);
@@ -402,6 +514,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    // Context 没有 whenSettled 之类的完成句柄，用短轮询有界等待 DISPOSED。
     private void pollContextDisposal(
             ContextHandle context,
             CompletableFuture<Void> settled,
@@ -419,6 +532,11 @@ public final class KnotraLoader implements AutoCloseable {
                 .execute(() -> pollContextDisposal(context, settled, remainingTicks - 1));
     }
 
+    /**
+     * 把期望树完全准备好：路径归一化、父子完整性、与运行时状态的冲突预检、
+     * 工厂解析与配置归一化。任何诊断都会让准备结果为空，保证后续阶段不会
+     * 基于半成品树提交结构事务（整批拒绝、现有树不动）。
+     */
     private PreparedTree prepare(
             ComponentTree desired,
             List<LoaderDiagnostic> diagnostics) {
@@ -494,6 +612,11 @@ public final class KnotraLoader implements AutoCloseable {
         return new PreparedTree(prepared);
     }
 
+    /**
+     * 结构事务前的冲突预检：确认基础 Context 存活且 ACTIVE，且每个期望路径上的
+     * Context 与挂载点要么尚不存在、要么恰好属于本 Loader 的记账。外来结构
+     * 一律判为冲突，绝不隐式认领，避免 Loader 释放他人的挂载或 Context。
+     */
     private void preflight(
             Set<String> paths,
             List<LoaderDiagnostic> diagnostics) {
@@ -559,6 +682,11 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 同步记账与运行时状态：移除已被外部（宿主事务、运行时 close 等）释放的
+     * Context 与句柄。Context 只把 ACTIVE/FAILED 视为存活；组件只要尚未到达
+     * DISPOSED 就仍需记账。
+     */
     private void pruneExternallyDisposed() {
         RuntimeSnapshot snapshot = runtime.snapshot();
         Set<String> liveContextIds = snapshot.contexts().stream()
@@ -579,6 +707,10 @@ public final class KnotraLoader implements AutoCloseable {
         publish(latestDiagnostics);
     }
 
+    /**
+     * 期望仍然存在的路径若其 Context 已 FAILED，先释放该子树，后续阶段才能
+     * 在下一次事务中重建干净的 Context。
+     */
     private boolean settleFailedDesiredContexts(
             PreparedTree desired,
             List<LoaderDiagnostic> diagnostics) {
@@ -593,6 +725,10 @@ public final class KnotraLoader implements AutoCloseable {
         return true;
     }
 
+    /**
+     * 释放不再被期望树包含的条目。清理失败记 BLOCKED 并立即中止，留待下一次
+     * reconcile 继续收敛，不在未释放干净的结构上挂载新条目。
+     */
     private boolean removeMissing(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
@@ -617,6 +753,11 @@ public final class KnotraLoader implements AutoCloseable {
         return true;
     }
 
+    /**
+     * 判断是否应作为释放子树的根：顶层路径总是根；有父且父仍由 Loader 管理、
+     * 且父本身不在本批已移除候选中时，子路径才是根。释放父 Context 会级联
+     * 其子树，逐条释放反而可能与级联释放竞争。
+     */
     private boolean isRemovalRoot(String path) {
         String parent = parentPath(path);
         return parent.isEmpty()
@@ -628,6 +769,10 @@ public final class KnotraLoader implements AutoCloseable {
         return !current.containsKey(parent) && !contexts.containsKey(parent);
     }
 
+    /**
+     * 实现身份（而非工厂引用）变化的条目必须整句柄替换：引用相同但指纹不同
+     * 也视为新实现。任一替换失败都会中止后续阶段，防止半棵树跨实现版本。
+     */
     private boolean replaceChangedFactories(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
@@ -651,6 +796,11 @@ public final class KnotraLoader implements AutoCloseable {
         return true;
     }
 
+    /**
+     * 替换单个条目：先等待旧句柄完全释放，再在原 Context 上挂载新实现。
+     * 新挂载被拒绝时，用旧定义做补偿性重挂载，保证路径不会停留在“旧已释放、
+     * 新未挂载”的空档；补偿自身也失败时才报告 COMPENSATION_FAILED。
+     */
     private boolean replaceEntry(
             ManagedEntry old,
             PreparedEntry next,
@@ -696,6 +846,11 @@ public final class KnotraLoader implements AutoCloseable {
         return false;
     }
 
+    /**
+     * 挂载全部缺失条目：Context 在同一个运行时事务中创建，挂载逐条执行；
+     * 任一失败都按 LIFO 回滚本批已挂载句柄与新 Context，兑现“失败批次不
+     * 留下部分挂载”的契约。
+     */
     private boolean addMissing(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
@@ -741,6 +896,10 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 在单个运行时事务中按父先子后的顺序创建全部缺失 Context；事务被拒绝或
+     * 结算失败时立即回滚已创建的 Context。
+     */
     private boolean createMissingContexts(
             List<String> missing,
             Map<String, ContextHandle> created,
@@ -803,6 +962,11 @@ public final class KnotraLoader implements AutoCloseable {
         return parent;
     }
 
+    /**
+     * 执行一次受控挂载并等待 Activation 结算。除异常外还校验策略确实使用了
+     * 分配的槽位：返回句柄必须绑定在分配的 contextId 与 mountId 上；越界
+     * 句柄立即释放并整批拒绝，防止策略把组件挂到 Loader 记账之外。
+     */
     private MountAttempt mountOne(
             PreparedEntry entry,
             ContextHandle context,
@@ -861,6 +1025,10 @@ public final class KnotraLoader implements AutoCloseable {
         return null;
     }
 
+    /**
+     * 新增批次的补偿：按挂载的逆序释放句柄，再释放新建 Context 子树；
+     * 补偿失败会额外报告 COMPENSATION_FAILED，不掩盖原始诊断。
+     */
     private void rollbackAdd(
             List<ManagedEntry> mounted,
             Map<String, ContextHandle> created,
@@ -887,6 +1055,7 @@ public final class KnotraLoader implements AutoCloseable {
         publish(latestDiagnostics);
     }
 
+    // 只释放新建子树的根；释放根 Context 会级联子孙，逐个释放会重复处置。
     private void rollbackContexts(
             Map<String, ContextHandle> created,
             List<LoaderDiagnostic> compensation) {
@@ -905,6 +1074,11 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 实现身份不变的配置变化走重配置而不是替换。先更新记账中的期望配置：
+     * 即使句柄当前 FAILED，也保留最新配置供后续显式 retry 使用；只有非
+     * FAILED 句柄才立即调用定义的重配置策略。
+     */
     private void updateConfigs(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
@@ -956,6 +1130,11 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 汇总仍处于 FAILED 的期望条目。Loader 刻意不做自动重试：失败的 start()
+     * 可能是持续故障，自动重试会在每次 reconcile 中放大副作用，因此收敛语义
+     * 要求调用方显式 retry。
+     */
     private void addFailedDiagnostics(
             PreparedTree desired,
             List<LoaderDiagnostic> diagnostics) {
@@ -970,6 +1149,10 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /**
+     * 通过运行时事务释放单个句柄并等待结算；若运行时整体关闭已经接管释放，
+     * 只等待其完成而不把竞态重复报告为失败。
+     */
     private boolean disposeHandle(
             String path,
             ComponentHandle<?> handle,
@@ -1013,6 +1196,7 @@ public final class KnotraLoader implements AutoCloseable {
         return true;
     }
 
+    /** 释放路径对应的 Context；空路径表示 owned 模式的基础 Context。 */
     private boolean disposeContext(
             String path,
             List<LoaderDiagnostic> diagnostics) {
@@ -1022,6 +1206,10 @@ public final class KnotraLoader implements AutoCloseable {
         return disposeHandlelessContext(path, context, diagnostics);
     }
 
+    /**
+     * 通过运行时事务释放 Context 并等待结算。释放会级联其子 Context 与挂载，
+     * 成功后从记账中移除整个子树；运行时整体关闭已接管释放时只做有界等待。
+     */
     private boolean disposeHandlelessContext(
             String path,
             ContextHandle context,
@@ -1076,6 +1264,7 @@ public final class KnotraLoader implements AutoCloseable {
         return true;
     }
 
+    /** 从记账中移除该路径及其子树；Context 释放会级联处置全部子孙。 */
     private void prune(String rootPath) {
         if (rootPath.isEmpty()) {
             current.clear();
@@ -1094,6 +1283,7 @@ public final class KnotraLoader implements AutoCloseable {
                 .toList();
     }
 
+    /** 记录一次成功挂载并发布新视图。 */
     private ManagedEntry register(MountAttempt entry) {
         contexts.put(entry.path(), entry.context());
         ManagedEntry managed = new ManagedEntry(
@@ -1108,6 +1298,7 @@ public final class KnotraLoader implements AutoCloseable {
         return managed;
     }
 
+    /** 汇总诊断、发布视图并构造结果；converged 要求无任何诊断。 */
     private ReconcileResult finish(
             boolean proposed,
             List<ReconcileResult.Change> changes,
@@ -1118,6 +1309,7 @@ public final class KnotraLoader implements AutoCloseable {
         return new ReconcileResult(proposed && copied.isEmpty(), changes, copied);
     }
 
+    /** 原子发布不可变视图，供协调器之外的 snapshot() 读取。 */
     private void publish(List<LoaderDiagnostic> diagnostics) {
         view = new LoaderView(
                 closed,
@@ -1135,6 +1327,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** 把 Core 事务诊断映射进 Loader 结果；核心未给出诊断时提供兜底文案。 */
     private void addCoreDiagnostics(
             LoaderDiagnosticCode fallback,
             String path,
@@ -1152,6 +1345,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** Core 诊断码到 Loader 诊断码的稳定映射；无法识别时回退到调用方指定的码。 */
     private LoaderDiagnosticCode mapCode(
             DiagnosticCode code,
             LoaderDiagnosticCode fallback) {
@@ -1164,6 +1358,10 @@ public final class KnotraLoader implements AutoCloseable {
         };
     }
 
+    /**
+     * 深度优先展平声明树：归一化路径、校验重复与越界。相对单段路径拼接在
+     * 父路径之下；null 配置折算为 NoConfig.INSTANCE，交给定义的 schema 归一化。
+     */
     private void collectEntries(
             List<ComponentEntry> entries,
             String parentPath,
@@ -1227,6 +1425,11 @@ public final class KnotraLoader implements AutoCloseable {
         return path.substring(path.lastIndexOf('/') + 1);
     }
 
+    /**
+     * 统一路径：trim、反斜杠归一为斜杠、折叠 “.” 与空段、拒绝 “..”。
+     * 相对单段路径在存在父路径时拼接到父路径之下，因此 “/alpha”、“alpha/”
+     * 与 “ alpha ” 归一化后是同一条目。
+     */
     private static String normalizePath(String raw, String parentPath) {
         if (raw == null) {
             return "";
@@ -1258,6 +1461,7 @@ public final class KnotraLoader implements AutoCloseable {
         return normalized;
     }
 
+    /** 取根因消息用于诊断，避免把包装异常的无信息消息写进结果。 */
     private static String safeError(Throwable error) {
         Throwable current = error;
         while (current.getCause() != null) {
@@ -1269,6 +1473,7 @@ public final class KnotraLoader implements AutoCloseable {
                 : message;
     }
 
+    /** 期望条目完成准备后的形态：归一化路径 + 解析出的定义 + 归一化配置。 */
     private record PreparedEntry(
             String path,
             String name,
@@ -1277,6 +1482,7 @@ public final class KnotraLoader implements AutoCloseable {
             Object config) {
     }
 
+    /** 完成准备的期望树；paths() 按层级从浅到深排序，保证先父后子处理。 */
     private record PreparedTree(Map<String, PreparedEntry> entries) {
 
         List<String> paths() {
@@ -1291,6 +1497,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** 一次成功受控挂载的产物，等待 register() 写入记账。 */
     private record MountAttempt(
             String path,
             String name,
@@ -1300,6 +1507,7 @@ public final class KnotraLoader implements AutoCloseable {
             Object config) {
     }
 
+    /** Loader 对单个受管路径的记账：Context、句柄、当前定义与归一化配置。 */
     private static final class ManagedEntry {
         private final String path;
         private final String name;
@@ -1359,6 +1567,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** 发布给 snapshot() 的不可变状态视图。 */
     private record LoaderView(
             boolean closed,
             Map<String, ManagedEntry> entries,
