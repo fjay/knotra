@@ -2,6 +2,8 @@
 
 本文面向使用 Knotra `0.1.0-SNAPSHOT` 的宿主和组件开发者，只使用 public API。当前版本仅存在于本地 Maven reactor，未发布到远端仓库；请在同一 reactor 内引用，或先安装到本机 Maven 缓存。
 
+**宿主（host）**指嵌入 Knotra 的那个常驻 JVM 应用：它创建 `KnotraRuntime`、通过 `mutate(...)` 发起结构事务、并在退出前关闭运行时。一个普通 `main` 程序或一个 Spring Boot 应用都可以是宿主，Knotra 不要求特定启动框架。与 Spring 共存的推荐模式见[线程模型与生产实践](<Knotra 线程模型与生产实践.md>)。
+
 ## 模块与依赖
 
 Knotra 要求 Java 21+、Maven 3.9+，groupId 为 `io.knotra`：
@@ -71,6 +73,8 @@ public final class ToolFactory implements ComponentFactory<ToolConfig> {
 }
 ```
 
+`ConfigSchema.validate(Object raw)` 的输入是任意 `Object`：Core API 的 mount/reconfigure 要求传入非 null，但形态由你定义——可以是目标类型本身（如上例的 record，schema 只做校验和 trim），也可以是 `Map`、JSON 树等外部格式，由 schema 负责转换成目标类型。归一化发生在 mount 事务回调内和 reconfigure 意图记录前；schema 抛异常或返回 null 都会导致事务拒绝（mount 报 `config schema returned null` 相关诊断，reconfigure 同样拒绝）。没有 schema 时配置原样传递。
+
 依赖必须在 descriptor 中声明。REQUIRED 缺失时组件等待；OPTIONAL 进入同一个 BindingSet，缺失可启动，但 provider 出现或消失也会重激活。
 
 ```java
@@ -84,6 +88,15 @@ Optional<Metrics> metrics = context.find(METRICS);
 ```
 
 `ActivationContext.require/find` 遇到未声明 key 会失败；这是组件 contract 错误，不能当普通查询使用。宿主拿到的 `RuntimeContext` 没有 descriptor 限制，可以查询任意 visible capability，也不会建立 Binding 或触发依赖追踪。
+
+## KnotraConfig 与 MountOptions
+
+`KnotraRuntime.create()` 有两个重载：无参使用默认配置，或传入 `KnotraConfig`。`KnotraConfig` 只有两项：
+
+- `runtimeId`：运行时标识，进入部分诊断的 targetId；默认 `"knotra-runtime"`，不允许空白。
+- `maxReconcileIterations`：结构变化后自动收敛的最大迭代数，默认 `256`，最小 1；超限后停止自动重启并报 `NON_CONVERGENT_RECONCILE`。
+
+`MountOptions` 携带挂载来源信息：`ComponentOrigin`（kind、sourceId、version、description）与不可变 metadata Map。`MountOptions.DEFAULT` 等价于 host origin 加空 metadata；`mount(...)` 传 null 时使用 `DEFAULT`，组件的子挂载默认继承父组件的 origin。metadata 通过 `options.metadata(name)` 读取，不存在返回 null。
 
 ## 宿主原子事务
 
@@ -227,6 +240,18 @@ context.lifecycle().manageAsync("job-listener", subscription::closeAsync);
 - `onBail` / `bail`：返回 `true` 表示认领并停止。
 - `onWaterfall` / `waterfall`：转换值传给下一个 listener。
 
+五种 listener 函数式接口的完整签名：
+
+| 订阅方法 | listener 接口 | 方法签名 |
+|---|---|---|
+| `on` | `EventListener<T>` | `void listen(T event) throws Exception` |
+| `onParallel` | `ParallelEventListener<T>` | `CompletionStage<Void> listen(T event) throws Exception` |
+| `onSerial` | `SerialEventListener<T>` | `CompletionStage<Boolean> listen(T event) throws Exception` |
+| `onBail` | `BailEventListener<T>` | `boolean bail(T event) throws Exception` |
+| `onWaterfall` | `WaterfallEventListener<T>` | `CompletionStage<T> transform(T event) throws Exception` |
+
+订阅模式与分发模式必须一致：`onSerial` 的定义用 `serial` 分发。不匹配时注册或分发接受前直接抛 `IllegalArgumentException`（不是异常完成的 stage），消息形如 `event definition requires SERIAL dispatch, not PARALLEL`。
+
 ```java
 EventDispatch<JobFinished> result = bus.serial(JOB_FINISHED, event)
         .toCompletableFuture()
@@ -302,6 +327,10 @@ try {
 
 `UNLOADED` 表示成功；`DRAIN_FAILED` 表示 cleanup 可重试。owned handle 通常为 `FAILED` 且 goal 为 `DISPOSED`。极端 PF4J stop/unload 半失败不会被伪造为成功，可能需要重启 JVM。
 
+适配器读取接口：`artifacts()` 返回全部受管 artifact 快照，`artifactsInState(...)` 按状态过滤，`artifact(id)` 查单个，`diagnostic(artifactId)` 返回该 artifact 的结构化诊断（state、transition、factoryIds、ownedHandleIds、lastError、classLoaderDiagnostics）。`transition` 是字符串，常见值：`published`、`unload`、`retry-drain`、`close-drain`、`drain-failed`、`unloaded`、`pf4j-unload-failed`、`load-rollback`。
+
+factoryId 是全局目录键：同一 artifact 内重复报 `duplicate factory id inside artifact`，跨 artifact 重复报 `factory id is already cataloged`，同一 `Plugin-Id` 的两个 JAR 在扫描范围内报 `ambiguous PF4J repository entry`。升级是"先卸后装"；两版本并存需要不同 factoryId。完整打包与冲突排查见[插件工程化手册](<Knotra 插件工程化手册.md>)。
+
 ## Loader 声明式装配
 
 Loader 消费 desired tree。路径是稳定身份并形成 context 树；父路径必须存在，不支持 `..`。
@@ -334,6 +363,11 @@ try (KnotraLoader loader = KnotraLoader.over(
 `FactoryIdentity` 由必填 `factoryId`、必填 implementation fingerprint 和可选 `version` 组成；三者共同参与相等性判断。fingerprint 用于区分同名 factory 的不同 artifact/实现来源。
 
 Loader 不监听文件系统。`reconcileAsync()` 由单线程 coordinator 串行执行；resolver 和 controlled mount 回调不能同步调用同一个 loader。
+
+两个容易踩的语义点：
+
+- **`reconcile(...)` 返回时相关条目已 settle，但 settle 不等于 `ACTIVE`**。必需依赖缺失的组件会 settle 为 `WAITING`，启动失败的 settle 为 `FAILED`（需要显式 `loader.retry(path)`）。判断结果用 `converged()` 加各条目状态，不要假设返回即全部活跃。
+- **路径即归属**。每个条目路径得到一个专属 child Context（名字取路径最后一段），`mountId` 精确等于归一化后的完整路径；嵌套路径要求父条目存在，兄弟条目共享同一个父 Context。路径整体 trim、`\` 折叠为 `/`、空段与 `.` 折叠、`..` 拒绝。`LoaderSnapshot.EntrySnapshot` 提供每条目的 `path`、`state`、`goal`、`configRevision`、`factoryIdentity` 等字段用于断言。
 
 ## PF4J 到 Loader 的 typed bridge
 
@@ -381,6 +415,17 @@ private static <C> Optional<ResolvedComponentDefinition> typedBridge(
 ```
 
 Resolver 根据 `FactoryRef` 选择 config token，再调用 `typedBridge`。typed resolve 查不到 factory 时返回 `Optional.empty()`；token 不匹配会 fail fast 抛 `IllegalArgumentException`，并由 Loader 记录 `RESOLUTION_FAILED`。桥接 schema 先归一化 raw config，`ControlledMountContext` 只暴露目标 context、mountId 和一次 typed mount；返回其它 handle 会破坏 slot 契约并被清理。
+
+## 释放路径
+
+有四种触发清理的方式，语义各不相同：
+
+| 路径 | 签名 | 语义 |
+|---|---|---|
+| 事务意图 | `RuntimeMutation.dispose(handle/context)` | 只在 `mutate(...)` 回调内记录意图，与其他意图原子提交；组件意图递归释放其拥有的子挂载与注册，Context 意图释放整个子树；根 Context 的该意图会被拒绝 |
+| 组件句柄 | `ComponentHandle.dispose()` | 公开 lifecycle 请求，返回 `CompletionStage<ComponentState>`，等待该组件清理收敛；失败停留 `FAILED` 可 `retry()` |
+| Context 句柄 | `ContextHandle.disposeAsync()` | 内部 Context 清理路径，释放子树注册与组件；失败时子树置 `FAILED`；根 Context 应由 Runtime 关闭 |
+| 运行时 | `KnotraRuntime.closeAsync()` | 设置 closing（拒绝新 mutation），复用根 Context 清理路径等待全树收敛；失败时异常完成、状态保留，可重复调用继续收敛 |
 
 ## 关闭顺序与错误处理
 

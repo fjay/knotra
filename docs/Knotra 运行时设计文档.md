@@ -6,7 +6,7 @@ Knotra 是一个面向 JVM 21 的动态组合运行时，解决的是“应用�
 
 当前仓库已经是按该模型实现的六模块 Maven 工程，版本为 `io.knotra:knotra-parent:0.1.0-SNAPSHOT`。Core、Events、PF4J adapter、Loader 和跨模块集成测试均可构建与运行；本文描述的是当前源码中的实际行为，而不是最初设想或后续演进计划。
 
-Cordis 的动态组合思想是 Knotra 的设计来源之一，尤其是能力注册身份、组件运行代际和可逆生命周期这些概念。Knotra 不实现 Cordis API，不承诺 Cordis 兼容，也没有旧模型迁移层；它使用独立的 `io.knotra` 契约和语义。旧 Cordis 设计只作为思想来源保留。
+Cordis 的动态组合思想是 Knotra 的设计来源之一，尤其是能力注册身份、组件运行代际和可逆生命周期这些概念。Knotra 不实现 Cordis API，不承诺 Cordis 兼容，也没有旧模型迁移层；它使用独立的 `io.knotra` 契约和语义。旧 Cordis 设计只作为思想来源保留。Cordis 不是使用 Knotra 的前置知识：读者不需要了解它，本文其余内容也不依赖它。
 
 Knotra 的核心取舍是把结构变化做成显式事务，把用户启动代码放到协调锁外执行，再通过代际和绑定身份做乐观提交。这样可以避免用户 `start()` 阻塞全局协调器，但实现必须接受 stale activation 回滚、有界 reconcile 和较严格的前置声明约束。这个复杂度用于换取三个不变量：STARTING 期间发布的能力不可见；ACTIVE 的组件状态、固定 BindingSet 和全部注册在一个 generation 原子出现；旧 Activation 未 settle 前同一 Handle 不会创建下一份运行。
 
@@ -19,8 +19,6 @@ Knotra 的核心取舍是把结构变化做成显式事务，把用户启动代�
 - Loader 不监听文件系统；期望状态由调用方显式提交。
 - 配置没有全局文件格式；每个 factory 通过 `ConfigSchema` 归一化自己的配置。
 - 不提供 Cordis 兼容 API 或旧版本共存迁移。
-
-建议分支：`refactor/knotra-runtime`。
 
 ## 整体设计
 

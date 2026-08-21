@@ -8,7 +8,7 @@ Knotra 的失败处理原则是**先保留状态与诊断，再显式重试**，
 
 ```java
 RuntimeSnapshot snapshot = runtime.snapshot();   // 组件、绑定、注册、清理状态、诊断
-ArtifactSnapshot artifacts = adapter.snapshot(); // artifact 状态、ownership、诊断
+List<ArtifactSnapshot> artifacts = adapter.artifacts(); // 全部受管 artifact 状态、ownership、诊断
 LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊断
 ```
 

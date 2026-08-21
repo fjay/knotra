@@ -5,9 +5,9 @@
 ![Java](https://img.shields.io/badge/Java-21%2B-orange)
 ![Maven](https://img.shields.io/badge/Maven-3.9%2B-blue)
 ![Version](https://img.shields.io/badge/version-0.1.0--SNAPSHOT-blue)
-![Tests](https://img.shields.io/badge/tests-226%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-227%20passing-brightgreen)
 
-> **项目状态**：`0.1.0-SNAPSHOT`，尚未发布到 Maven Central，API 可能调整。核心、事件、PF4J 适配器、Loader 均已实现并有完整测试覆盖。
+> **项目状态**：`0.1.0-SNAPSHOT`，尚未发布到 Maven Central。核心、事件、PF4J 适配器、Loader 均已实现并有完整测试覆盖。0.x 阶段不提供跨版本兼容承诺（包括 API、诊断码、SPI 与快照结构）；1.0 发布前会公布版本稳定性政策。
 
 ## 为什么需要它
 
@@ -148,18 +148,35 @@ flowchart TB
 
 替换一个服务时，运行时会自动找到绑定旧注册的组件：旧运行先收尾，然后按新注册重新启动。新组件在启动成功前对别人不可见，启动失败就整体回滚，不会留下半成品。
 
+## 术语表
+
+| 术语 | 含义 |
+|---|---|
+| 宿主（host） | 嵌入 Knotra 的那个常驻 JVM 应用。它创建 `KnotraRuntime`、发起结构事务、决定何时关闭——通常就是你的 main 程序或 Spring Boot 应用 |
+| artifact / 插件 JAR | 同一个东西：被 PF4J 适配器管理的一个插件 JAR。运行时 `artifactId` 来自插件描述符的 `Plugin-Id` |
+| PF4J | 轻量 Java 插件框架，负责插件 JAR 的加载与生命周期。Knotra 的 `knotra-pf4j` 只把它当作 artifact 边界 |
+| OSGi | Java 最早的模块化运行时规范，体系完整但重量级。Knotra 不是 OSGi 实现，只做动态组合这一层 |
+| Activation（激活） | 组件按某一代依赖绑定的一次运行。依赖或配置变化会产生新的 Activation |
+| generation（代际） | Runtime 结构的全局版本号，每次成功事务递增 |
+| settle（收敛） | 一次过渡完成并稳定到某个状态；`whenSettled()` 等待的就是它 |
+| BindingSet（绑定集） | 组件一次 Activation 固定绑定的那组注册，按注册身份追踪 |
+| drain（排空） | 卸载前等待在途工作收尾、按依赖顺序清理资源的过程 |
+
 ## 文档
 
 - 想看完整故事：[实战案例：动态物流路由系统](<docs/Knotra 实战案例：动态物流路由系统.md>)——仓库级能力覆盖、依赖重激活、插件排空卸载。
 - 要写代码：[API 与集成指南](<docs/Knotra API 与集成指南.md>)——公开 API、模块依赖、宿主事务、EventBus、PF4J 与 Loader 接入。
 - 想弄懂语义：[运行时设计文档](<docs/Knotra 运行时设计文档.md>)——Context、Capability、Activation、LifecycleScope、依赖图和失败恢复的详细语义。
 - 遇到问题排障：[FAQ 与排障指南](<docs/Knotra FAQ 与排障指南.md>)——按症状组织的排查流程，附状态速查与全部诊断码对照表。
+- 要做插件 JAR：[插件工程化手册](<docs/Knotra 插件工程化手册.md>)——从空 Maven 工程到可加载插件 JAR 的完整步骤。
+- 要上生产：[线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)——回调线程、阻塞边界、Spring 共存、监控接线与容量边界。
+- 要写测试：[测试指南](<docs/Knotra 测试指南.md>)——依赖替换、清理失败、drain 竞态、ClassLoader 回收怎么测。
 
 ## 模块
 
 | 模块 | 职责 | 运行时依赖 | 测试 |
 |---|---|---|---|
-| `knotra-core` | Runtime 内核：Context、Capability、ComponentHandle、Activation、LifecycleScope、Snapshot | 无 | 95 |
+| `knotra-core` | Runtime 内核：Context、Capability、ComponentHandle、Activation、LifecycleScope、Snapshot | 无 | 96 |
 | `knotra-events` | 作为普通 Capability 发布的类型化 EventBus | `knotra-core` | 44 |
 | `knotra-pf4j-spi` | 由 PF4J artifact 实现的共享提供方 SPI | `knotra-core`、PF4J（provided 作用域） | - |
 | `knotra-pf4j` | PF4J artifact 适配器：加载/启动、类型化受控挂载、只读工厂目录、drain、卸载、ClassLoader 防护 | `knotra-core`、`knotra-pf4j-spi`、PF4J、ASM | 37 |
@@ -167,6 +184,8 @@ flowchart TB
 | `knotra-integration-tests` | 跨模块真实测试样例验证（仅测试，不发布） | 所有模块（测试作用域） | 14 |
 
 ## 深入设计
+
+以下每节回答一个具体问题：先说清这东西解决什么，再给用法，最后点出关键规则。完整语义在链接的文档里，不在首页堆满。
 
 ### 核心模型
 
@@ -220,7 +239,18 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
 ### 事件
 
-事件模块是一个普通组件，没有内核专用通道。挂载 `EventBusFactory`，并像依赖其他能力一样依赖 `EventBus` Capability。订阅必须由消费方的 LifecycleScope 管理，使运行时在 teardown 时等待已接受的 dispatch 收敛：
+组件之间怎么通信？Knotra 的答案是一个事件组件。它不是内核的特权部件，和路由规则、HTTP 客户端一样，是个普通的可挂载组件。
+
+先挂载事件总线，之后 `EventBus` 就成了一个可以 require 的普通能力：
+
+```java
+MutationResult<ComponentHandle<NoConfig>> bus = runtime.mutate(tx ->
+        tx.mount(runtime.rootContext(), "event-bus",
+                new EventBusFactory(), NoConfig.INSTANCE));
+bus.value().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+```
+
+然后消费方订阅事件。看两处：依赖要在 descriptor 里声明（和依赖任何其他能力一样）；订阅是资源，交给 lifecycle 托管——组件停止时，运行时会先等在途事件处理完，再关闭订阅：
 
 ```java
 EventBus bus = context.require(EventCapabilities.EVENT_BUS);
@@ -228,19 +258,19 @@ EventDefinition<JobFinished> JOB_FINISHED =
         EventDefinition.serial(EventKey.of(JobFinished.class));
 
 EventSubscription subscription = bus.onSerial(JOB_FINISHED, event -> {
-    // serial listener 返回 stage 保持 dispatch chain 异步
-    return CompletableFuture.completedFuture(true);
+    persist(event);
+    return CompletableFuture.completedFuture(true);   // 返回 stage，分发链保持异步
 });
-context.lifecycle().manageAsync("job-finished-listener", subscription::closeAsync);
+context.lifecycle().manageAsync("job-listener", subscription::closeAsync);
 ```
 
-EventBus 或订阅的 `closeAsync()` 会等待关闭请求被观察到之前已接受的分发；关闭之后的新工作会被拒绝。事件身份是精确的 JVM `Class`，而不只是类型名，这条规则同样跨 artifact ClassLoader 生效。
+两条规则先记住：事件的身份是精确的 JVM `Class`，两个插件里同名的类是两个不同事件；关闭是收尾式的——`closeAsync()` 等已接受的事件处理完、拒绝新事件，不丢在途的，也不假装成功。
 
 ### PF4J Artifact 边界
 
-这一节回答一个问题：插件的 JAR 边界如何与运行时的组件模型对接。
+这一节回答一个问题：插件 JAR 里的组件，怎么进入运行时？
 
-`knotra-pf4j` 只把 PF4J 当作 artifact 边界。加载 artifact 会启动对应的 PF4J 插件，并发现 `RuntimeComponentProvider` 导出；它本身不会直接挂载组件。每个导出的工厂都携带显式配置 token，该 token 必须属于宿主或共享合约；挂载必须通过类型化解析完成：
+分工是这样的：PF4J 负责 JAR 的加载与卸载，Knotra 负责组件的挂载与清理，`knotra-pf4j` 适配器站在中间。加载插件后，适配器不直接挂载任何组件，只发布一个类型化的工厂目录；宿主从目录解析工厂，再显式挂载：
 
 ```java
 try (KnotraRuntime runtime = KnotraRuntime.create();
@@ -248,26 +278,25 @@ try (KnotraRuntime runtime = KnotraRuntime.create();
              Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
 
     adapter.loadArtifact(Path.of("plugins/tool-1.0.0.jar")).join();
+
     ArtifactFactoryHandle<ToolConfig> factory =
             adapter.resolver().resolve("tool", ToolConfig.class).orElseThrow();
     ComponentHandle<ToolConfig> tool =
             factory.mount(runtime.rootContext(), "tool", new ToolConfig());
 
-    adapter.unloadArtifact("tool-plugin").join(); // 先 drain owned mount
+    adapter.unloadArtifact("tool-plugin").join();   // 先排空这个插件拥有的挂载
 }
 ```
 
-无 token 的解析器和 `factoryCatalog()` 只暴露不可变的 `ArtifactFactoryCatalogEntry` 元数据（包括稳定的配置类型名称）；它们不能挂载组件、归一化配置，也不能转换回工厂句柄。错误 token 会在类型化 `resolve(...)` 中失败；经 raw cast 传入的非空配置，也会在工厂创建或组件启动之前再次被拒绝。
+为什么要经过工厂目录这一层？为了边界。不带配置类型的查询只能看到元数据（工厂名、配置类型名），不能挂载；想挂载，必须给出正确的配置类型。类型不对，解析时就失败；就算用 raw cast 硬塞，组件启动前还会被再拦一次。
 
-适配器拥有通过其工厂句柄创建的每一个挂载：卸载会进入 drain 状态，等待执行中的挂载，逻辑 dispose 每个 owned handle（依赖该 artifact 的下游 artifact 优先），然后才停止并卸载 PF4J 插件、释放其 ClassLoader。清理失败会把 artifact 保留在 `DRAIN_FAILED` 并附带诊断；底层资源修复后，可通过 `retryDrain(...)` 完成该流程。并发的 `runtime.close()`、Loader 关闭和适配器关闭会收敛，不会因为一个所有者而导致其他所有者失败。
+卸载是这一节真正值钱的语义。`unloadArtifact` 的顺序是：停止新挂载 → 等在途挂载收尾 → 按"下游先走"清理这个插件创建的全部组件 → 停止并卸载 PF4J 插件 → 释放 ClassLoader。中途失败则进入 `DRAIN_FAILED`，保留现场，修复后 `retryDrain` 从断点继续。适配器不会伪造一次成功的卸载。
 
-跨越 artifact 边界的 Class 必须来自共享合约包；插件私有的合约类型会在激活期间被拒绝，因此卸载才能真正让插件 ClassLoader 变为弱可达。
+怎么从零打出一个能被加载的插件 JAR，见[插件工程化手册](<docs/Knotra 插件工程化手册.md>)。
 
 ### Loader
 
-Loader 回答的问题是：我想要一棵这样的组件树，请把运行时收敛成这样。
-
-Loader 会将期望的组件声明树与 Runtime 当前状态进行协调。条目具有稳定路径；解析器返回不透明的受控定义；失败的批次会回滚，而不是留下部分挂载：
+前面都是"宿主手动挂载"。组件多了以后，手动管理很脆弱：哪个组件该在哪个范围、用哪个版本、配什么参数，散落在调用代码里。Loader 解决这个问题：描述一棵期望的组件树，它把运行时收敛成这棵树。
 
 ```java
 FactoryRef ref = FactoryRef.of("tool", "1.0.0");
@@ -279,65 +308,29 @@ try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), cla
     ReconcileResult result = loader.reconcile(ComponentTree.of(
             ComponentEntry.of("tools/tool", ref, new ToolConfig())));
     if (!result.converged()) {
-        result.diagnostics().forEach(diagnostic -> log.warn("{}: {}", diagnostic.path(),
-                diagnostic.message()));
+        result.diagnostics().forEach(d -> log.warn("{}: {}", d.path(), d.message()));
     }
 }
 ```
 
-PF4J 工厂的解析器可以桥接不透明的 artifact 句柄，同时不会向 Loader 暴露 artifact 工厂、PF4J 管理器或 `RuntimeMutation`：
+`reconcile` 做三件事：树上多的，新增；树上少的，递归释放；配置或实现版本变了的，替换。任何一步失败，整批回滚，不会留半个挂载。路径就是归属：每个条目路径对应一个专属子 Context（名字取最后一段），mountId 是完整路径；嵌套路径要求父条目存在，兄弟条目共享同一个父 Context。
 
-```java
-ComponentFactoryResolver artifacts =
-        ref -> bridge(adapter, ref, ToolConfig.class);
-
-private static <C> Optional<ResolvedComponentDefinition> bridge(
-        Pf4jArtifactAdapter adapter,
-        FactoryRef ref,
-        Class<C> configType) {
-    return adapter.resolver().resolve(ref.factoryId(), configType)
-            .map(handle -> {
-                String fingerprint = handle.artifactId() + "@"
-                        + handle.artifactVersion() + "#" + handle.factoryId();
-                ConfigSchema<Object> schema = raw -> {
-                    Optional<ConfigSchema<C>> selected = handle.configSchema();
-                    if (selected.isPresent()) {
-                        return selected.get().validate(raw);
-                    }
-                    return raw == null ? NoConfig.INSTANCE : raw;
-                };
-                ControlledMountStrategy strategy = (context, config) -> {
-                    C typedConfig = configType.cast(config);
-                    ComponentHandle<C> mounted = handle.mount(
-                            context.context(),
-                            context.mountId(),
-                            typedConfig);
-                    return CompletableFuture.completedFuture(mounted)
-                            .thenApply(value -> (ComponentHandle<?>) value);
-                };
-                return new ResolvedComponentDefinition(
-                        FactoryIdentity.fromRef(ref, fingerprint),
-                        schema,
-                        strategy,
-                        ReconfigureStrategy.direct());
-            });
-}
-```
-
-受控策略只会收到分配出的 `ControlledMountContext`（其中的 context、挂载 ID 和一次类型化挂载操作）。它无法访问 `KnotraRuntime`、`RuntimeMutation`、任意 Context 的处置，或宿主的 Capability 发布。
-
-同一个桥接方案会在 `knotra-integration-tests` 中针对真实插件样例验证，覆盖嵌套树、配置 schema 归一化、工厂替换、所有权，以及必须在下一次 reconcile 中收敛的 reconcile 与 drain 竞态。
+插件工厂怎么接进 Loader（typed bridge）属于进阶内容，完整代码见[API 与集成指南](<docs/Knotra API 与集成指南.md>)。
 
 ### Snapshot 与诊断
 
-`runtime.snapshot()` 报告当前代际、Context、ComponentHandle、带有绑定集的 Activation、注册、LifecycleScope 与受管条目的清理状态，以及稳定诊断。适配器和 Loader 发布各自的不可变 Snapshot（`ArtifactSnapshot`、`LoaderSnapshot`），规则相同：Snapshot 是数据，不会引用运行中的内部机制，因此持有 Snapshot 不会阻止已卸载插件的 ClassLoader 被回收。诊断码是枚举（`DiagnosticCode`、`LoaderDiagnosticCode`、结构化 artifact 操作），适合用于告警和协调逻辑。
+运行中的系统必须能被观察。Knotra 的答案是不可变快照：随时调用 `runtime.snapshot()`，拿到当前结构的完整拷贝——有哪些 Context 和组件、每个组件绑定的是哪一次注册、哪些清理失败了、诊断码是什么。适配器和 Loader 各有自己的快照，规则相同。
+
+关键设计是快照只含数据，不引用任何活对象。拿着一份快照，不会阻止已卸载插件的 ClassLoader 被回收。诊断码是稳定枚举（`MISSING_CAPABILITY`、`CLEANUP_FAILED` 等），直接按码接告警，不要匹配消息文本。
 
 ### ClassLoader 合约
 
-- `knotra-core` 和 `knotra-loader` 完全不感知 PF4J；每个模块都通过 Maven Enforcer 强制该依赖边界。
-- `knotra-pf4j-spi` 以 `provided` 作用域针对 PF4J 编译，因此不会为不使用 artifact 的宿主增加运行时依赖。
-- 共享合约包（`io.knotra`、`io.knotra.pf4j.spi`、`org.pf4j`，以及传给适配器的包）始终从宿主加载。用作 Capability 合约的插件私有类型会被拒绝。
-- 成功卸载和加载失败回滚都会让插件 ClassLoader 变为弱可达；两条路径都用弱引用 GC 测试断言。
+插件卸载之后，JVM 什么时候真正回收它的类？条件只有一个：没有人再引用它的 ClassLoader。Knotra 用四条规则保证运行时自己是干净的：
+
+- `knotra-core` 和 `knotra-loader` 完全不知道 PF4J 的存在，这条边界由构建工具强制。
+- 合约类型（`io.knotra`、`io.knotra.pf4j.spi`、`org.pf4j` 等）永远从宿主加载；插件私有的同名类不算同一个类型。
+- 卸载成功和加载失败回滚，都会让插件 ClassLoader 变为弱可达，两条路径都有 GC 测试断言。
+- 最后一段责任在业务代码：宿主自己保存了插件对象的话，运行时无能为力。
 
 ## 非目标
 
@@ -346,6 +339,7 @@ private static <C> Optional<ResolvedComponentDefinition> bridge(
 - 不提供通用 DI 容器、AOP、代理拦截或 Spring 兼容层。
 - 不自研插件仓库、插件市场、版本解析 UI 或远程安装协议。
 - 不做分布式协调、跨进程一致性或多 JVM 热替换。
+- 不做安全隔离：无插件权限模型、代码签名校验或资源配额，只应加载可信来源的插件 JAR。
 - Loader 不监听文件系统；期望状态由调用方显式提交。
 - 配置没有全局文件格式；每个工厂通过 `ConfigSchema` 归一化自己的配置。
 - 不提供 Cordis 兼容 API 或旧版本共存迁移。
@@ -362,7 +356,7 @@ private static <C> Optional<ResolvedComponentDefinition> bridge(
 mvn clean verify
 ```
 
-Maven reactor 会按依赖顺序构建，不需要先执行 `mvn install`。`mvn clean verify` 会运行 226 项测试（Core 95、Events 44、PF4J 适配器 37、Loader 36、跨模块集成 14）。集成模块会构建真实的 PF4J 样例 jar，并只通过公开 API 验证：没有内部强制转换，没有 `Thread.sleep`，没有生产代码后门。
+Maven reactor 会按依赖顺序构建，不需要先执行 `mvn install`。`mvn clean verify` 会运行 227 项测试（Core 96、Events 44、PF4J 适配器 37、Loader 36、跨模块集成 14）。集成模块会构建真实的 PF4J 样例 jar，并只通过公开 API 验证：没有内部强制转换，没有 `Thread.sleep`，没有生产代码后门。
 
 ## 贡献
 
