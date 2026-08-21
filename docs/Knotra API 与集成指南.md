@@ -395,6 +395,8 @@ runtime.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
 
 ## 常见错误
 
+本节是一行式速记；按症状展开的完整排查流程、状态速查与诊断码对照见 [Knotra FAQ 与排障指南](<Knotra FAQ 与排障指南.md>)。
+
 - `MutationResult.value()` 抛异常：事务被拒绝，先看 `committed()` 与 `diagnostics()`。
 - 第二次 provide 同名 capability 被拒：同 context slot 已占用，先 `revoke()`。
 - 组件长期 `WAITING`：REQUIRED 缺失或 binding cycle，看 snapshot bindings/diagnostics。
