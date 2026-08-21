@@ -6,6 +6,12 @@ Knotra 为应用提供一组精简的可组合原语，用于组装动态挂载�
 
 需要 Java 21+ 和 Maven 3.9+。
 
+## 文档
+
+- [实战案例：动态物流路由系统](<docs/Knotra 实战案例：动态物流路由系统.md>)：从仓库级能力覆盖、依赖重激活到 PF4J artifact 排空卸载，说明 Knotra 适合解决的问题和完整使用路径。
+- [API 与集成指南](<docs/Knotra API 与集成指南.md>)：公开 API、模块依赖、宿主事务、EventBus、PF4J 与 Loader 接入方式。
+- [运行时设计文档](<docs/Knotra 运行时设计文档.md>)：Context、Capability、Activation、LifecycleScope、依赖图和失败恢复的详细语义。
+
 ## 模块
 
 | 模块 | 职责 | 运行时依赖 | 测试 |
