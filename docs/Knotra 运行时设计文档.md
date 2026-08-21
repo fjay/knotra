@@ -181,6 +181,27 @@ STARTING reservation 对 Snapshot 可见，但它的 staged registration 不进�
 - 因新 registration 受影响的 consumer 及其 ownership descendant 先被 logical detach。
 - child Activation 在父提交后的 post-commit plan 中调度，不在父用户的 `start()` 栈内递归启动。
 
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING: 挂载或等待依赖
+    WAITING --> STARTING: 必需依赖全部满足
+    STARTING --> ACTIVE: start() 成功 & 乐观验证通过
+    STARTING --> WAITING: 启动期依赖变化 (Stale 回滚)
+    STARTING --> FAILED: 启动异常 / 环路检测失败
+    
+    ACTIVE --> STOPPING: 依赖变更 / 重配置 / dispose
+    
+    STOPPING --> WAITING: 清理成功 (Goal=RUNNING, 自动重激活)
+    STOPPING --> DISPOSED: 清理成功 (Goal=DISPOSED)
+    STOPPING --> FAILED: 资源清理失败 (现场隔离可重试)
+    
+    FAILED --> WAITING: retry() 清理成功
+    FAILED --> STARTING: retry() 重新发起启动
+    FAILED --> DISPOSED: 显式 dispose()
+    
+    DISPOSED --> [*]
+```
+
 ### 依赖变化、owned child 与 teardown
 
 provider 撤销、替换或 Context shadow 关系变化时，Core 不是只异步通知 consumer。mutation 在 draft 中计算直接绑定旧 registration 的组件，加上这些组件的 owned child，再传递闭包得到直接和间接 dependent closure。这个 closure 的 Activation 被标记 STOPPING，其 owned registrations 在同一 draft 中撤销；随后才发布 view 并调度物理 cleanup。
@@ -192,6 +213,40 @@ provider 撤销、替换或 Context shadow 关系变化时，Core 不是只异�
 - Context disposal 覆盖整个 subtree，并把其中组件及 owned descendants 的 goal 改为 DISPOSED。
 - Runtime close 从 root Context 递归收敛。
 - provider 的资源 teardown 等待相关 dependent cleanup future，不会在 consumer 仍引用旧 provider value 时先释放底层连接。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as 宿主 (Host)
+    participant Core as 运行时 (Knotra Core)
+    participant Consumer as 消费方 (Consumer)
+    participant Provider as 提供方 (Provider)
+
+    Note over Consumer,Provider: 初始状态：Consumer 绑定 Provider(v1)，均为 ACTIVE
+    Host->>Core: runtime.mutate(revoke(v1), provide(v2))
+    activate Core
+    Core->>Core: 计算受影响闭包：Consumer 依赖旧 v1
+    Core->>Consumer: 标记为 STOPPING，触发优雅收尾
+    deactivate Core
+    
+    activate Consumer
+    Consumer->>Consumer: LifecycleScope 逆序释放资源 / 排空在途任务
+    Consumer-->>Core: 清理完成 (Consumer 进入 WAITING)
+    deactivate Consumer
+
+    Core->>Provider: 释放旧 v1 底层资源 (确保无在途引用)
+    Core->>Core: 原子发布 v2，生成新 Generation
+
+    Note over Core,Consumer: 自动 Reconcile：新依赖 v2 已就绪
+    Core->>Consumer: 创建新 Activation (代际+1, 绑定 v2)
+    activate Consumer
+    Consumer->>Consumer: 锁外执行 start(context, config)
+    Consumer-->>Core: start 成功，暂存注册校验通过
+    deactivate Consumer
+    
+    Core->>Core: 乐观提交，Consumer 状态切换为 ACTIVE
+    Core-->>Host: 事务收敛完成 (whenSettled 达成)
+```
 
 同一个 Handle 的 transition 串行排队。旧 Activation 处于 STOPPING 或 cleanup FAILED 时，新 binding 不会立刻创建第二份运行；等旧 Activation settle 后，Handle 依最新 goal 与 binding 进入 WAITING/FAILED/DISPOSED。这解决了 provider 快速替换时的双实例问题。
 

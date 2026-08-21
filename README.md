@@ -209,6 +209,69 @@ public interface Component<C> {
 
 `REQUIRED` 绑定会在所绑定的注册变化时重新激活消费方；`OPTIONAL` 绑定也属于同一个 `BindingSet`，因此可选提供方出现或消失同样会产生新的 Activation。Capability 合约类型在 Runtime 生命周期内按名称固定。
 
+### 组件状态机
+
+组件挂载点（`ComponentHandle`）在 Runtime 中遵循明确的状态流转。启动代码在锁外异步执行，依赖变更或失败均有确定性的状态边界：
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING: mount / 依赖待满足
+    WAITING --> STARTING: 必需依赖就绪
+    STARTING --> ACTIVE: start 成功 & 乐观验证通过
+    STARTING --> WAITING: 启动期依赖变化 (Stale 回滚重试)
+    STARTING --> FAILED: 启动异常 / 依赖环路
+    
+    ACTIVE --> STOPPING: 依赖变更 / 重配置 / 收到卸载
+    
+    STOPPING --> WAITING: 清理完成 (目标为 RUNNING, 自动重激活)
+    STOPPING --> DISPOSED: 清理完成 (目标为 DISPOSED)
+    STOPPING --> FAILED: 资源清理失败 (保留现场可重试)
+    
+    FAILED --> WAITING: retry 清理成功
+    FAILED --> STARTING: retry 重新启动
+    FAILED --> DISPOSED: 放弃并销毁
+    
+    DISPOSED --> [*]
+```
+
+### 依赖重激活与优雅收尾时序
+
+当依赖的服务提供方发生替换时，Knotra 确保消费方先优雅收尾，再绑定新提供方重新启动，避免在途请求损坏或带过期状态运行：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as 宿主 (Host)
+    participant Core as 运行时 (Knotra Core)
+    participant Consumer as 消费方组件 (Consumer)
+    participant Provider as 服务提供方 (Provider)
+
+    Note over Consumer,Provider: 初始：Consumer 绑定 Provider(v1)，均为 ACTIVE
+    Host->>Core: runtime.mutate(revoke(v1), provide(v2))
+    activate Core
+    Core->>Core: 计算受影响闭包：发现 Consumer 依赖旧 v1
+    Core->>Consumer: 标记为 STOPPING，触发优雅收尾
+    deactivate Core
+    
+    activate Consumer
+    Consumer->>Consumer: LifecycleScope 逆序释放资源 / 排空在途请求
+    Consumer-->>Core: 清理完成 (Consumer 进入 WAITING)
+    deactivate Consumer
+
+    Core->>Provider: 释放旧 v1 底层资源 (确保无存活引用)
+    Core->>Core: 原子发布 v2，生成新 Generation
+
+    Note over Core,Consumer: 自动 Reconcile：新依赖 v2 已就绪
+    Core->>Consumer: 创建新 Activation (代际+1, 绑定 v2)
+    activate Consumer
+    Consumer->>Consumer: 锁外执行 start(context, config)
+    Consumer-->>Core: start 成功，提交暂存注册
+    deactivate Consumer
+    
+    Core->>Core: 乐观校验通过，Consumer 切换为 ACTIVE
+    Core-->>Host: 事务收敛完成 (whenSettled 达成)
+```
+
 ### 宿主事务
 
 宿主不会通过共享可变对象修改 Runtime。结构调整通过短事务完成；事务被拒绝时不会发布任何内容：
