@@ -26,6 +26,6 @@ public enum DiagnosticCode {
     INVALID_LIFECYCLE_OPERATION,
     /** 挂载 ID 缺失或已被占用。 */
     INVALID_MOUNT_ID,
-    /** 配置不符合工厂 schema；当前为保留码。 */
+    /** 类型化配置为 null，或 factory normalizer 抛错、返回 null。 */
     INVALID_CONFIG
 }

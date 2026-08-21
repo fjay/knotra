@@ -18,7 +18,7 @@ LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊�
 2. **诊断码**：稳定枚举，适合程序化判断；消息文本可能调整，不要按消息字符串编程。
 3. **绑定集**：组件的 `BindingSet` 显示它绑定的是哪一次注册，用于回答"它为什么重启 / 为什么不启动"。
 
-恢复操作都是幂等推进的：已成功项跳过，失败项保留。`retry()`、`retryDrain(...)`、重复 `closeAsync()`、重复 `dispose()` 都是安全操作。
+恢复操作都是幂等推进的：已成功项跳过，失败项保留。`retryAsync()`、`retryDrain(...)`、重复 `closeAsync()`、重复 `disposeAsync()` 都是安全操作。
 
 ## 状态速查
 
@@ -28,7 +28,7 @@ LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊�
 | `STARTING` | 启动事务进行中 | 用户 `start()` 未返回；长期停留先检查是否有阻塞调用 |
 | `ACTIVE` | 当前 Activation 活跃 | 正常 |
 | `STOPPING` | 正在停止，等待清理收敛 | 清理慢或清理卡住，看 LifecycleScope 条目状态 |
-| `FAILED` | 启动或清理失败 | 读诊断码；`retry()` 可重试 |
+| `FAILED` | 启动或清理失败 | 读诊断码；`retryAsync()` 可重试 |
 | `DISPOSED` | 已释放并移除 | 终态 |
 
 | ArtifactState | 含义 | 卡在这个状态通常说明 |
@@ -51,7 +51,7 @@ LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊�
 
 1. 看 snapshot 中该 handle 的 bindings 与 diagnostics；
 2. 缺依赖：在可见的 Context 上 `provide(...)` 对应 capability，组件会在 provider 出现后自动启动；
-3. 有环：调整组件的依赖声明解除环；同一 fingerprint 反复超限会停止自动重启，改结构后 fingerprint 重置，或显式 `retry()`。
+3. 有环：调整组件的依赖声明解除环；同一 fingerprint 反复超限会停止自动重启，改结构后 fingerprint 重置，或显式 `retryAsync()`。
 
 ### 替换了一个 `equals()` 相等的提供方，组件为什么还是重启了？
 
@@ -63,7 +63,7 @@ LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊�
 
 ### `require(...)` 报 capability 未声明？
 
-`ActivationContext.require/find` 只能访问 descriptor 声明过的 key，未声明是组件契约错误。把对应 `CapabilityRequirement` 加进 `ComponentDescriptor`；宿主侧的 `RuntimeContext` 没有这个限制，但它不建立绑定、不触发依赖追踪，不要混用两者。
+`ActivationContext.require/find` 只能访问 descriptor 声明过的 key，未声明是组件契约错误。把对应 `CapabilityRequirement` 加进 `ComponentDescriptor`；宿主侧的 `ContextView` 没有这个限制，但它不建立绑定、不触发依赖追踪，不要混用两者。
 
 ### `start()` 执行到一半依赖被替换，组件会带着过期状态运行吗？
 
@@ -89,8 +89,8 @@ LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊�
 
 按诊断码分三类：
 
-- `ACTIVATION_FAILED`：`start()` 抛错，已回滚暂存注册与资源。修正原因后 `retry()` 或 reconfigure；
-- `CLEANUP_FAILED`：LifecycleScope 条目清理失败，失败条目保留错误文本，`retry()` 只重试失败条目，不重放已成功项；
+- `ACTIVATION_FAILED`：`start()` 抛错，已回滚暂存注册与资源。修正原因后 `retryAsync()` 或 `reconfigureAsync`；
+- `CLEANUP_FAILED`：LifecycleScope 条目清理失败，失败条目保留错误文本，`retryAsync()` 只重试失败条目，不重放已成功项；
 - `ROLLBACK_FAILED`：提交或回滚流程自身失败，读诊断中的原始错误。
 
 ### 关闭卡住（STOPPING 不收敛），看什么？
@@ -125,7 +125,7 @@ LoaderSnapshot loaderState = loader.snapshot();  // 收敛条目、路径、诊�
 - **factory 不存在**：`resolve(...)` 返回 `Optional.empty()`；
 - **token 不匹配**：立即抛 `IllegalArgumentException`。经 Loader 桥接时记录为 `RESOLUTION_FAILED`，不会伪装成空结果。
 
-排查用 `factoryCatalog()` 的只读元数据（含稳定的 `configTypeName()`）确认 factory id 与配置类型名。
+排查用 `factories().list()` 的只读元数据（含稳定的 `configTypeName()`）确认 factory id 与配置类型名。
 
 ### 遇到 `DRAIN_FAILED`？
 
@@ -143,7 +143,7 @@ Runtime 侧不保留引用（两条路径都用弱引用 GC 测试断言过）�
 
 ### mount 报 null config？
 
-artifact handle 的类型化挂载强制非空配置。无配置工厂也必须传 `NoConfig.INSTANCE`；有配置时传正确类型的 raw 值，归一化由 Core 调 factory schema 完成。
+Artifact handle 的三参数 typed mount 拒绝 null。无配置工厂使用 `mount(context, mountId)`；配置型工厂先 `decodeConfig(raw)`，再把得到的 `C` 传给 typed mount，Core 随后执行 factory normalizer。
 
 ## Loader
 
@@ -173,9 +173,9 @@ Loader 的 `ACTIVATION_FAILED` 表示组件 Activation 失败或重配置后处�
 | `CAPABILITY_SLOT_OCCUPIED` | 目标 Context 同名 slot 已占用 | 先 revoke，或用子 Context 遮蔽 |
 | `CAPABILITY_TYPE_CONFLICT` | 同名 capability 与已固化类型冲突 | 统一合约类型来源 |
 | `BINDING_CYCLE` | 依赖图有环，自动重启被抑制 | 改结构，或显式 retry |
-| `ACTIVATION_FAILED` | 组件启动失败 | 修正后 `retry()` / reconfigure |
+| `ACTIVATION_FAILED` | 组件启动失败 | 修正后 `retryAsync()` / `reconfigureAsync` |
 | `ROLLBACK_FAILED` | 激活提交或回滚流程失败 | 读诊断中的原始错误 |
-| `CLEANUP_FAILED` | 受管条目清理失败 | `retry()` 只重试失败条目 |
+| `CLEANUP_FAILED` | 受管条目清理失败 | `retryAsync()` 只重试失败条目 |
 | `NON_CONVERGENT_RECONCILE` | 自动收敛超次数未收敛 | 改结构后 fingerprint 重置 |
 | `INVALID_LIFECYCLE_OPERATION` | 操作非法（目标已释放、参数无效、运行时关闭中） | 检查目标状态后重试 |
 | `INVALID_MOUNT_ID` | 挂载 ID 缺失或被占用 | 换 ID 或释放旧挂载 |

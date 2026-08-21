@@ -18,11 +18,11 @@ import io.knotra.ComponentFactory;
 import io.knotra.ComponentHandle;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
-import io.knotra.ConfigSchema;
+import io.knotra.ConfigDecoder;
 import io.knotra.ContextHandle;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountOptions;
-import io.knotra.MutationResult;
+import io.knotra.TransactionRejectedException;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.pf4j.spi.ExportedComponentFactory;
 import io.knotra.pf4j.spi.RuntimeComponentProvider;
@@ -61,13 +61,23 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     private final Object closeLock = new Object();
     private CompletableFuture<Void> closeFuture;
 
-    private final ArtifactFactoryResolver resolver = new ArtifactFactoryResolver() {
+    private final ArtifactFactoryCatalog factoryCatalog = new ArtifactFactoryCatalog() {
         @Override
-        public Optional<ArtifactFactoryCatalogEntry> resolve(String factoryId) {
+        public List<ArtifactFactoryCatalogEntry> list() {
+            return catalogEntries();
+        }
+
+        @Override
+        public Optional<ArtifactFactoryCatalogEntry> find(String factoryId) {
             Objects.requireNonNull(factoryId, "factoryId");
-            return factoryCatalog().stream()
+            return catalogEntries().stream()
                     .filter(entry -> entry.factoryId().equals(factoryId))
                     .findFirst();
+        }
+
+        @Override
+        public Optional<ArtifactFactoryHandle<?>> resolve(String factoryId) {
+            return Optional.ofNullable(activeFactory(factoryId));
         }
 
         @Override
@@ -89,11 +99,6 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             @SuppressWarnings("unchecked")
             ArtifactFactoryHandle<C> typed = (ArtifactFactoryHandle<C>) handle;
             return Optional.of(typed);
-        }
-
-        @Override
-        public List<ArtifactFactoryCatalogEntry> handles() {
-            return factoryCatalog();
         }
     };
     DefaultPf4jArtifactAdapter(
@@ -119,7 +124,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     @Override
-    public CompletableFuture<ArtifactSnapshot> loadArtifact(Path artifactPath) {
+    public CompletableFuture<ArtifactSnapshot> loadArtifactAsync(Path artifactPath) {
         Path target = Objects.requireNonNull(artifactPath, "artifactPath").toAbsolutePath().normalize();
         if (closeStarted.get() || coordinator.isStopped()) {
             return CompletableFuture.failedFuture(new IllegalStateException("adapter is closed"));
@@ -159,17 +164,16 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     @Override
-    public CompletableFuture<Void> unloadArtifact(String artifactId) {
+    public CompletableFuture<Void> unloadArtifactAsync(String artifactId) {
         return drain(Objects.requireNonNull(artifactId, "artifactId"), "unload");
     }
 
     @Override
-    public CompletableFuture<Void> retryDrain(String artifactId) {
+    public CompletableFuture<Void> retryDrainAsync(String artifactId) {
         return drain(Objects.requireNonNull(artifactId, "artifactId"), "retry-drain");
     }
 
-    @Override
-    public List<ArtifactFactoryCatalogEntry> factoryCatalog() {
+    private List<ArtifactFactoryCatalogEntry> catalogEntries() {
         return coordinator.submit(() -> {
             synchronized (stateLock) {
                 List<ArtifactFactoryCatalogEntry> entries = new ArrayList<>();
@@ -195,10 +199,9 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }).join();
     }
 
-
     @Override
-    public ArtifactFactoryResolver resolver() {
-        return resolver;
+    public ArtifactFactoryCatalog factories() {
+        return factoryCatalog;
     }
 
     <T> T coordinateRead(java.util.function.Supplier<T> action) {
@@ -351,22 +354,23 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                     classLoaderPolicy,
                     handle.artifact.metadata);
             // 提交 Core 事务不持有内存状态锁；组件启动仍由 Core 控制在协调器之外。
-            MutationResult<ComponentHandle<C>> result = runtime.mutate(mutation ->
-                    mutation.mount(
-                            context,
-                            mountId,
-                            guarded,
-                            config,
-                            new MountOptions(
-                                    handle.artifact.metadata.origin(),
-                                    handle.artifact.metadata.metadata())));
-            if (!result.committed()) {
+            try {
+                component = runtime.transact(transaction -> transaction.mount(
+                        context,
+                        mountId,
+                        guarded,
+                        config,
+                        new MountOptions(
+                                handle.artifact.metadata.origin(),
+                                handle.artifact.metadata.metadata())))
+                        .value();
+            } catch (TransactionRejectedException failure) {
                 throw new ArtifactOperationException(
                         handle.artifact.artifactId,
                         "mount",
-                        "Knotra rejected mount: " + result.diagnostics());
+                        "Knotra rejected mount: " + failure.diagnostics(),
+                        failure.diagnostics());
             }
-            component = result.value();
             synchronized (stateLock) {
                 // Core 已提交的句柄即使撞上并发 drain，也必须先记入所有权再决定回滚。
                 handle.artifact.directHandles.put(component.handleId(), component);
@@ -385,7 +389,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
         // mount 提交后撞上 drain：先保留所有权，异步 dispose 完成前不能卸载插件。
         ComponentHandle<C> rejected = component;
-        rejected.dispose().whenComplete((ignored, disposalFailure) ->
+        rejected.disposeAsync().whenComplete((ignored, disposalFailure) ->
                 endMount(handle.artifact));
         throw new ArtifactOperationException(
                 handle.artifact.artifactId,
@@ -727,7 +731,11 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         // 配置 token 是跨边界合约，必须在工厂进入目录前完成宿主身份校验。
         classLoaderPolicy.validateContractType(exported.configType(), artifact.artifactId);
         ComponentFactory<C> factory = exported.factory();
-        Optional<ConfigSchema<C>> configSchema = factory.configSchema();
+        ConfigDecoder<C> decoder = exported.decoder();
+        classLoaderPolicy.validateInterface(
+                decoder.getClass(),
+                ConfigDecoder.class,
+                artifact.artifactId);
         ComponentFactory<C> guarded = GuardedComponentFactory.wrap(
                 factory,
                 classLoaderPolicy,
@@ -744,7 +752,12 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             }
         }
         result.add(new ManagedFactory<>(
-                this, artifact, factoryId, exported.configType(), guarded, configSchema));
+                this,
+                artifact,
+                factoryId,
+                exported.configType(),
+                decoder,
+                guarded));
     }
 
     private void rollback(LoadJournal journal, String targetId, Throwable failure) {
@@ -1007,8 +1020,8 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 && handle.goal() == io.knotra.ComponentGoal.DISPOSED;
         // FAILED 且目标是 DISPOSED 时，只剩可重试的清理，不应重新启动组件。
         CompletableFuture<ComponentState> attempt = failedDisposedGoal
-                ? handle.retry().toCompletableFuture()
-                : handle.dispose().toCompletableFuture();
+                ? handle.retryAsync().toCompletableFuture()
+                : handle.disposeAsync().toCompletableFuture();
         return attempt.exceptionallyCompose(error -> {
             if (!isRuntimeClosing()) {
                 return CompletableFuture.failedFuture(error);
@@ -1019,7 +1032,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     private boolean isRuntimeClosing() {
-        String rootId = runtime.rootContext().contextId();
+        String rootId = runtime.root().contextId();
         return runtime.snapshot().contexts().stream()
                 .filter(context -> context.contextId().equals(rootId))
                 .findFirst()

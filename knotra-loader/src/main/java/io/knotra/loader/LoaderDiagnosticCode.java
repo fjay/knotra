@@ -10,7 +10,7 @@ package io.knotra.loader;
 public enum LoaderDiagnosticCode {
     /** 工厂引用解析失败：解析器未返回实现，或解析过程抛出异常。 */
     RESOLUTION_FAILED,
-    /** 配置 schema 归一化或校验拒绝，整批期望树在挂载前失败。 */
+    /** Raw decoder 或 Core typed normalizer 拒绝配置。 */
     CONFIG_INVALID,
     /** 期望树结构非法：路径为空、越界、重复、缺少父条目等。 */
     INVALID_TREE,

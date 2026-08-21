@@ -99,7 +99,7 @@ final class ManagedArtifact {
         acceptingMounts = false;
         for (ManagedFactory<?> factory : factories) {
             factory.factory = null;
-            factory.configSchema = java.util.Optional.empty();
+            factory.decoder = null;
         }
         factories.clear();
         factoriesById.clear();

@@ -8,7 +8,6 @@ import io.knotra.CapabilityKey;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ConfigSchema;
 import io.knotra.ContextInfo;
 import io.knotra.LifecycleScope;
 import io.knotra.MountOptions;
@@ -80,6 +79,28 @@ final class GuardedActivationContext implements ActivationContext {
                         ? metadata.options().metadata()
                         : options.metadata()));
     }
+    @Override
+    public io.knotra.ComponentHandle<io.knotra.NoConfig> mountChild(
+            String mountId,
+            ComponentFactory<io.knotra.NoConfig> factory) {
+        return mountChild(
+                mountId,
+                factory,
+                io.knotra.NoConfig.INSTANCE,
+                io.knotra.MountOptions.DEFAULT);
+    }
+
+    @Override
+    public io.knotra.ComponentHandle<io.knotra.NoConfig> mountChild(
+            String mountId,
+            ComponentFactory<io.knotra.NoConfig> factory,
+            MountOptions options) {
+        return mountChild(
+                mountId,
+                factory,
+                io.knotra.NoConfig.INSTANCE,
+                options);
+    }
 
     @Override
     public LifecycleScope lifecycle() {
@@ -87,8 +108,8 @@ final class GuardedActivationContext implements ActivationContext {
     }
 
     @Override
-    public ContextInfo contextInfo() {
-        return delegate.contextInfo();
+    public ContextInfo info() {
+        return delegate.info();
     }
 
     private void validate(CapabilityKey<?> key) {

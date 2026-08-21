@@ -16,7 +16,7 @@ public final class EventBusComponent implements Component<NoConfig> {
     public static final EventBusComponent INSTANCE = new EventBusComponent();
 
     private static final ComponentDescriptor DESCRIPTOR =
-            ComponentDescriptor.of("knotra-event-bus");
+            ComponentDescriptor.named("knotra-event-bus");
 
     private EventBusComponent() {
     }
@@ -36,7 +36,7 @@ public final class EventBusComponent implements Component<NoConfig> {
     @Override
     public void start(ActivationContext context, NoConfig config) {
         EventBus bus = new DefaultEventBus();
-        context.lifecycle().manageAsync("event-bus", bus::closeAsync);
+        context.lifecycle().manageAsync("event-bus", bus);
         context.provide(EventCapabilities.EVENT_BUS, bus);
     }
 }

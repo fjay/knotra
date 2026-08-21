@@ -10,17 +10,17 @@ import io.knotra.ComponentFactory;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
 import io.knotra.NoConfig;
-import io.knotra.loader.ClasspathComponentFactoryResolver;
+import io.knotra.loader.ClasspathFactoryResolver;
 import io.knotra.loader.ComponentEntry;
 import io.knotra.loader.ComponentFactoryResolver;
 import io.knotra.loader.ComponentTree;
-import io.knotra.loader.CompositeComponentFactoryResolver;
 import io.knotra.loader.FactoryRef;
 import io.knotra.loader.KnotraLoader;
 import io.knotra.loader.LoaderDiagnosticCode;
 import io.knotra.loader.ReconcileResult;
 import io.knotra.pf4j.ArtifactState;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
+import io.knotra.pf4j.loader.Pf4jFactoryResolver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -56,30 +56,30 @@ final class LoaderPf4jBridgeIntegrationTest {
     }
 
     private static ComponentFactoryResolver artifactBridge(Pf4jArtifactAdapter adapter) {
-        return ref -> IntegrationTestKit.bridge(adapter).apply(ref);
+        return Pf4jFactoryResolver.of(adapter);
     }
 
     @Test
-    void opaqueBridgeReconcilesNestedTreeWithSchemaIdentityAndOwnership(
+    void officialBridgeReconcilesNestedTreeWithDecoderIdentityAndOwnership(
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             KnotraLoader loader = KnotraLoader.over(
                     runtime,
-                    runtime.rootContext(),
-                    CompositeComponentFactoryResolver.of(artifactBridge(adapter)));
+                    runtime.root(),
+                    artifactBridge(adapter));
             try {
                 ReconcileResult rejected = loader.reconcile(ComponentTree.of(
-                        ComponentEntry.of("greeting", GREETING, "   ")));
+                        ComponentEntry.configured("greeting", GREETING, "   ")));
                 assertFalse(rejected.converged());
                 assertTrue(rejected.diagnostics().stream()
                         .anyMatch(item -> item.code() == LoaderDiagnosticCode.CONFIG_INVALID),
                         () -> rejected.diagnostics().toString());
                 assertTrue(runtime.snapshot().components().isEmpty());
 
-                ComponentTree desired = ComponentTree.of(ComponentEntry.of(
+                ComponentTree desired = ComponentTree.of(ComponentEntry.configured(
                         "greeting", GREETING, "  hello  ",
-                        ComponentEntry.of("parent", PARENT, NoConfig.INSTANCE)));
+                        ComponentEntry.of("parent", PARENT)));
                 ReconcileResult first = loader.reconcile(desired);
                 assertTrue(first.converged(), () -> first.diagnostics().toString());
                 assertEquals(2, loader.snapshot().entries().size());
@@ -103,8 +103,8 @@ final class LoaderPf4jBridgeIntegrationTest {
                         "greeting, parent, and the artifact child must stay owned");
 
                 ReconcileResult updated = loader.reconcile(ComponentTree.of(
-                        ComponentEntry.of("greeting", GREETING, "  next  ",
-                                ComponentEntry.of("parent", PARENT, NoConfig.INSTANCE))));
+                        ComponentEntry.configured("greeting", GREETING, "  next  ",
+                                ComponentEntry.of("parent", PARENT))));
                 assertTrue(updated.converged(), () -> updated.diagnostics().toString());
                 assertTrue(updated.changes().stream()
                         .anyMatch(change -> change.type() == ReconcileResult.ChangeType.UPDATED
@@ -118,28 +118,48 @@ final class LoaderPf4jBridgeIntegrationTest {
     }
 
     @Test
+    void officialBridgeRejectsVersionMismatchBeforeCreatingStructure(
+            @TempDir Path pluginsRoot) throws Exception {
+        FactoryRef incompatible = FactoryRef.of("integration-greeting", "9.0.0");
+        try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
+             KnotraLoader loader = KnotraLoader.over(
+                     runtime, runtime.root(), Pf4jFactoryResolver.of(adapter))) {
+            adapter.loadArtifact(IntegrationTestKit.fixture());
+
+            ReconcileResult result = loader.reconcile(ComponentTree.of(
+                    ComponentEntry.configured("greeting", incompatible, "hello")));
+
+            assertFalse(result.converged());
+            assertTrue(result.diagnostics().stream().anyMatch(
+                    item -> item.code() == LoaderDiagnosticCode.RESOLUTION_FAILED));
+            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(loader.snapshot().entries().isEmpty());
+        }
+    }
+
+    @Test
     void reconcileAndArtifactDrainRaceLeavesNoPartialStateAndConvergesOnRetry(
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            ComponentFactory<Object> local = IntegrationTestKit.classpathFactory(
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            ComponentFactory<NoConfig> local = IntegrationTestKit.classpathFactory(
                     "local-recovery", (context, config) -> {
                     });
-            ComponentFactoryResolver classpath = ClasspathComponentFactoryResolver.builder()
+            ComponentFactoryResolver classpath = ClasspathFactoryResolver.builder()
                     .add(LOCAL, local)
                     .build();
             KnotraLoader loader = KnotraLoader.over(
                     runtime,
-                    runtime.rootContext(),
-                    CompositeComponentFactoryResolver.of(artifactBridge(adapter), classpath));
+                    runtime.root(),
+                    Pf4jFactoryResolver.withFallbacks(adapter, classpath));
             try {
                 var race = loader.reconcileAsync(
-                        ComponentTree.of(ComponentEntry.of(
-                                "gated", IN_FLIGHT, NoConfig.INSTANCE)));
+                        ComponentTree.of(ComponentEntry.of("gated", IN_FLIGHT)));
                 IntegrationCoordinator.mountEntered().get(10, TimeUnit.SECONDS);
 
                 CompletableFuture<Void> unload =
-                        adapter.unloadArtifact(IntegrationTestKit.ARTIFACT_ID);
+                        adapter.unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID)
+                                .toCompletableFuture();
                 await().atMost(java.time.Duration.ofSeconds(10)).untilAsserted(() ->
                         assertEquals(ArtifactState.DRAINING, adapter.artifact(
                                 IntegrationTestKit.ARTIFACT_ID).orElseThrow().state()));
@@ -157,7 +177,7 @@ final class LoaderPf4jBridgeIntegrationTest {
                 assertTrue(loader.snapshot().entry("gated").isEmpty());
 
                 ReconcileResult recovery = loader.reconcile(ComponentTree.of(
-                        ComponentEntry.of("recovered", LOCAL, NoConfig.INSTANCE)));
+                        ComponentEntry.of("recovered", LOCAL)));
                 assertTrue(recovery.converged(), () -> recovery.diagnostics().toString());
                 assertEquals(ComponentState.ACTIVE, loader.snapshot()
                         .entry("recovered").orElseThrow().state());
@@ -182,11 +202,11 @@ final class LoaderPf4jBridgeIntegrationTest {
                 });
         KnotraLoader loader = KnotraLoader.over(
                 runtime,
-                runtime.rootContext(),
-                ClasspathComponentFactoryResolver.builder().add(FLAKY, flaky).build());
+                runtime.root(),
+                ClasspathFactoryResolver.builder().add(FLAKY, flaky).build());
         try {
             ReconcileResult first = loader.reconcile(ComponentTree.of(
-                    ComponentEntry.of("flaky", FLAKY, NoConfig.INSTANCE)));
+                    ComponentEntry.of("flaky", FLAKY)));
             assertFalse(first.converged());
             assertTrue(first.diagnostics().stream()
                     .anyMatch(item -> item.code() == LoaderDiagnosticCode.ACTIVATION_FAILED),

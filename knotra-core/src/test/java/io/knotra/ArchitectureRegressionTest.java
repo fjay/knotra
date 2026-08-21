@@ -37,7 +37,7 @@ final class ArchitectureRegressionTest {
 
     private ComponentHandle<NoConfig> mount(String id, TestKit.Start<NoConfig> start,
                                              CapabilityRequirement... requirements) {
-        return TestKit.mount(runtime, runtime.rootContext(), id, id, start, requirements);
+        return TestKit.mount(runtime, runtime.root(), id, id, start, requirements);
     }
 
     @Test
@@ -45,23 +45,22 @@ final class ArchitectureRegressionTest {
         ComponentFactory<EquivalentConfig> factory = TestKit.factory(
                 "configured",
                 new TestKit.Scripted<>(
-                        ComponentDescriptor.of("configured"),
+                        ComponentDescriptor.named("configured"),
                         (context, config) -> {}));
-        var handle = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "configured", factory, new EquivalentConfig("one"))).value();
+        var handle = runtime.transact(mutation -> mutation.mount(
+                runtime.root(), "configured", factory, new EquivalentConfig("one"))).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         String activation = TestKit.component(runtime, handle).currentActivationId();
         long generation = runtime.snapshot().generation();
 
-        var rejected = runtime.mutate(mutation -> {
+        TestKit.assertRejected(() -> runtime.transact(mutation -> {
             mutation.reconfigure(handle, new EquivalentConfig("two"));
-            mutation.mount(runtime.rootContext(), "configured",
+            mutation.mount(runtime.root(), "configured",
                     TestKit.factory("duplicate", new TestKit.Scripted<>(
-                            ComponentDescriptor.of("duplicate"), (context, config) -> {})),
+                            ComponentDescriptor.named("duplicate"), (context, config) -> {})),
                     NoConfig.INSTANCE);
             return null;
-        });
-        TestKit.assertRejected(rejected, DiagnosticCode.INVALID_MOUNT_ID);
+        }), DiagnosticCode.INVALID_MOUNT_ID);
 
         assertEquals(generation, runtime.snapshot().generation());
         assertEquals(1, handle.configRevision());
@@ -72,20 +71,20 @@ final class ArchitectureRegressionTest {
     @Test
     void sameTransactionCanUseAndRevokeProvisionalRegistrationsAndContexts() {
         ContextHandle[] workspace = new ContextHandle[1];
-        var result = runtime.mutate(mutation -> {
-            ContextHandle child = mutation.childContext(runtime.rootContext(), "workspace");
+        var result = runtime.transact(mutation -> {
+            ContextHandle child = mutation.childContext(runtime.root(), "workspace");
             workspace[0] = child;
             var first = mutation.provide(child, A, "first");
             mutation.revoke(first);
             var second = mutation.provide(child, A, "second");
             mutation.mount(child, "component", TestKit.factory("component",
-                    new TestKit.Scripted<>(ComponentDescriptor.of("component",
+                    new TestKit.Scripted<>(ComponentDescriptor.named("component",
                             CapabilityRequirement.required(A)), (context, config) -> {})),
                     NoConfig.INSTANCE);
             return second;
         });
         TestKit.assertCommitted(result);
-        assertEquals("second", workspace[0].context().require(A));
+        assertEquals("second", workspace[0].view().require(A));
         assertEquals(1, runtime.snapshot().registrations().size());
     }
 
@@ -97,12 +96,12 @@ final class ArchitectureRegressionTest {
 
             @Override public Component<NoConfig> create() {
                 creates.incrementAndGet();
-                return new TestKit.Scripted<>(ComponentDescriptor.of("temporary"),
+                return new TestKit.Scripted<>(ComponentDescriptor.named("temporary"),
                         (context, config) -> {});
             }
         };
-        var result = runtime.mutate(mutation -> {
-            var handle = mutation.mount(runtime.rootContext(), "temporary", factory, NoConfig.INSTANCE);
+        var result = runtime.transact(mutation -> {
+            var handle = mutation.mount(runtime.root(), "temporary", factory, NoConfig.INSTANCE);
             mutation.dispose(handle);
             return handle;
         });
@@ -120,7 +119,7 @@ final class ArchitectureRegressionTest {
         var handle = mount("waiting", (context, config) -> {},
                 CapabilityRequirement.required(A));
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call());
-        assertEquals(ComponentState.DISPOSED, handle.dispose()
+        assertEquals(ComponentState.DISPOSED, handle.disposeAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertTrue(runtime.snapshot().components().isEmpty());
 
@@ -135,19 +134,19 @@ final class ArchitectureRegressionTest {
         CompletableFuture<Void> gate = new CompletableFuture<>();
         ComponentFactory<BlockingEqualConfig> factory = TestKit.factory(
                 "configured",
-                new TestKit.Scripted<>(ComponentDescriptor.of("configured"),
+                new TestKit.Scripted<>(ComponentDescriptor.named("configured"),
                         (context, config) -> {}));
-        var handle = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "configured", factory,
+        var handle = runtime.transact(mutation -> mutation.mount(
+                runtime.root(), "configured", factory,
                 new BlockingEqualConfig("same", null, null))).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         String activation = TestKit.component(runtime, handle).currentActivationId();
 
         ExecutorService worker = Executors.newSingleThreadExecutor();
-        var reconfiguredFuture = worker.submit(() -> handle.reconfigure(
+        var reconfiguredFuture = worker.submit(() -> handle.reconfigureAsync(
                 new BlockingEqualConfig("same", entered, gate)));
         assertTrue(entered.await(10, TimeUnit.SECONDS));
-        TestKit.provide(runtime, runtime.rootContext(), UNRELATED, "independent");
+        TestKit.provide(runtime, runtime.root(), UNRELATED, "independent");
         long generation = runtime.snapshot().generation();
         gate.complete(null);
         var reconfigured = reconfiguredFuture.get(10, TimeUnit.SECONDS);
@@ -175,9 +174,9 @@ final class ArchitectureRegressionTest {
                 throw new IllegalStateException("user failure after stale");
             }
         }, CapabilityRequirement.required(A));
-        var first = TestKit.provide(runtime, runtime.rootContext(), A, "one");
+        var first = TestKit.provide(runtime, runtime.root(), A, "one");
         assertTrue(started.await(10, TimeUnit.SECONDS));
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(first);
             return null;
         }));
@@ -188,7 +187,7 @@ final class ArchitectureRegressionTest {
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.targetId().equals(handle.handleId())));
 
-        TestKit.provide(runtime, runtime.rootContext(), A, "two");
+        TestKit.provide(runtime, runtime.root(), A, "two");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(2, starts.get());
     }
@@ -205,9 +204,9 @@ final class ArchitectureRegressionTest {
                     });
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.dispose()
+        assertEquals(ComponentState.FAILED, handle.disposeAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        assertEquals(ComponentState.DISPOSED, handle.retry()
+        assertEquals(ComponentState.DISPOSED, handle.retryAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
     }
 
@@ -216,15 +215,15 @@ final class ArchitectureRegressionTest {
         List<String> events = new java.util.concurrent.CopyOnWriteArrayList<>();
         var handle = mount("async", (context, config) -> {
             var group = context.lifecycle().parallelChild("group");
-            group.manageAsync("bad", () -> CompletableFuture.failedFuture(
+            group.onCloseAsync("bad", () -> CompletableFuture.failedFuture(
                     new IllegalStateException("bad")));
-            group.manageAsync("good", () -> {
+            group.onCloseAsync("good", () -> {
                 events.add("good");
                 return CompletableFuture.completedFuture(null);
             });
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.dispose()
+        assertEquals(ComponentState.FAILED, handle.disposeAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(List.of("good"), events);
     }
@@ -234,12 +233,12 @@ final class ArchitectureRegressionTest {
         int rounds = 1000;
         for (int round = 0; round < rounds; round++) {
             List<String> order = new java.util.concurrent.CopyOnWriteArrayList<>();
-            var provider = TestKit.mount(runtime, runtime.rootContext(),
+            var provider = TestKit.mount(runtime, runtime.root(),
                     "p-" + round, (context, config) -> {
                         context.provide(A, "a");
                         context.lifecycle().onClose("p", () -> order.add("p"));
                     });
-            var consumer = TestKit.mount(runtime, runtime.rootContext(),
+            var consumer = TestKit.mount(runtime, runtime.root(),
                     "c-" + round, (context, config) -> {
                         context.require(A);
                         context.lifecycle().onClose("c", () -> order.add("c"));
@@ -247,18 +246,18 @@ final class ArchitectureRegressionTest {
             assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
             assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
             int currentRound = round;
-            assertEquals(ComponentState.DISPOSED, provider.dispose()
+            assertEquals(ComponentState.DISPOSED, provider.disposeAsync()
                     .toCompletableFuture().get(10, TimeUnit.SECONDS),
                     () -> "provider round " + currentRound + ": " + runtime.snapshot());
             assertEquals(List.of("c", "p"), order);
             assertEquals(ComponentState.WAITING, consumer.state());
             var replacement = TestKit.provide(
-                    runtime, runtime.rootContext(), A, "host-" + round);
+                    runtime, runtime.root(), A, "host-" + round);
             assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
-            assertEquals(ComponentState.DISPOSED, consumer.dispose()
+            assertEquals(ComponentState.DISPOSED, consumer.disposeAsync()
                     .toCompletableFuture().get(10, TimeUnit.SECONDS),
                     () -> "consumer round " + currentRound + ": " + runtime.snapshot());
-            var revoke = runtime.mutate(mutation -> {
+            var revoke = runtime.transact(mutation -> {
                 mutation.revoke(replacement);
                 return null;
             });
@@ -268,26 +267,26 @@ final class ArchitectureRegressionTest {
 
     @Test
     void snapshotIsSortedAndCarriesProvenanceRequirementsAndPaths() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "workspace");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "workspace");
         var origin = ComponentOrigin.artifact("artifact-a", "1.2.3", "test artifact");
         AtomicReference<ComponentHandle<NoConfig>> mountedChild =
                 new AtomicReference<>();
-        var parent = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(),
+        var parent = runtime.transact(mutation -> mutation.mount(
+                runtime.root(),
                 "parent",
                 TestKit.factory("parent", new TestKit.Scripted<>(
-                        ComponentDescriptor.of("parent", CapabilityRequirement.required(A)),
+                        ComponentDescriptor.named("parent", CapabilityRequirement.required(A)),
                         (context, config) -> {
                             context.provide(B, "b");
                             mountedChild.set(context.mountChild("child",
                                     TestKit.factory("child",
-                                            new TestKit.Scripted<>(ComponentDescriptor.of("child"),
+                                            new TestKit.Scripted<>(ComponentDescriptor.named("child"),
                                                     (childContext, childConfig) -> {})),
                                     NoConfig.INSTANCE));
                         })),
                 NoConfig.INSTANCE,
                 new MountOptions(origin, java.util.Map.of("source", "test")))).value();
-        TestKit.provide(runtime, runtime.rootContext(), A, "a");
+        TestKit.provide(runtime, runtime.root(), A, "a");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(mountedChild.get()).call());
         var childHandle = runtime.snapshot().components().stream()
@@ -307,32 +306,32 @@ final class ArchitectureRegressionTest {
         assertEquals(origin, childHandle.origin());
         assertEquals("test", TestKit.component(runtime, parent).mountOptions().metadata("source"));
         assertEquals(parent.handleId(), childHandle.parentHandleId());
-        assertEquals("/root", runtime.rootContext().contextInfo().canonicalPath());
-        assertEquals("/root/workspace", child.contextInfo().canonicalPath());
+        assertEquals("/root", runtime.root().info().canonicalPath());
+        assertEquals("/root/workspace", child.info().canonicalPath());
         assertEquals(CapabilityRequirement.Mode.REQUIRED,
                 TestKit.component(runtime, parent).requirements().getFirst().mode());
     }
 
     @Test
     void disposedChildContextLeavesNamespaceAndSameNameCanBeRebuilt() throws Exception {
-        ContextHandle first = TestKit.child(runtime, runtime.rootContext(), "workspace");
+        ContextHandle first = TestKit.child(runtime, runtime.root(), "workspace");
         first.close();
         assertEquals(ContextState.DISPOSED, first.state());
         assertTrue(runtime.snapshot().contexts().stream()
                 .noneMatch(context -> context.contextId().equals(first.contextId())));
 
-        ContextHandle second = TestKit.child(runtime, runtime.rootContext(), "workspace");
+        ContextHandle second = TestKit.child(runtime, runtime.root(), "workspace");
         assertNotEquals(first.contextId(), second.contextId());
-        assertEquals("/root/workspace", second.contextInfo().canonicalPath());
+        assertEquals("/root/workspace", second.info().canonicalPath());
     }
 
     @Test
     void contextCanBeDisposedInsideStructuralTransaction() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "temporary");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "temporary");
         TestKit.provide(runtime, child, A, "value");
-        var result = runtime.mutate(mutation -> {
+        var result = runtime.transact(mutation -> {
             mutation.mount(child, "component", TestKit.factory("component",
-                    new TestKit.Scripted<>(ComponentDescriptor.of("component"), (c, config) -> {})),
+                    new TestKit.Scripted<>(ComponentDescriptor.named("component"), (c, config) -> {})),
                     NoConfig.INSTANCE);
             mutation.dispose(child);
             return null;
@@ -340,7 +339,7 @@ final class ArchitectureRegressionTest {
         TestKit.assertCommitted(result);
         result.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ContextState.DISPOSED, child.state());
-        assertTrue(runtime.context().find(A).isEmpty());
+        assertTrue(runtime.root().view().find(A).isEmpty());
         assertTrue(runtime.snapshot().components().isEmpty());
     }
 
@@ -352,7 +351,7 @@ final class ArchitectureRegressionTest {
         List<ComponentHandle<NoConfig>> staged =
                 new java.util.concurrent.CopyOnWriteArrayList<>();
         ComponentFactory<NoConfig> childFactory = TestKit.factory("child",
-                new TestKit.Scripted<>(ComponentDescriptor.of("child"),
+                new TestKit.Scripted<>(ComponentDescriptor.named("child"),
                         (context, config) -> childStarts.incrementAndGet()));
         TestKit.Start<NoConfig> parentStart = (context, config) -> {
             staged.add(context.mountChild("collision", childFactory, NoConfig.INSTANCE));
@@ -378,8 +377,8 @@ final class ArchitectureRegressionTest {
 
     @Test
     void bindingCycleRetriesOnlyWhenRelevantTopologyChanges() throws Exception {
-        var rootA = TestKit.provide(runtime, runtime.rootContext(), A, "root-a");
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "cycle");
+        var rootA = TestKit.provide(runtime, runtime.root(), A, "root-a");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "cycle");
         var provider = TestKit.mount(runtime, child, "provider",
                 (context, config) -> {
                     context.require(A);
@@ -396,16 +395,16 @@ final class ArchitectureRegressionTest {
         assertEquals(ComponentState.WAITING, TestKit.settle(cyclic).call());
         assertEquals(1, starts.get());
 
-        TestKit.provide(runtime, runtime.rootContext(), UNRELATED, "unrelated");
+        TestKit.provide(runtime, runtime.root(), UNRELATED, "unrelated");
         assertEquals(ComponentState.WAITING, TestKit.settle(cyclic).call());
         assertEquals(1, starts.get());
 
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(rootA);
             return null;
         }));
         assertEquals(ComponentState.WAITING, TestKit.settle(provider).call());
-        TestKit.provide(runtime, runtime.rootContext(), A, "root-a-new");
+        TestKit.provide(runtime, runtime.root(), A, "root-a-new");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
         assertEquals(ComponentState.WAITING, TestKit.settle(cyclic).call());
         assertEquals(2, starts.get());
@@ -440,15 +439,15 @@ final class ArchitectureRegressionTest {
         var inherited = ComponentOrigin.artifact("parent-artifact", "2.0", "parent");
         var explicit = ComponentOrigin.artifact("child-artifact", "3.0", "child");
         AtomicReference<ComponentHandle<NoConfig>> child = new AtomicReference<>();
-        var parent = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(),
+        var parent = runtime.transact(mutation -> mutation.mount(
+                runtime.root(),
                 "parent",
                 TestKit.factory("parent", new TestKit.Scripted<>(
-                        ComponentDescriptor.of("parent"),
+                        ComponentDescriptor.named("parent"),
                         (context, config) -> child.set(context.mountChild(
                                 "child",
                                 TestKit.factory("child", new TestKit.Scripted<>(
-                                        ComponentDescriptor.of("child"),
+                                        ComponentDescriptor.named("child"),
                                         (childContext, childConfig) -> {})),
                                 NoConfig.INSTANCE,
                                 new MountOptions(explicit))))),
@@ -471,7 +470,7 @@ final class ArchitectureRegressionTest {
             context.lifecycle().onClose("last", () -> events.add("last"));
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(List.of("last", "deeper-entry", "nested-entry", "first"), events);
     }
 

@@ -1,7 +1,7 @@
 package io.knotra.events;
 
 /**
- * 同步事件的监听合约。{@link EventBus#emit(EventDefinition, Object)} 会在调用线程中按订阅顺序执行监听，
+ * 同步事件的监听合约。{@link EventBus#dispatch(EventDefinition.Sync, Object)} 在调用线程中按订阅顺序执行监听，
  * 单个监听失败不会阻止后续监听，失败会被聚合进 {@link EventDispatch#failures()}。
  */
 @FunctionalInterface

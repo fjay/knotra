@@ -1,265 +1,293 @@
 # Knotra 测试指南
 
-本文回答：**如何测试基于 Knotra 的组件、依赖替换、清理失败和插件卸载**。适用于 `0.1.0-SNAPSHOT`，全部示例只用公开 API。
+Knotra 测试应验证状态与结构语义，不依赖调度时机。仓库自身的测试遵循三条规则：
 
-## 原则
+1. 等待 `CompletionStage`，不要用 `Thread.sleep` 猜测收敛。
+2. 断言稳定状态、generation、registration identity、Snapshot 和诊断码，不匹配错误文本。
+3. 失败恢复必须验证“只重试未完成部分”，不能只验证最终成功。
 
-1. **用真实 Runtime 测试**。生命周期、绑定换代、清理顺序本身就是被测行为的一部分，mock 掉 Runtime 等于没测。每个测试创建独立的 `KnotraRuntime`，用 try-with-resources 或 `@AfterEach` 关闭。
-2. **永远等待 settle，不要 sleep**。`whenSettled()` / `dispose()` / `reconcile()` 都返回可等待的 future；轮询快照时用 Awaitility。仓库自身的 227 项测试没有任何 `Thread.sleep`，你的测试也不需要。
-3. **断言行为而不是实现**。组件消费了哪一代 provider，最可靠的断言是让组件记录它看到的值，而不是猜内部结构。
-4. **测试结束时 close 应当成功**。`runtime.close()` 抛异常说明清理逻辑有 bug，应当让测试失败，而不是吞掉。
+## 最小测试夹具
 
-依赖（测试作用域）：
-
-```xml
-<dependency>
-  <groupId>org.junit.jupiter</groupId>
-  <artifactId>junit-jupiter</artifactId>
-  <scope>test</scope>
-</dependency>
-<dependency>
-  <groupId>org.awaitility</groupId>
-  <artifactId>awaitility</artifactId>
-  <scope>test</scope>
-</dependency>
-```
-
-## 基本骨架：挂载并断言 ACTIVE
+无配置组件可以用小型 factory helper：
 
 ```java
-class GreetingComponentTest {
-
-    @Test
-    void mountedComponentBecomesActive() throws Exception {
-        try (KnotraRuntime runtime = KnotraRuntime.create()) {
-            MutationResult<ComponentHandle<NoConfig>> mounted = runtime.mutate(tx ->
-                    tx.mount(runtime.rootContext(), "greeter",
-                            new GreetingFactory(), NoConfig.INSTANCE));
-            assertTrue(mounted.committed(), mounted.diagnostics()::toString);
-
-            ComponentState state = mounted.value().whenSettled()
-                    .toCompletableFuture().get(10, TimeUnit.SECONDS);
-            assertEquals(ComponentState.ACTIVE, state);
+static ComponentFactory<NoConfig> factory(
+        String id,
+        CapabilityRequirement[] requirements,
+        ThrowingBiConsumer<ActivationContext, NoConfig> start) {
+    return new ComponentFactory<>() {
+        @Override
+        public String factoryId() {
+            return id;
         }
-    }
-}
-```
 
-检查 `committed()` 是固定动作：事务被拒时 `value()` 会抛 `IllegalStateException`。
+        @Override
+        public Component<NoConfig> create() {
+            return new Component<>() {
+                @Override
+                public ComponentDescriptor descriptor() {
+                    return ComponentDescriptor.named(id, requirements);
+                }
 
-## 测试依赖替换与重激活
-
-让组件把它绑定到的 provider 值记录下来，替换 provider 后断言值变化、activation 换代：
-
-```java
-@Test
-void providerReplacementReactivatesConsumer() throws Exception {
-    try (KnotraRuntime runtime = KnotraRuntime.create()) {
-        CapabilityKey<Greeting> GREETING =
-                CapabilityKey.of("app.greeting", Greeting.class);
-        AtomicReference<String> boundTo = new AtomicReference<>();
-        AtomicInteger activations = new AtomicInteger();
-
-        ComponentFactory<NoConfig> consumerFactory = new ComponentFactory<>() {
-            @Override public String factoryId() { return "greeter"; }
-
-            @Override public Component<NoConfig> create() {
-                return new Component<>() {
-                    @Override public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("greeter",
-                                CapabilityRequirement.required(GREETING));
-                    }
-
-                    @Override public void start(ActivationContext context, NoConfig config) {
-                        activations.incrementAndGet();
-                        boundTo.set(context.require(GREETING).version());
-                    }
-                };
-            }
-        };
-
-        MutationResult<RegistrationHandle> v1 = runtime.mutate(tx ->
-                tx.provide(runtime.rootContext(), GREETING, greeting("v1")));
-        MutationResult<ComponentHandle<NoConfig>> consumer = runtime.mutate(tx ->
-                tx.mount(runtime.rootContext(), "greeter", consumerFactory, NoConfig.INSTANCE));
-        assertEquals(ComponentState.ACTIVE, consumer.value().whenSettled()
-                .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        assertEquals("v1", boundTo.get());
-
-        runtime.mutate(tx -> {
-            tx.revoke(v1.value());
-            return tx.provide(runtime.rootContext(), GREETING, greeting("v2"));
-        });
-        consumer.value().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
-
-        assertEquals(2, activations.get());      // 旧运行收尾后按新注册重启
-        assertEquals("v2", boundTo.get());
-    }
-}
-
-record Greeting(String version) {}
-```
-
-同一次替换里"先 revoke 再 provide"是一个事务：绑定变化只触发一次重激活，不会出现中间空窗被误判为 `MISSING_CAPABILITY`。
-
-## 测试清理失败与 retry
-
-清理失败的语义：失败条目保留、组件进入 `FAILED`、`retry()` 只重试失败条目。
-
-```java
-@Test
-void retryRepeatsOnlyFailedCleanup() throws Exception {
-    try (KnotraRuntime runtime = KnotraRuntime.create()) {
-        AtomicInteger goodCloses = new AtomicInteger();
-        AtomicInteger badCloses = new AtomicInteger();
-
-        ComponentFactory<NoConfig> factory = new ComponentFactory<>() {
-            @Override public String factoryId() { return "flaky"; }
-
-            @Override public Component<NoConfig> create() {
-                return new Component<>() {
-                    @Override public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("flaky");
-                    }
-
-                    @Override public void start(ActivationContext context, NoConfig config) {
-                        context.lifecycle().onClose("good", goodCloses::incrementAndGet);
-                        context.lifecycle().onClose("bad", () -> {
-                            if (badCloses.incrementAndGet() < 2) {
-                                throw new IllegalStateException("temporary");
-                            }
-                        });
-                    }
-                };
-            }
-        };
-
-        MutationResult<ComponentHandle<NoConfig>> mounted = runtime.mutate(tx ->
-                tx.mount(runtime.rootContext(), "flaky", factory, NoConfig.INSTANCE));
-        ComponentHandle<NoConfig> handle = mounted.value();
-        assertEquals(ComponentState.ACTIVE, handle.whenSettled()
-                .toCompletableFuture().get(10, TimeUnit.SECONDS));
-
-        // 清理失败：dispose 正常完成为 FAILED，不会异常完成
-        assertEquals(ComponentState.FAILED, handle.dispose()
-                .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        assertTrue(runtime.snapshot().diagnostics().stream()
-                .anyMatch(d -> d.code() == DiagnosticCode.CLEANUP_FAILED));
-
-        // 修复外部条件后重试：good 条目不再重放，bad 条目重试成功
-        ComponentState settled = handle.retry()
-                .toCompletableFuture().get(10, TimeUnit.SECONDS);
-        assertEquals(ComponentState.DISPOSED, settled);
-        assertEquals(1, goodCloses.get());
-        assertEquals(2, badCloses.get());
-    }
-}
-```
-
-## 用门闩控制时序
-
-测试竞态的正确姿势是用 `CountDownLatch` 冻结某个阶段，而不是 sleep：
-
-```java
-CountDownLatch startGate = new CountDownLatch(1);
-
-// 组件 start() 里阻塞：startGate.await();
-// 此时从测试线程发起 dispose，再断言过渡状态：
-assertEquals(ComponentState.STOPPING, componentState(runtime, handle));
-
-startGate.countDown();   // 放行 start，过渡继续推进
-assertEquals(ComponentState.DISPOSED, handle.dispose()
-        .toCompletableFuture().get(10, TimeUnit.SECONDS));
-```
-
-`componentState` 是对快照的薄封装（Knotra 没有发布测试工具包，建议在自己的工程里维护这个小助手）：
-
-```java
-static ComponentState componentState(KnotraRuntime runtime, ComponentHandle<?> handle) {
-    return runtime.snapshot().components().stream()
-            .filter(c -> c.handleId().equals(handle.handleId()))
-            .findFirst()
-            .orElseThrow()
-            .state();
-}
-```
-
-## 测试 reconfigure
-
-```java
-// 同一组件实例收到两次配置；activation 换代，configRevision 递增
-MutationResult<ComponentHandle<GreetingConfig>> mounted = runtime.mutate(tx ->
-        tx.mount(runtime.rootContext(), "greeter",
-                new GreetingFactory(), new GreetingConfig("v1")));
-ComponentHandle<GreetingConfig> handle = mounted.value();
-assertEquals(ComponentState.ACTIVE, handle.whenSettled()
-        .toCompletableFuture().get(10, TimeUnit.SECONDS));
-assertEquals(1, handle.configRevision());
-
-runtime.mutate(tx -> tx.reconfigure(handle, new GreetingConfig("v2")));
-assertEquals(ComponentState.ACTIVE, handle.whenSettled()
-        .toCompletableFuture().get(10, TimeUnit.SECONDS));
-assertEquals(2, handle.configRevision());
-```
-
-断言"组件实例被复用、配置被更新"最直接的方式同样是让 `start()` 把收到的 config 记入 `AtomicReference`。
-
-## 测试 ClassLoader 回收
-
-插件卸载后断言 ClassLoader 弱可达，使用弱引用加显式 GC 循环（与仓库集成测试相同的姿势）：
-
-```java
-@Test
-void unloadedPluginClassLoaderIsCollectable() throws Exception {
-    try (KnotraRuntime runtime = KnotraRuntime.create();
-         Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
-                 pluginsRoot, runtime, Set.of("com.example.contract"))) {
-
-        adapter.loadArtifact(pluginJar).join();
-        // 挂载、使用、卸载……
-        adapter.unloadArtifact("greeting-plugin").join();
-
-        ClassLoader pluginLoader = capturedDuringLoad;   // 在加载阶段通过插件代码捕获
-        WeakReference<ClassLoader> ref = new WeakReference<>(pluginLoader);
-        pluginLoader = null;
-
-        for (int i = 0; i < 50 && ref.get() != null; i++) {
-            System.gc();
-            Thread.onSpinWait();
+                @Override
+                public void start(ActivationContext context, NoConfig config)
+                        throws Exception {
+                    start.accept(context, config);
+                }
+            };
         }
-        assertNull(ref.get());
-    }
+    };
 }
 ```
 
-注意：测试里不能有其他强引用（局部变量、字段、lambda 捕获）指向插件对象或 loader，否则断言会假失败。
-
-## 测试插件加载与卸载
-
-集成层测试直接走真实 JAR（可以用测试 fixture 的构建方式在 `generate-test-resources` 阶段编译打包一个最小插件），断言用适配器公开状态：
+挂载与等待：
 
 ```java
-adapter.loadArtifact(pluginJar).join();
-assertEquals(ArtifactState.ACTIVE, adapter.artifact("greeting-plugin")
-        .orElseThrow().state());
+ComponentHandle<NoConfig> handle = runtime.mount(
+        "consumer", consumerFactory);
 
-adapter.unloadArtifact("greeting-plugin").join();
-assertEquals(ArtifactState.UNLOADED, adapter.artifact("greeting-plugin")
-        .orElseThrow().state());
+assertEquals(ComponentState.ACTIVE,
+        handle.whenSettled().toCompletableFuture()
+                .get(10, TimeUnit.SECONDS));
 ```
 
-drain 竞态测试思路：用门闩让某个 owned mount 的清理阻塞，发起 `unloadArtifact`，断言 artifact 处于 `DRAINING`；放行后断言 `UNLOADED`。若并发发起 reconcile，被 drain 的 mount 应失败回滚，下一次 reconcile 恢复本地实现。
+无配置路径不传 `NoConfig.INSTANCE`。
 
-## 常见坑
+## 依赖替换
 
-- **保存 `ActivationContext`**：`start()` 返回后 context 即关闭，存下来后续使用必错。需要长期状态就发布 capability。
-- **组件字段跨代残留**：组件实例复用，上次 Activation 的字段若不在 `start()` 重置，会污染本次运行。
-- **用 sleep 等收敛**：偶发通过、经常抖动。所有等待都有 future 或 Awaitility 入口。
-- **吞掉 close 失败**：`runtime.close()` 异常 = 清理 bug，让测试红。
-- **在诊断里匹配消息文本**：消息文本可能调整，按 `DiagnosticCode` 编程。
+测试 provider 替换应同时验证旧 registration 被撤销、消费方产生新 Activation，并只绑定新值：
 
-## 相关文档
+```java
+RegistrationHandle v1 = runtime.provide(GREETING, greeting("v1"));
+ComponentHandle<NoConfig> consumer = runtime.mount(
+        "greeter", consumerFactory);
+assertEquals(ComponentState.ACTIVE, settle(consumer));
 
-- [Knotra API 与集成指南](<Knotra API 与集成指南.md>)：被测 API 的完整语义。
-- [Knotra 线程模型与生产实践](<Knotra 线程模型与生产实践.md>)：时序相关断言背后的线程事实。
-- [Knotra FAQ 与排障指南](<Knotra FAQ 与排障指南.md>)：测试中出现的诊断码含义。
+String oldActivation = component(runtime.snapshot(), consumer)
+        .currentActivationId();
+
+runtime.transact(tx -> {
+    tx.revoke(v1);
+    return tx.provide(runtime.root(), GREETING, greeting("v2"));
+});
+
+assertEquals(ComponentState.ACTIVE, settle(consumer));
+String newActivation = component(runtime.snapshot(), consumer)
+        .currentActivationId();
+assertNotEquals(oldActivation, newActivation);
+assertEquals("v2", observed.get());
+```
+
+不要只断言 `start()` 调用了两次；那无法证明旧 BindingSet 已经失效。
+
+## 事务原子性
+
+拒绝现在通过异常表达：
+
+```java
+long generation = runtime.snapshot().generation();
+
+TransactionRejectedException failure = assertThrows(
+        TransactionRejectedException.class,
+        () -> runtime.transact(tx -> {
+            tx.provide(runtime.root(), SERVICE, first);
+            tx.provide(runtime.root(), SERVICE, duplicate);
+            return null;
+        }));
+
+assertEquals(DiagnosticCode.CAPABILITY_SLOT_OCCUPIED,
+        failure.diagnostics().getFirst().code());
+assertEquals(generation, runtime.snapshot().generation());
+assertTrue(runtime.root().view().find(SERVICE).isEmpty());
+```
+
+还应覆盖：
+
+- callback 抛异常时零发布。
+- 同事务 provisional Context/registration 可以被后续 intent 使用。
+- 无结构变化的事务不增加 generation。
+- Runtime closing 后新事务抛 `TransactionRejectedException`。
+- typed normalizer 抛错或返回 null 时诊断为 `INVALID_CONFIG`。
+
+## Stale Activation
+
+用 latch 控制 `start()`：
+
+1. 组件进入 `STARTING` 后阻塞。
+2. 替换其 provider 或 reconfigure。
+3. 放行旧 `start()`。
+4. 断言旧 Activation 回滚，不产生业务 `ACTIVATION_FAILED`。
+5. 断言新 Activation 绑定最新 registration/config。
+
+旧候选已经 stale 时，即使旧 `start()` 随后抛业务异常，也应优先按 stale rollback 处理。
+
+## LifecycleScope
+
+验证 LIFO：
+
+```java
+List<String> order = new CopyOnWriteArrayList<>();
+ComponentHandle<NoConfig> handle = runtime.mount("lifo", factory(
+        "lifo", new CapabilityRequirement[0], (context, config) -> {
+            context.lifecycle().onClose("first", () -> order.add("first"));
+            context.lifecycle().onClose("last", () -> order.add("last"));
+        }));
+
+assertEquals(ComponentState.ACTIVE, settle(handle));
+assertEquals(ComponentState.DISPOSED,
+        handle.disposeAsync().toCompletableFuture().get());
+assertEquals(List.of("last", "first"), order);
+```
+
+异步动作使用 `onCloseAsync`：
+
+```java
+context.lifecycle().onCloseAsync("consumer", this::closeConsumerAsync);
+```
+
+实现 `AsyncCloseable` 的资源直接 `manageAsync`：
+
+```java
+EventSubscription subscription = bus.subscribe(EVENT, listener);
+context.lifecycle().manageAsync("listener", subscription);
+```
+
+## 清理失败与 close
+
+失败条目保留，成功条目不重放：
+
+```java
+assertEquals(ComponentState.FAILED,
+        handle.disposeAsync().toCompletableFuture().get());
+assertEquals(1, successfulCleanupAttempts.get());
+assertEquals(1, failedCleanupAttempts.get());
+
+repair();
+assertEquals(ComponentState.DISPOSED,
+        handle.retryAsync().toCompletableFuture().get());
+assertEquals(1, successfulCleanupAttempts.get());
+assertEquals(2, failedCleanupAttempts.get());
+```
+
+必须单独覆盖 `close()`：
+
+```java
+IllegalStateException failure = assertThrows(
+        IllegalStateException.class,
+        handle::close);
+assertEquals(ComponentState.FAILED, handle.state());
+```
+
+这可以防止同步 close 静默接受清理失败。
+
+Context 清理失败正常返回 `ContextState.FAILED`，第二次 `disposeAsync()` 推进重试。Runtime close 则异常完成并保留执行器，重复 `closeAsync()` 继续收敛。
+
+## EventBus
+
+Definition 静态类型固定 mode：
+
+```java
+EventDefinition.Serial<JobFinished> event =
+        EventDefinition.serial(JobFinished.class);
+EventSubscription subscription = bus.subscribe(
+        event,
+        value -> CompletableFuture.completedFuture(true));
+EventDispatch<JobFinished> dispatch = bus.dispatch(event, value)
+        .toCompletableFuture().get();
+```
+
+不存在运行时 mode mismatch 测试；非法组合应当无法编译。行为测试应覆盖：
+
+- Sync 注册顺序。
+- Parallel 等待全部 listener。
+- Serial stop、Bail claim、Waterfall value 传递。
+- Listener 失败进入 `EventDispatch.failures()`。
+- `unsubscribe()` 不等待 accepted work。
+- Subscription/bus `closeAsync()` 等待 accepted work。
+- 同名不同 exact Class 被拒，binding idle 后可由新 ClassLoader 重新绑定。
+- Listener callback 使用 listener ClassLoader 作为临时 TCCL，结束后恢复。
+
+## Loader
+
+无配置与 raw 配置声明分开：
+
+```java
+ComponentTree tree = ComponentTree.of(
+        ComponentEntry.of("metrics", METRICS_REF),
+        ComponentEntry.configured("tool", TOOL_REF, rawConfig));
+```
+
+配置型 classpath factory 在 resolver 注册 decoder：
+
+```java
+ComponentFactoryResolver resolver = ClasspathFactoryResolver.builder()
+        .add(TOOL_REF, toolFactory, rawToolDecoder)
+        .add(METRICS_REF, metricsFactory)
+        .build();
+```
+
+Loader 测试应验证：
+
+- 全部 decoder 在结构变化前执行。
+- decoder 失败返回 `CONFIG_INVALID`，新增项零挂载。
+- 相同 `FactoryIdentity` 只 reconfigure，handle 不变。
+- Identity 改变时旧 handle 先到 `DISPOSED`，再挂新实现。
+- 新实现拒绝时补偿恢复旧实现。
+- 清理失败产生 `BLOCKED` / `TEARDOWN_FAILED`，下一次 reconcile 只重试清理。
+- start `FAILED` 不自动 retry，必须显式 `loader.retry(path)`。
+- `requireConverged()` 在有诊断时抛 `ReconcileException`，合法 `WAITING` 不抛。
+
+## PF4J 与官方桥接
+
+直接 artifact 测试：
+
+```java
+plugins.loadArtifact(fixture);
+ArtifactFactoryHandle<Config> factory = plugins.factories()
+        .resolve("factory", Config.class)
+        .orElseThrow();
+Config config = factory.decodeConfig(raw);
+ComponentHandle<Config> handle = factory.mount(
+        runtime.root(), "component", config);
+```
+
+需要覆盖 token mismatch、decoder wrong type、normalizer 拒绝、catalog metadata 不可执行、wildcard handle 失效和 direct ownership。
+
+官方 Loader bridge：
+
+```java
+KnotraLoader loader = KnotraLoader.over(
+        runtime,
+        runtime.root(),
+        Pf4jFactoryResolver.of(plugins));
+```
+
+跨模块测试应证明：
+
+- 宿主不提供 factoryId 到 `Class<C>` 映射也能 reconcile。
+- 非空 `FactoryRef.version` 精确匹配 artifact version。
+- Core `INVALID_CONFIG` 穿过 PF4J 和 bridge 后仍映射为 Loader `CONFIG_INVALID`。
+- Reconcile mount 与 artifact drain 竞争时不留下 partial state。
+- Cleanup 失败进入 `DRAIN_FAILED`，`retryDrainAsync` 只推进失败部分。
+- Adapter、Loader 与 Runtime 并发 close 最终收敛。
+
+## ClassLoader GC
+
+GC 测试应保留弱引用并避免测试代码自己持有插件对象：
+
+1. Load artifact 并挂载组件或 listener。
+2. 保存 Runtime、Artifact、Loader、EventBus Snapshot。
+3. Drain/unload artifact。
+4. 清空 fixture coordinator 等宿主静态引用。
+5. 使用 Awaitility 触发 GC，断言插件 ClassLoader 弱引用清零。
+
+Snapshot 可以继续强引用；它们不得钉住插件 ClassLoader。
+
+## 运行测试
+
+```bash
+mvn test
+mvn clean verify
+```
+
+当前测试分布：Core 98、Events 44、PF4J 37、Loader 36、跨模块集成 15，共 230 项。

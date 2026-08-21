@@ -63,54 +63,54 @@ final class DefaultEventBus implements EventBus {
     }
 
     @Override
-    public <T> EventSubscription on(
-            EventDefinition<T> definition,
+    public <T> EventSubscription subscribe(
+            EventDefinition.Sync<T> definition,
             EventListener<? super T> listener) {
         Objects.requireNonNull(listener, "listener");
-        return register(definition, EventMode.SYNC, listener);
+        return register(definition, listener);
     }
 
     @Override
-    public <T> EventSubscription onParallel(
-            EventDefinition<T> definition,
+    public <T> EventSubscription subscribe(
+            EventDefinition.Parallel<T> definition,
             ParallelEventListener<? super T> listener) {
         Objects.requireNonNull(listener, "listener");
-        return register(definition, EventMode.PARALLEL, listener);
+        return register(definition, listener);
     }
 
     @Override
-    public <T> EventSubscription onSerial(
-            EventDefinition<T> definition,
+    public <T> EventSubscription subscribe(
+            EventDefinition.Serial<T> definition,
             SerialEventListener<? super T> listener) {
         Objects.requireNonNull(listener, "listener");
-        return register(definition, EventMode.SERIAL, listener);
+        return register(definition, listener);
     }
 
     @Override
-    public <T> EventSubscription onBail(
-            EventDefinition<T> definition,
+    public <T> EventSubscription subscribe(
+            EventDefinition.Bail<T> definition,
             BailEventListener<? super T> listener) {
         Objects.requireNonNull(listener, "listener");
-        return register(definition, EventMode.BAIL, listener);
+        return register(definition, listener);
     }
 
     @Override
-    public <T> EventSubscription onWaterfall(
-            EventDefinition<T> definition,
+    public <T> EventSubscription subscribe(
+            EventDefinition.Waterfall<T> definition,
             WaterfallEventListener<T> listener) {
         Objects.requireNonNull(listener, "listener");
-        return register(definition, EventMode.WATERFALL, listener);
+        return register(definition, listener);
     }
 
     @Override
-    public <T> EventDispatch<T> emit(EventDefinition<T> definition, T event) {
+    public <T> EventDispatch<T> dispatch(EventDefinition.Sync<T> definition, T event) {
         Accepted<T> accepted = accept(definition, event, EventMode.SYNC);
         // accepted.listeners 已被固化，同步回调即使修改注册表也不会改变本次分发的监听集合。
         try {
             List<EventFailure> failures = new ArrayList<>();
             for (RegisteredSubscription subscription : accepted.listeners()) {
                 try {
-                    EventListener<? super T> listener = listener(subscription, EventMode.SYNC);
+                    EventListener<? super T> listener = listener(subscription);
                     withListenerContext(subscription, () -> {
                         listener.listen(accepted.event());
                         return null;
@@ -126,8 +126,8 @@ final class DefaultEventBus implements EventBus {
     }
 
     @Override
-    public <T> CompletionStage<EventDispatch<T>> parallel(
-            EventDefinition<T> definition,
+    public <T> CompletionStage<EventDispatch<T>> dispatch(
+            EventDefinition.Parallel<T> definition,
             T event) {
         Accepted<T> accepted = accept(definition, event, EventMode.PARALLEL);
         try {
@@ -160,22 +160,22 @@ final class DefaultEventBus implements EventBus {
     }
 
     @Override
-    public <T> CompletionStage<EventDispatch<T>> serial(
-            EventDefinition<T> definition,
+    public <T> CompletionStage<EventDispatch<T>> dispatch(
+            EventDefinition.Serial<T> definition,
             T event) {
         return sequential(definition, event, EventMode.SERIAL);
     }
 
     @Override
-    public <T> CompletionStage<EventDispatch<T>> bail(
-            EventDefinition<T> definition,
+    public <T> CompletionStage<EventDispatch<T>> dispatch(
+            EventDefinition.Bail<T> definition,
             T event) {
         return sequential(definition, event, EventMode.BAIL);
     }
 
     @Override
-    public <T> CompletionStage<EventDispatch<T>> waterfall(
-            EventDefinition<T> definition,
+    public <T> CompletionStage<EventDispatch<T>> dispatch(
+            EventDefinition.Waterfall<T> definition,
             T event) {
         return sequential(definition, event, EventMode.WATERFALL);
     }
@@ -278,11 +278,6 @@ final class DefaultEventBus implements EventBus {
         return closeFuture;
     }
 
-    @Override
-    public void close() {
-        closeAsync().toCompletableFuture().join();
-    }
-
     private void stopOwnedExecutor() {
         if (!ownsExecutor) {
             closeFuture.complete(null);
@@ -349,9 +344,8 @@ final class DefaultEventBus implements EventBus {
 
     private EventSubscription register(
             EventDefinition<?> definition,
-            EventMode mode,
             Object listener) {
-        requireDefinition(definition, mode);
+        Objects.requireNonNull(definition, "definition");
         Objects.requireNonNull(listener, "listener");
 
         lock.writeLock().lock();
@@ -366,8 +360,10 @@ final class DefaultEventBus implements EventBus {
                     "event-subscription-" + busId + "-" + sequences.incrementAndGet(),
                     definition,
                     listener);
-            subscriptions.computeIfAbsent(new SubscriptionIndex(definition.name(), eventType, mode),
-                    ignored -> new ArrayList<>()).add(subscription);
+            subscriptions.computeIfAbsent(
+                            new SubscriptionIndex(definition.name(), eventType, definition.mode()),
+                            ignored -> new ArrayList<>())
+                    .add(subscription);
             binding.subscriptionRegistered();
             return subscription;
         } finally {
@@ -379,7 +375,7 @@ final class DefaultEventBus implements EventBus {
             EventDefinition<T> definition,
             T event,
             EventMode mode) {
-        requireDefinition(definition, mode);
+        Objects.requireNonNull(definition, "definition");
         Objects.requireNonNull(event, "event");
 
         lock.writeLock().lock();
@@ -475,14 +471,6 @@ final class DefaultEventBus implements EventBus {
         return CompletableFuture.allOf(dispatches.toArray(CompletableFuture[]::new));
     }
 
-    private void requireDefinition(EventDefinition<?> definition, EventMode mode) {
-        Objects.requireNonNull(definition, "definition");
-        if (definition.mode() != mode) {
-            throw new IllegalArgumentException("event definition requires " + definition.mode()
-                    + " dispatch, not " + mode);
-        }
-    }
-
     private EventFailure failure(RegisteredSubscription subscription, Throwable error) {
         return new EventFailure(
                 subscription.subscriptionId(),
@@ -493,10 +481,8 @@ final class DefaultEventBus implements EventBus {
     }
 
     @SuppressWarnings("unchecked")
-    private <T> EventListener<? super T> listener(
-            RegisteredSubscription subscription,
-            EventMode mode) {
-        verifyMode(subscription, mode);
+    private <T> EventListener<? super T> listener(RegisteredSubscription subscription) {
+        verifyMode(subscription, EventMode.SYNC);
         return (EventListener<? super T>) subscription.listener();
     }
 
@@ -624,7 +610,9 @@ final class DefaultEventBus implements EventBus {
 
     private void verifyMode(RegisteredSubscription subscription, EventMode mode) {
         if (subscription.mode() != mode) {
-            throw new IllegalArgumentException("subscription is not registered for " + mode);
+            throw new IllegalStateException(
+                    "internal event subscription mode mismatch: expected " + mode
+                            + " but was " + subscription.mode());
         }
     }
 
@@ -938,11 +926,6 @@ final class DefaultEventBus implements EventBus {
                         pending.toArray(CompletableFuture[]::new));
             }
             return closeFuture;
-        }
-
-        @Override
-        public synchronized void close() {
-            closeAsync().toCompletableFuture().join();
         }
 
         private void accept(CompletableFuture<Void> dispatch) {

@@ -21,14 +21,15 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
+import io.knotra.ComponentGoal;
 import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.ContextState;
 import io.knotra.DiagnosticCode;
 import io.knotra.KnotraRuntime;
-import io.knotra.MutationResult;
-import io.knotra.NoConfig;
+import io.knotra.TransactionReceipt;
+import io.knotra.TransactionRejectedException;
 import io.knotra.RuntimeDiagnostic;
 import io.knotra.RuntimeSnapshot;
 
@@ -84,12 +85,15 @@ public final class KnotraLoader implements AutoCloseable {
         this.loaderId = "loader-" + NEXT_ID.incrementAndGet();
         this.owned = owned;
         if (owned) {
-            MutationResult<ContextHandle> result = runtime.mutate(mutation ->
-                    mutation.childContext(runtime.rootContext(), loaderId));
-            if (!result.committed()) {
-                throw new IllegalArgumentException("owned base context creation was rejected");
+            TransactionReceipt<ContextHandle> receipt;
+            try {
+                receipt = runtime.transact(transaction ->
+                        transaction.childContext(runtime.root(), loaderId));
+            } catch (TransactionRejectedException rejection) {
+                throw new IllegalArgumentException(
+                        "owned base context creation was rejected", rejection);
             }
-            this.baseContext = result.value();
+            this.baseContext = receipt.value();
         } else {
             this.baseContext = Objects.requireNonNull(baseContext, "baseContext");
         }
@@ -249,7 +253,7 @@ public final class KnotraLoader implements AutoCloseable {
                 .map(entry -> new LoaderSnapshot.EntrySnapshot(
                         entry.path(),
                         entry.context().contextId(),
-                        entry.context().contextInfo().canonicalPath(),
+                        entry.context().info().canonicalPath(),
                         entry.handle().handleId(),
                         entry.handle().mountId(),
                         entry.handle().componentId(),
@@ -289,10 +293,10 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
-    /** 阻塞等待 {@link #closeAsync()} 完成；清理异常直接上抛，可再次调用重试。 */
+    /** 阻塞等待 {@link #closeAsync()} 完成；失败以 CompletionException 上抛，可再次调用重试。 */
     @Override
-    public void close() throws Exception {
-        closeAsync().toCompletableFuture().get();
+    public void close() {
+        closeAsync().toCompletableFuture().join();
     }
 
     /**
@@ -389,7 +393,7 @@ public final class KnotraLoader implements AutoCloseable {
 
         if (entry.handle().state() == ComponentState.FAILED) {
             try {
-                ComponentState state = entry.handle().retry()
+                ComponentState state = entry.handle().retryAsync()
                         .toCompletableFuture().get();
                 current.put(path, entry.withHandle(entry.handle()));
                 changes.add(ReconcileResult.Change.of(
@@ -468,12 +472,12 @@ public final class KnotraLoader implements AutoCloseable {
             return false;
         }
         return runtime.snapshot().contexts().stream()
-                .filter(context -> context.contextId().equals(runtime.rootContext().contextId()))
+                .filter(context -> context.contextId().equals(runtime.root().contextId()))
                 .findFirst()
                 .map(context -> context.state() == ContextState.DISPOSING
                         || context.state() == ContextState.DISPOSED)
-                .orElseGet(() -> runtime.rootContext().state() == ContextState.DISPOSING
-                        || runtime.rootContext().state() == ContextState.DISPOSED);
+                .orElseGet(() -> runtime.root().state() == ContextState.DISPOSING
+                        || runtime.root().state() == ContextState.DISPOSED);
     }
 
     /** 运行时整体关闭已经接管本次释放时为 true；此时等待其完成而不是重复报错。 */
@@ -482,7 +486,7 @@ public final class KnotraLoader implements AutoCloseable {
         if (baseState != ContextState.DISPOSING && baseState != ContextState.DISPOSED) {
             return false;
         }
-        String rootId = runtime.rootContext().contextId();
+        String rootId = runtime.root().contextId();
         return runtime.snapshot().contexts().stream()
                 .filter(context -> context.contextId().equals(rootId))
                 .findFirst()
@@ -563,13 +567,13 @@ public final class KnotraLoader implements AutoCloseable {
             return new PreparedTree(Map.of());
         }
 
-        Map<FactoryRef, ResolvedComponentDefinition> definitions = new LinkedHashMap<>();
+        Map<FactoryRef, ResolvedFactory> definitions = new LinkedHashMap<>();
         for (PreparedEntry entry : raw.values()) {
             if (definitions.containsKey(entry.ref())) {
                 continue;
             }
             try {
-                Optional<ResolvedComponentDefinition> definition = resolver.resolve(entry.ref());
+                Optional<ResolvedFactory> definition = resolver.resolve(entry.ref());
                 if (definition.isPresent()) {
                     definitions.put(entry.ref(), definition.get());
                 } else {
@@ -591,10 +595,10 @@ public final class KnotraLoader implements AutoCloseable {
 
         Map<String, PreparedEntry> prepared = new LinkedHashMap<>();
         for (PreparedEntry candidate : raw.values()) {
-            ResolvedComponentDefinition definition = definitions.get(candidate.ref());
+            ResolvedFactory definition = definitions.get(candidate.ref());
             Object config;
             try {
-                config = definition.normalizeConfig(candidate.config());
+                config = definition.decodeConfig(candidate.config());
             } catch (Exception error) {
                 diagnostics.add(LoaderDiagnostic.of(
                         LoaderDiagnosticCode.CONFIG_INVALID,
@@ -905,30 +909,32 @@ public final class KnotraLoader implements AutoCloseable {
             Map<String, ContextHandle> created,
             List<LoaderDiagnostic> diagnostics) {
         Map<String, ContextHandle> provisional = new LinkedHashMap<>();
-        MutationResult<Void> result = runtime.mutate(mutation -> {
-            for (String path : missing) {
-                ContextHandle reusable = contexts.get(path);
-                if (reusable != null) {
-                    if (reusable.state() != ContextState.ACTIVE) {
-                        throw new IllegalStateException("managed context is not active: " + path);
+        TransactionReceipt<Void> receipt;
+        try {
+            receipt = runtime.transact(transaction -> {
+                for (String path : missing) {
+                    ContextHandle reusable = contexts.get(path);
+                    if (reusable != null) {
+                        if (reusable.state() != ContextState.ACTIVE) {
+                            throw new IllegalStateException("managed context is not active: " + path);
+                        }
+                        provisional.put(path, reusable);
+                        continue;
                     }
-                    provisional.put(path, reusable);
-                    continue;
+                    ContextHandle parent = parentContext(path, provisional);
+                    ContextHandle child = transaction.childContext(parent, lastSegment(path));
+                    provisional.put(path, child);
+                    created.put(path, child);
                 }
-                ContextHandle parent = parentContext(path, provisional);
-                ContextHandle child = mutation.childContext(parent, lastSegment(path));
-                provisional.put(path, child);
-                created.put(path, child);
-            }
-            return null;
-        });
-        if (!result.committed()) {
+                return null;
+            });
+        } catch (TransactionRejectedException rejection) {
             addCoreDiagnostics(LoaderDiagnosticCode.STRUCTURE_REJECTED, missing.getFirst(), diagnostics,
-                    result.diagnostics());
+                    rejection.diagnostics());
             created.clear();
             return false;
         }
-        if (!await(result.settlement())) {
+        if (!await(receipt.settlement())) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     missing.getFirst(),
@@ -983,7 +989,7 @@ public final class KnotraLoader implements AutoCloseable {
                     runtime, context, entry.path());
             ComponentHandle<?> handle = entry.definition()
                     .mountStrategy()
-                    .mount(mountContext, entry.config())
+                    .mountAsync(mountContext, entry.config())
                     .toCompletableFuture()
                     .get();
             if (handle == null) {
@@ -1016,6 +1022,19 @@ public final class KnotraLoader implements AutoCloseable {
                     entry.path(),
                     diagnostics,
                     error.diagnostics());
+        } catch (ExecutionException error) {
+            if (error.getCause() instanceof ControlledMountException controlled) {
+                addCoreDiagnostics(
+                        LoaderDiagnosticCode.STRUCTURE_REJECTED,
+                        entry.path(),
+                        diagnostics,
+                        controlled.diagnostics());
+            } else {
+                diagnostics.add(LoaderDiagnostic.of(
+                        LoaderDiagnosticCode.STRUCTURE_REJECTED,
+                        entry.path(),
+                        safeError(error)));
+            }
         } catch (Exception error) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
@@ -1109,7 +1128,7 @@ public final class KnotraLoader implements AutoCloseable {
             try {
                 ComponentState state = desiredEntry.definition()
                         .reconfigureStrategy()
-                        .reconfigure(managed.handle(), desiredEntry.config())
+                        .reconfigureAsync(managed.handle(), desiredEntry.config())
                         .toCompletableFuture()
                         .get();
                 changes.add(ReconcileResult.Change.of(
@@ -1160,40 +1179,29 @@ public final class KnotraLoader implements AutoCloseable {
         if (handle.state() == ComponentState.DISPOSED) {
             return true;
         }
-        MutationResult<Void> result = runtime.mutate(mutation -> {
-            mutation.dispose(handle);
-            return null;
-        });
-        if (!result.committed()) {
-            if (runtimeOwnsDisposalNow()
-                    && awaitRuntimeOwnedHandleDisposal(handle)) {
+        try {
+            CompletionStage<ComponentState> cleanup =
+                    handle.state() == ComponentState.FAILED
+                            && handle.goal() == ComponentGoal.DISPOSED
+                    ? handle.retryAsync()
+                    : handle.disposeAsync();
+            ComponentState settled = cleanup.toCompletableFuture().get();
+            if (settled == ComponentState.DISPOSED) {
                 return true;
             }
-            addCoreDiagnostics(LoaderDiagnosticCode.TEARDOWN_FAILED, path, diagnostics,
-                    result.diagnostics());
+            diagnostics.add(LoaderDiagnostic.of(
+                    LoaderDiagnosticCode.TEARDOWN_FAILED,
+                    path,
+                    "component cleanup reached " + settled));
             return false;
-        }
-        try {
-            result.settlement().toCompletableFuture().get();
         } catch (Exception error) {
             if (runtimeOwnsDisposalNow()
                     && awaitRuntimeOwnedHandleDisposal(handle)) {
                 return true;
             }
-            diagnostics.add(LoaderDiagnostic.of(
-                    LoaderDiagnosticCode.TEARDOWN_FAILED,
-                    path,
-                    safeError(error)));
+            addAsyncDiagnostics(LoaderDiagnosticCode.TEARDOWN_FAILED, path, diagnostics, error);
             return false;
         }
-        if (handle.state() != ComponentState.DISPOSED) {
-            diagnostics.add(LoaderDiagnostic.of(
-                    LoaderDiagnosticCode.TEARDOWN_FAILED,
-                    path,
-                    "component cleanup did not reach DISPOSED"));
-            return false;
-        }
-        return true;
     }
 
     /** 释放路径对应的 Context；空路径表示 owned 模式的基础 Context。 */
@@ -1222,23 +1230,15 @@ public final class KnotraLoader implements AutoCloseable {
             publish(latestDiagnostics);
             return true;
         }
-        MutationResult<Void> result = runtime.mutate(mutation -> {
-            mutation.dispose(context);
-            return null;
-        });
-        if (!result.committed()) {
-            if (runtimeOwnsDisposalNow()
-                    && awaitRuntimeOwnedContextDisposal(context)) {
-                prune(path);
-                publish(latestDiagnostics);
-                return true;
-            }
-            addCoreDiagnostics(LoaderDiagnosticCode.TEARDOWN_FAILED, path, diagnostics,
-                    result.diagnostics());
-            return false;
-        }
         try {
-            result.settlement().toCompletableFuture().get();
+            ContextState settled = context.disposeAsync().toCompletableFuture().get();
+            if (settled != ContextState.DISPOSED) {
+                diagnostics.add(LoaderDiagnostic.of(
+                        LoaderDiagnosticCode.TEARDOWN_FAILED,
+                        path,
+                        "context cleanup reached " + settled));
+                return false;
+            }
         } catch (Exception error) {
             if (runtimeOwnsDisposalNow()
                     && awaitRuntimeOwnedContextDisposal(context)) {
@@ -1246,17 +1246,7 @@ public final class KnotraLoader implements AutoCloseable {
                 publish(latestDiagnostics);
                 return true;
             }
-            diagnostics.add(LoaderDiagnostic.of(
-                    LoaderDiagnosticCode.TEARDOWN_FAILED,
-                    path,
-                    safeError(error)));
-            return false;
-        }
-        if (context.state() != ContextState.DISPOSED) {
-            diagnostics.add(LoaderDiagnostic.of(
-                    LoaderDiagnosticCode.TEARDOWN_FAILED,
-                    path,
-                    "context cleanup reached " + context.state()));
+            addAsyncDiagnostics(LoaderDiagnosticCode.TEARDOWN_FAILED, path, diagnostics, error);
             return false;
         }
         prune(path);
@@ -1327,6 +1317,26 @@ public final class KnotraLoader implements AutoCloseable {
         }
     }
 
+    /** 展开 async 包装；Core 事务拒绝保留结构化诊断，其余失败使用根因消息。 */
+    private void addAsyncDiagnostics(
+            LoaderDiagnosticCode fallback,
+            String path,
+            List<LoaderDiagnostic> diagnostics,
+            Throwable error) {
+        Throwable cause = error;
+        while ((cause instanceof java.util.concurrent.CompletionException
+                || cause instanceof ExecutionException) && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        if (cause instanceof TransactionRejectedException rejection) {
+            addCoreDiagnostics(fallback, path, diagnostics, rejection.diagnostics());
+            return;
+        }
+        diagnostics.add(LoaderDiagnostic.of(
+                fallback,
+                path,
+                safeError(cause)));
+    }
     /** 把 Core 事务诊断映射进 Loader 结果；核心未给出诊断时提供兜底文案。 */
     private void addCoreDiagnostics(
             LoaderDiagnosticCode fallback,
@@ -1334,7 +1344,7 @@ public final class KnotraLoader implements AutoCloseable {
             List<LoaderDiagnostic> diagnostics,
             List<RuntimeDiagnostic> values) {
         if (values.isEmpty()) {
-            diagnostics.add(LoaderDiagnostic.of(fallback, path, "runtime mutation was rejected"));
+            diagnostics.add(LoaderDiagnostic.of(fallback, path, "runtime transaction was rejected"));
             return;
         }
         for (RuntimeDiagnostic value : values) {
@@ -1352,15 +1362,16 @@ public final class KnotraLoader implements AutoCloseable {
         return switch (code) {
             case ACTIVATION_FAILED -> LoaderDiagnosticCode.ACTIVATION_FAILED;
             case CLEANUP_FAILED, ROLLBACK_FAILED -> LoaderDiagnosticCode.TEARDOWN_FAILED;
-            case INVALID_CONFIG, MISSING_CAPABILITY, CAPABILITY_SLOT_OCCUPIED,
-                    CAPABILITY_TYPE_CONFLICT, BINDING_CYCLE, NON_CONVERGENT_RECONCILE,
-                    INVALID_LIFECYCLE_OPERATION, INVALID_MOUNT_ID -> LoaderDiagnosticCode.STRUCTURE_REJECTED;
+            case INVALID_CONFIG -> LoaderDiagnosticCode.CONFIG_INVALID;
+            case MISSING_CAPABILITY, CAPABILITY_SLOT_OCCUPIED, CAPABILITY_TYPE_CONFLICT,
+                    BINDING_CYCLE, NON_CONVERGENT_RECONCILE, INVALID_LIFECYCLE_OPERATION,
+                    INVALID_MOUNT_ID -> LoaderDiagnosticCode.STRUCTURE_REJECTED;
         };
     }
 
     /**
      * 深度优先展平声明树：归一化路径、校验重复与越界。相对单段路径拼接在
-     * 父路径之下；null 配置折算为 NoConfig.INSTANCE，交给定义的 schema 归一化。
+     * 父路径之下；rawConfig 原样进入 ResolvedFactory decoder，null 表示无配置声明。
      */
     private void collectEntries(
             List<ComponentEntry> entries,
@@ -1404,7 +1415,7 @@ public final class KnotraLoader implements AutoCloseable {
                     lastSegment(path),
                     entry.factoryRef(),
                     null,
-                    entry.config() == null ? NoConfig.INSTANCE : entry.config()));
+                    entry.rawConfig()));
             collectEntries(entry.children(), path, flattened, diagnostics);
         }
     }
@@ -1478,7 +1489,7 @@ public final class KnotraLoader implements AutoCloseable {
             String path,
             String name,
             FactoryRef ref,
-            ResolvedComponentDefinition definition,
+            ResolvedFactory definition,
             Object config) {
     }
 
@@ -1503,7 +1514,7 @@ public final class KnotraLoader implements AutoCloseable {
             String name,
             ContextHandle context,
             ComponentHandle<?> handle,
-            ResolvedComponentDefinition definition,
+            ResolvedFactory definition,
             Object config) {
     }
 
@@ -1513,7 +1524,7 @@ public final class KnotraLoader implements AutoCloseable {
         private final String name;
         private final ContextHandle context;
         private final ComponentHandle<?> handle;
-        private final ResolvedComponentDefinition definition;
+        private final ResolvedFactory definition;
         private final Object config;
 
         private ManagedEntry(
@@ -1521,7 +1532,7 @@ public final class KnotraLoader implements AutoCloseable {
                 String name,
                 ContextHandle context,
                 ComponentHandle<?> handle,
-                ResolvedComponentDefinition definition,
+                ResolvedFactory definition,
                 Object config) {
             this.path = path;
             this.name = name;
@@ -1547,7 +1558,7 @@ public final class KnotraLoader implements AutoCloseable {
             return handle;
         }
 
-        private ResolvedComponentDefinition definition() {
+        private ResolvedFactory definition() {
             return definition;
         }
 
@@ -1560,7 +1571,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
 
         private ManagedEntry withDefinitionAndConfig(
-                ResolvedComponentDefinition replacementDefinition,
+                ResolvedFactory replacementDefinition,
                 Object replacementConfig) {
             return new ManagedEntry(path, name, context, handle, replacementDefinition,
                     replacementConfig);

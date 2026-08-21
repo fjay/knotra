@@ -181,9 +181,7 @@ import io.knotra.ActivationContext;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ConfigSchema;
 
-import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -200,7 +198,7 @@ public final class RoutePlannerFactory implements ComponentFactory<RouterConfig>
             @Override
             public ComponentDescriptor descriptor() {
                 // 这个组件只发布能力，不消费其他 Capability。
-                return ComponentDescriptor.of("regional-route-planner");
+                return ComponentDescriptor.of();
             }
 
             @Override
@@ -227,22 +225,17 @@ public final class RoutePlannerFactory implements ComponentFactory<RouterConfig>
     }
 
     @Override
-    public Optional<ConfigSchema<RouterConfig>> configSchema() {
-        // mount 和 reconfigure 都会先经过这段归一化，坏配置不会进入 start()。
-        return Optional.of(raw -> {
-            if (!(raw instanceof RouterConfig config)) {
-                throw new IllegalArgumentException("RouterConfig is required");
-            }
-            if (config.endpoint() == null) {
-                throw new IllegalArgumentException("endpoint is required");
-            }
-            if (config.timeout() == null
-                    || config.timeout().isZero()
-                    || config.timeout().isNegative()) {
-                throw new IllegalArgumentException("timeout must be positive");
-            }
-            return config;
-        });
+    public RouterConfig normalizeConfig(RouterConfig config) {
+        // Core mount 和 reconfigure 都先执行 typed normalizer。
+        if (config.endpoint() == null) {
+            throw new IllegalArgumentException("endpoint is required");
+        }
+        if (config.timeout() == null
+                || config.timeout().isZero()
+                || config.timeout().isNegative()) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
+        return config;
     }
 }
 ```
@@ -299,7 +292,7 @@ public final class ParcelDispatcherFactory implements ComponentFactory<NoConfig>
                 RoutePlanner planner = context.require(ROUTE_PLANNER);
                 ParcelInbox inbox = context.require(PARCEL_INBOX);
                 // warehouseId 是站点标识；上海 Context 下的 Dispatcher 只消费上海队列分区。
-                String warehouseId = context.contextInfo().name();
+                String warehouseId = context.info().name();
 
                 // plan 为包裹选择承运商和配送服务；complete 写回结果并确认队列消息。
                 // 回调捕获的是本代 planner，provider 换代后旧回调随旧 Activation 退出。
@@ -309,7 +302,7 @@ public final class ParcelDispatcherFactory implements ComponentFactory<NoConfig>
                                 .thenCompose(delivery::complete));
 
                 // 订阅交给 LifecycleScope 后，provider 替换或插件卸载会等待已接受任务。
-                context.lifecycle().manageAsync(
+                context.lifecycle().onCloseAsync(
                         "parcel-inbox-subscription",
                         subscription::closeAsync);
             }
@@ -340,9 +333,9 @@ record Topology(
 try (ParcelInbox inbox = openDurableInbox();
      KnotraRuntime runtime = KnotraRuntime.create()) {
 
-    // mutate 内的所有 provide/context/mount 是一组 intents；任一校验失败都整体拒绝。
-    MutationResult<Topology> created = runtime.mutate(tx -> {
-        ContextHandle root = runtime.rootContext();
+    // transact 内的所有 provide/context/mount 是一组 intents；任一校验失败都会抛出并整体拒绝。
+    TransactionReceipt<Topology> created = runtime.transact(tx -> {
+        ContextHandle root = runtime.root();
         // 站点 Context 只划分“这个站点能看到哪些规则”，不创建线程池或 ClassLoader。
         ContextHandle shanghai = tx.childContext(root, "warehouse-shanghai");
         ContextHandle shenzhen = tx.childContext(root, "warehouse-shenzhen");
@@ -369,14 +362,12 @@ try (ParcelInbox inbox = openDurableInbox();
         ComponentHandle<NoConfig> shanghaiDispatcher = tx.mount(
                 shanghai,
                 "parcel-dispatcher",
-                new ParcelDispatcherFactory(),
-                NoConfig.INSTANCE);
+                new ParcelDispatcherFactory());
 
         ComponentHandle<NoConfig> shenzhenDispatcher = tx.mount(
                 shenzhen,
                 "parcel-dispatcher",
-                new ParcelDispatcherFactory(),
-                NoConfig.INSTANCE);
+                new ParcelDispatcherFactory());
 
         return new Topology(
                 shanghai,
@@ -387,10 +378,7 @@ try (ParcelInbox inbox = openDurableInbox();
                 shenzhenDispatcher);
     });
 
-    // committed 只说明结构事务发布；组件启动是异步的。
-    if (!created.committed()) {
-        throw new IllegalStateException(created.diagnostics().toString());
-    }
+    // transact 已返回说明结构提交成功；拒绝会直接抛 TransactionRejectedException。
 
     Topology topology = created.value();
     ComponentHandle<?>[] handles = {
@@ -415,7 +403,7 @@ try (ParcelInbox inbox = openDurableInbox();
 }
 ```
 
-`created.committed()` 表示 Context、注册意图和挂载结构已经作为同一 Runtime generation 发布，不表示所有组件已经 ACTIVE。组件启动在协调锁外异步执行，因此还要等待目标 handle 的 `whenSettled()` 并检查返回状态。
+`TransactionReceipt` 表示 Context、registration 与 mount 已作为同一 generation 发布；组件启动仍在协调锁外异步执行，因此还要等待目标 handle 的 `whenSettled()` 并检查状态。事务拒绝直接抛出 `TransactionRejectedException`，不会返回可忽略的失败 receipt。
 
 提供方与消费方可以在同一宿主事务中挂载。消费方在所需能力发布前保持 WAITING，随后由 Runtime 调度；上海本地能力成功发布后遮蔽默认能力，深圳消费方继续绑定 Root 中的默认实现。
 
@@ -425,15 +413,12 @@ try (ParcelInbox inbox = openDurableInbox();
 
 ```java
 // reconfigure 保留同一个 ComponentHandle，只创建新的配置代际和 Activation。
-MutationResult<ComponentHandle<RouterConfig>> update = runtime.mutate(tx ->
+TransactionReceipt<ComponentHandle<RouterConfig>> update = runtime.transact(tx ->
         tx.reconfigure(
                 topology.shanghaiRouter(),
                 shanghaiRouterConfigV2()));
 
-// 事务被拒绝时，新配置不会部分生效。
-if (!update.committed()) {
-    throw new IllegalStateException(update.diagnostics().toString());
-}
+// transact 被拒绝会抛出，旧配置保持不变。
 
 // 等待旧资源释放、新配置启动完成；返回值就是结算后的组件状态。
 ComponentState state = topology.shanghaiRouter()
@@ -495,10 +480,10 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
 
     // loadArtifact 只启动 PF4J 插件并登记工厂目录；它不会挂载业务组件。
     ArtifactSnapshot artifactV1 = adapter.loadArtifact(
-            Path.of("plugins/regional-router-v1.jar")).join();
+            Path.of("plugins/regional-router-v1.jar"));
 
     // typed resolve 必须携带精确 RouterConfig Class；token 不匹配会立即失败。
-    ArtifactFactoryHandle<RouterConfig> factoryV1 = adapter.resolver()
+    ArtifactFactoryHandle<RouterConfig> factoryV1 = adapter.factories()
             .resolve("regional-route-planner", RouterConfig.class)
             .orElseThrow();
 
@@ -517,7 +502,7 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
     }
 
     // unload 是 drain：等待 in-flight mount，先释放依赖方和 owned mount，再停 PF4J 插件。
-    adapter.unloadArtifact(artifactV1.artifactId()).join();
+    adapter.unloadArtifact(artifactV1.artifactId());
 
     // 本地路由消失后，上海 Dispatcher 应重新激活并绑定 Root 默认路由。
     ComponentState fallbackState = topology.shanghaiDispatcher()
@@ -530,16 +515,16 @@ try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
                     fallbackSnapshot,
                     topology.shanghaiDispatcher().handleId(),
                     ROUTE_PLANNER.name(),
-                    runtime.rootContext().contextId())) {
+                    runtime.root().contextId())) {
         throw new IllegalStateException(
                 "Shanghai dispatcher did not bind the root planner");
     }
 
     // v1 卸载后其 factoryId 目录条目已释放，v2 可以导出同名 factoryId。
     ArtifactSnapshot artifactV2 = adapter.loadArtifact(
-            Path.of("plugins/regional-router-v2.jar")).join();
+            Path.of("plugins/regional-router-v2.jar"));
 
-    ArtifactFactoryHandle<RouterConfig> factoryV2 = adapter.resolver()
+    ArtifactFactoryHandle<RouterConfig> factoryV2 = adapter.factories()
             .resolve("regional-route-planner", RouterConfig.class)
             .orElseThrow();
 
@@ -643,13 +628,13 @@ Knotra 保证的是组件代际、依赖顺序和资源清理。持续进件依�
 
 ```java
 // serial listener 返回 future；前一个 stage 完成后，EventBus 才调用下一个 listener。
-EventSubscription subscription = bus.onSerial(ROUTE_FINISHED, event ->
+EventSubscription subscription = bus.subscribe(ROUTE_FINISHED, event ->
         metrics.record(event).thenApply(ignored -> true));
 
 // 订阅关闭会等待关闭请求前已接受的 dispatch；组件换代不会留下孤儿回调。
 context.lifecycle().manageAsync(
         "route-finished-listener",
-        subscription::closeAsync);
+        subscription);
 ```
 
 这段登记让 provider 替换或 artifact 卸载等待已接受的监听回调完成。EventBus 没有持久化语义；分拣任务入口仍应使用消息队列，不能用进程内事件总线推导“升级期间任务不会丢失”。
@@ -660,13 +645,13 @@ context.lifecycle().manageAsync(
 
 | 失败位置 | 可观察状态 | 恢复动作 |
 |---|---|---|
-| 组件 `start()` 抛错 | handle 进入 `FAILED`，暂存能力不发布，已登记资源执行回滚 | 修复外部条件后调用 `ComponentHandle.retry()` |
-| Activation 清理器抛错 | handle 保留失败 Activation；已成功清理项不会重放 | 修复资源后调用 `retry()`，只重试失败 entry |
+| 组件 `start()` 抛错 | handle 进入 `FAILED`，暂存能力不发布，已登记资源执行回滚 | 修复外部条件后调用 `ComponentHandle.retryAsync()` |
+| Activation 清理器抛错 | handle 保留失败 Activation；已成功清理项不会重放 | 修复资源后调用 `retryAsync()`，只重试失败 entry |
 | PF4J stop、unload 或 owned mount 清理失败 | artifact 进入 `DRAIN_FAILED`，ownership 与诊断保留 | 读取 `adapter.artifact(id)` 和 `adapter.diagnostic(id)`，修复后调用 `retryDrain(id)` |
 | REQUIRED capability 缺失 | 消费方保持 `WAITING`，goal 仍为 RUNNING | 发布可见 provider，Runtime 会重新调度 |
 | Loader 批量装配失败 | 本批新增项回滚，结果携带路径级诊断 | 修正完整期望树后再次 `reconcile`；FAILED 条目使用 `loader.retry(path)` |
 
-`MutationResult.committed()`、`ArtifactState.UNLOADED`、`ComponentState.ACTIVE` 分别描述结构事务、artifact 和组件三层状态，不能互相替代。运行时诊断从 `runtime.snapshot()` 读取；artifact 状态从 `adapter.artifact(id)` 读取，操作诊断通过 `adapter.diagnostic(id)` 查询。`RuntimeSnapshot` 与 `ArtifactSnapshot` 只含稳定数据，不会因为监控代码长期保存快照而钉住插件 `ClassLoader`。
+`TransactionReceipt` 只表示结构事务已经提交；`ArtifactState.UNLOADED` 与 `ComponentState.ACTIVE` 分别描述 artifact 和组件层状态，三者不能互相替代。事务拒绝通过 `TransactionRejectedException` 表达。运行时诊断从 `runtime.snapshot()` 读取；artifact 状态和诊断从 adapter 查询。Snapshot 只含稳定数据，不会钉住插件 `ClassLoader`。
 
 ## 和常见组合相比，Knotra 多管了什么
 

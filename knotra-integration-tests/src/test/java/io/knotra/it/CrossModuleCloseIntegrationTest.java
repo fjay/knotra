@@ -15,7 +15,7 @@ import io.knotra.NoConfig;
 import io.knotra.events.EventBusFactory;
 import io.knotra.loader.ComponentEntry;
 import io.knotra.loader.ComponentTree;
-import io.knotra.loader.CompositeComponentFactoryResolver;
+import io.knotra.pf4j.loader.Pf4jFactoryResolver;
 import io.knotra.loader.FactoryRef;
 import io.knotra.loader.KnotraLoader;
 import io.knotra.loader.ReconcileResult;
@@ -48,10 +48,7 @@ final class CrossModuleCloseIntegrationTest {
     }
 
     private ComponentHandle<NoConfig> mountBus() {
-        var result = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "bus", new EventBusFactory(), NoConfig.INSTANCE));
-        assertTrue(result.committed(), () -> result.diagnostics().toString());
-        return result.value();
+        return runtime.mount("bus", new EventBusFactory());
     }
 
     @Test
@@ -59,23 +56,22 @@ final class CrossModuleCloseIntegrationTest {
             @TempDir Path pluginsRoot) throws Exception {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            adapter.resolver().resolve("integration-greeting", String.class).orElseThrow()
-                    .mount(runtime.rootContext(), "greeting", "hello");
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            adapter.factories().resolve("integration-greeting", String.class).orElseThrow()
+                    .mount(runtime.root(), "greeting", "hello");
             KnotraLoader loader = KnotraLoader.over(
                     runtime,
-                    runtime.rootContext(),
-                    CompositeComponentFactoryResolver.of(ref ->
-                            IntegrationTestKit.bridge(adapter).apply(ref)));
+                    runtime.root(),
+                    Pf4jFactoryResolver.of(adapter));
             ComponentHandle<NoConfig> bus = mountBus();
             ReconcileResult reconcile = loader.reconcile(ComponentTree.of(
-                    ComponentEntry.of("greeting", GREETING, "loader")));
+                    ComponentEntry.configured("greeting", GREETING, "loader")));
             assertTrue(reconcile.converged(), () -> reconcile.diagnostics().toString());
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(bus));
 
             try (ExecutorService executor = Executors.newFixedThreadPool(3)) {
                 CompletableFuture<Void> adapterClose = CompletableFuture.runAsync(
-                        () -> adapter.closeAsync().join(), executor);
+                        () -> adapter.closeAsync().toCompletableFuture().join(), executor);
                 CompletableFuture<Void> loaderClose = CompletableFuture.runAsync(
                         () -> loader.closeAsync().toCompletableFuture().join(), executor);
                 CompletableFuture<Void> runtimeClose = CompletableFuture.runAsync(
@@ -100,16 +96,15 @@ final class CrossModuleCloseIntegrationTest {
             @TempDir Path pluginsRoot) throws Exception {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            adapter.resolver().resolve("integration-greeting", String.class).orElseThrow()
-                    .mount(runtime.rootContext(), "greeting", "hello");
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            adapter.factories().resolve("integration-greeting", String.class).orElseThrow()
+                    .mount(runtime.root(), "greeting", "hello");
             KnotraLoader loader = KnotraLoader.over(
                     runtime,
-                    runtime.rootContext(),
-                    CompositeComponentFactoryResolver.of(ref ->
-                            IntegrationTestKit.bridge(adapter).apply(ref)));
+                    runtime.root(),
+                    Pf4jFactoryResolver.of(adapter));
             ReconcileResult reconcile = loader.reconcile(ComponentTree.of(
-                    ComponentEntry.of("greeting", GREETING, "loader")));
+                    ComponentEntry.configured("greeting", GREETING, "loader")));
             assertTrue(reconcile.converged(), () -> reconcile.diagnostics().toString());
 
             runtime.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
@@ -131,14 +126,14 @@ final class CrossModuleCloseIntegrationTest {
             throws Exception {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            ComponentHandle<NoConfig> handle = adapter.resolver()
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            ComponentHandle<NoConfig> handle = adapter.factories()
                     .resolve("integration-failing-cleanup", NoConfig.class).orElseThrow()
-                    .mount(runtime.rootContext(), "failing", NoConfig.INSTANCE);
+                    .mount(runtime.root(), "failing", NoConfig.INSTANCE);
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(handle));
 
             IntegrationCoordinator.failNextCleanup();
-            CompletableFuture<Void> firstClose = adapter.closeAsync();
+            CompletableFuture<Void> firstClose = adapter.closeAsync().toCompletableFuture();
             assertThrows(CompletionException.class, firstClose::join);
             assertEquals(ArtifactState.DRAIN_FAILED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
@@ -146,7 +141,7 @@ final class CrossModuleCloseIntegrationTest {
             assertFalse(adapter.ownership(IntegrationTestKit.ARTIFACT_ID).isEmpty());
 
             IntegrationCoordinator.allowCleanup();
-            adapter.closeAsync().join();
+            adapter.closeAsync().toCompletableFuture().join();
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
             assertEquals(ComponentState.DISPOSED, handle.state());

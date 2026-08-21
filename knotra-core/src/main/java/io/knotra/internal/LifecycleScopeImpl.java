@@ -1,5 +1,6 @@
 package io.knotra.internal;
 
+import io.knotra.AsyncCloseable;
 import io.knotra.AsyncDisposer;
 import io.knotra.CleanupState;
 import io.knotra.LifecycleScope;
@@ -11,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -23,7 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>每个 {@link ActivationRuntime} 持有一个根作用域，子作用域和受管条目作为树中的
  * {@link Node} 记录。所有节点使用同一个全局序列，释放时按序列倒序执行，形成跨嵌套层的 LIFO 顺序；
  * 显式 parallelChild 只并行其直接条目，不把并行性扩展到后续兄弟节点。释放是异步聚合的，失败条目
- * 保持 {@code FAILED} 并保留释放器，供 ComponentHandle.retry() 只重试失败部分。</p>
+ * 保持 {@code FAILED} 并保留释放器，供 ComponentHandle.retryAsync() 只重试失败部分。</p>
  *
  * <p>锁约定：新增子节点时先锁父再锁子，保证父状态检查与树插入有序；释放器本身在作用域锁外执行。
  * {@link DefaultKnotraRuntime} 先完成依赖方清理，再触发提供方 {@code teardown()}。</p>
@@ -84,9 +86,16 @@ final class LifecycleScopeImpl implements LifecycleScope {
     }
 
     @Override
-    public ManagedHandle manageAsync(String description, AsyncDisposer disposer) {
+    public ManagedHandle onCloseAsync(String description, AsyncDisposer disposer) {
         Objects.requireNonNull(disposer, "disposer");
         return manage(description, null, null, disposer, true);
+    }
+
+    @Override
+    public <T extends AsyncCloseable> T manageAsync(String description, T resource) {
+        Objects.requireNonNull(resource, "resource");
+        manage(description, null, resource, resource::closeAsync, true);
+        return resource;
     }
 
     @Override
@@ -100,8 +109,8 @@ final class LifecycleScopeImpl implements LifecycleScope {
     }
 
     @Override
-    public LifecycleScope parent() {
-        return parent;
+    public Optional<LifecycleScope> parent() {
+        return Optional.ofNullable(parent);
     }
 
     @Override
@@ -258,7 +267,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
         CompletableFuture<Void> result;
         try {
             if (entry.asynchronous()) {
-                CompletionStage<Void> stage = entry.async().dispose();
+                CompletionStage<Void> stage = entry.async().disposeAsync();
                 result = stage == null
                         ? CompletableFuture.completedFuture(null)
                         : stage.toCompletableFuture();
@@ -459,7 +468,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
     private record ScopeNode(LifecycleScopeImpl scope, long sequence) implements Node {
     }
 
-    // 单个受管条目；释放器字段只在成功后清空，失败时保留用于 ComponentHandle.retry()。
+    // 单个受管条目；释放器字段只在成功后清空，失败时保留用于 ComponentHandle.retryAsync()。
     private static final class Entry implements Node {
         private final String id;
         private final String description;

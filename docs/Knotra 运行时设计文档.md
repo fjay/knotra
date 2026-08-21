@@ -4,7 +4,7 @@ Knotra 是一个面向 JVM 21 的动态组合运行时，解决的是“应用�
 
 这个问题不能只靠 Service Locator、`start()/stop()`、EventBus 或 PluginManager 的组合解决。普通查找只能回答“当前能否找到一个对象”，无法回答“这个组件绑定的是哪一次 provider 注册”、“provider 替换后哪些直接和间接依赖必须先退出”、“旧运行尚未清理完时能否启动下一代”、“cleanup 失败后还能不能安全重试”。Knotra 把这些关系作为运行时的一等结构管理：Context 决定可见性，Capability 表示类型化依赖，ComponentHandle 表示稳定逻辑挂载，Activation 表示一次可验证和可撤销的运行，LifecycleScope 表示资源所有权。
 
-当前仓库已经是按该模型实现的六模块 Maven 工程，版本为 `io.knotra:knotra-parent:0.1.0-SNAPSHOT`。Core、Events、PF4J adapter、Loader 和跨模块集成测试均可构建与运行；本文描述的是当前源码中的实际行为，而不是最初设想或后续演进计划。
+当前仓库已经是按该模型实现的七模块 Maven 工程，版本为 `io.knotra:knotra-parent:0.1.0-SNAPSHOT`。Core、Events、PF4J adapter、Loader、官方 PF4J Loader bridge 和跨模块集成测试均可构建与运行；本文描述的是当前源码中的实际行为。
 
 Cordis 的动态组合思想是 Knotra 的设计来源之一，尤其是能力注册身份、组件运行代际和可逆生命周期这些概念。Knotra 不实现 Cordis API，不承诺 Cordis 兼容，也没有旧模型迁移层；它使用独立的 `io.knotra` 契约和语义。旧 Cordis 设计只作为思想来源保留。Cordis 不是使用 Knotra 的前置知识：读者不需要了解它，本文其余内容也不依赖它。
 
@@ -17,7 +17,7 @@ Knotra 的核心取舍是把结构变化做成显式事务，把用户启动代�
 - 不做分布式协调、跨进程一致性或多 JVM 热替换。
 - 不承诺回收被宿主或业务代码继续引用的插件对象和 ClassLoader。
 - Loader 不监听文件系统；期望状态由调用方显式提交。
-- 配置没有全局文件格式；每个 factory 通过 `ConfigSchema` 归一化自己的配置。
+- 配置没有全局文件格式；Core factory 归一化类型化配置，Loader/PF4J 通过 `ConfigDecoder` 解释 raw 配置。
 - 不提供 Cordis 兼容 API 或旧版本共存迁移。
 
 ## 整体设计
@@ -31,9 +31,10 @@ Knotra 的 Maven reactor 要求 Java 21 和 Maven 3.9 以上，模块如下：
 | `knotra-pf4j-spi` | 插件实现的共享 SPI 与显式配置 token | Core；PF4J `3.13.0` 为 `provided` |
 | `knotra-pf4j` | PF4J artifact 加载、typed factory mount、drain、ownership、ClassLoader guard | Core、SPI、PF4J `3.13.0`、ASM `9.7` |
 | `knotra-loader` | 声明树 reconciliation、稳定路径、配置更新、工厂替换、rollback | 只依赖 Core；禁止 PF4J 和 adapter |
+| `knotra-pf4j-loader` | PF4J catalog 到 Loader resolver 的官方桥接 | 只依赖 Loader 与 PF4J adapter |
 | `knotra-integration-tests` | 真实 fixture JAR 与跨模块生命周期验收 | 仅 test scope，不 install、不 deploy |
 
-`knotra-core` 的主要入口是 `KnotraRuntime.create(KnotraConfig)`。宿主通过 `runtime.mutate(...)` 做结构写操作，通过 `runtime.context()`、`runtime.snapshot()` 和各 Handle 做只读观察与生命周期请求。Core 内部由 `DefaultKnotraRuntime` 协调一个不可变 `RuntimeView`，核心实现位于 `knotra-core/src/main/java/io/knotra/internal/DefaultKnotraRuntime.java`。
+`knotra-core` 的主要入口是 `KnotraRuntime.create(KnotraConfig)`。宿主通过 `runtime.transact(...)` 做结构写操作，通过 `runtime.root().view()`、`runtime.snapshot()` 和各 Handle 做只读观察与生命周期请求。Core 内部由 `DefaultKnotraRuntime` 协调一个不可变 `RuntimeView`，核心实现位于 `knotra-core/src/main/java/io/knotra/internal/DefaultKnotraRuntime.java`。
 
 整体链路是：
 
@@ -70,11 +71,11 @@ child context
 
 同一 Context 的同名同类型 capability slot 只有一个当前 registration；child registration 会 shadow parent。child 注册撤销后，解析会重新暴露 parent registration，并使相关 BindingSet 变化。这个变化不是值比较，而是 registration identity 比较。
 
-Registration 由 `registrationId` 唯一标识。宿主通过 `RuntimeMutation.provide(...)` 发布，Activation 通过 `ActivationContext.provide(...)` staged 发布。新旧 provider 的 value 即使 `equals()` 相同，甚至都是同一个 Java 对象，只要 registration id 不同，绑定身份就不同，依赖该 slot 的 Activation 必须重新生成。因此“用等值对象替换 provider”不会被误判为没有变化。
+Registration 由 `registrationId` 唯一标识。宿主通过 `RuntimeTransaction.provide(...)` 发布，Activation 通过 `ActivationContext.provide(...)` staged 发布。新旧 provider 的 value 即使 `equals()` 相同，甚至都是同一个 Java 对象，只要 registration id 不同，绑定身份就不同，依赖该 slot 的 Activation 必须重新生成。因此“用等值对象替换 provider”不会被误判为没有变化。
 
 只读读取有两个不同边界：
 
-- `RuntimeContext.require/find` 是宿主读取接口，可以查询当前 Context 父链上任意 visible capability；它没有 Component descriptor，不会建立 Binding，也不会影响生命周期。
+- `ContextView.require/find` 是宿主读取接口，可以查询当前 Context 父链上任意 visible capability；它没有 Component descriptor，不会建立 Binding，也不会影响生命周期。
 - `ActivationContext.require/find` 只能访问 descriptor 声明过的 key；未声明 key 是组件契约错误，不会隐式建立依赖。
 
 两个接口都按 exact key 命中；同名不同 `Class` 会在结构校验阶段被拒绝，不会退化为按类名匹配。
@@ -100,7 +101,7 @@ public interface Component<C> {
 - `handleId`：稳定 ComponentHandle 标识，配置重启和绑定重绑不改变。
 - `activationId`：一次实际运行标识，每次 start/reconfigure/rebind 都是新 Activation。
 
-`ComponentHandle<C>` 暴露 `state()`、`goal()`、`configRevision()`、`whenSettled()`、`reconfigure()`、`retry()` 和 `dispose()`。Handle 是稳定挂载，不是当前组件实例；当前执行保存在 Activation 和 LifecycleScope 中，settle 后会释放可执行引用。
+`ComponentHandle<C>` 暴露 `state()`、`goal()`、`configRevision()`、`whenSettled()`、`reconfigureAsync()`、`retryAsync()` 和 `disposeAsync()`。Handle 是稳定挂载，不是当前组件实例；当前执行保存在 Activation 和 LifecycleScope 中，settle 后会释放可执行引用。
 
 组件状态是：
 
@@ -109,11 +110,11 @@ WAITING -> STARTING -> ACTIVE -> STOPPING -> DISPOSED
                          \-> FAILED
 ```
 
-`ComponentGoal` 只有 `RUNNING` 和 `DISPOSED`。`WAITING` 表示 goal 仍是 RUNNING 但 required binding 缺失；`FAILED` 可能来自用户 start 失败后的残留清理失败，也可能是启动失败已完全 rollback；`DISPOSED` 表示逻辑挂载已移除。FAILED 不会自动猜测应否重启，调用方需要显式 `retry()`，或者等待新的配置/绑定 fingerprint 改变后由 reconcile 继续处理。
+`ComponentGoal` 只有 `RUNNING` 和 `DISPOSED`。`WAITING` 表示 goal 仍是 RUNNING 但 required binding 缺失；`FAILED` 可能来自用户 start 失败后的残留清理失败，也可能是启动失败已完全 rollback；`DISPOSED` 表示逻辑挂载已移除。FAILED 不会自动猜测应否重启，调用方需要显式 `retryAsync()`，或者等待新的配置/绑定 fingerprint 改变后由 reconcile 继续处理。
 
 ### 宿主结构事务
 
-宿主不能拿到长期可写的 Runtime mutation 对象。每次 `runtime.mutate(action)` 创建一次性 `RuntimeMutation`，可用操作包括：
+宿主不能拿到长期可写的 Runtime mutation 对象。每次 `runtime.transact(action)` 创建一次性 `RuntimeTransaction`，可用操作包括：
 
 ```java
 RegistrationHandle provide(ContextHandle, CapabilityKey<T>, T);
@@ -128,7 +129,7 @@ void dispose(ComponentHandle<?> handle);
 void dispose(ContextHandle context);
 ```
 
-事务流程是：先在协调锁外执行宿主 callback，callback 中的操作被记录为 intents 并能拿到 provisional handle；随后进入 coordinator，把全部 intents 应用到一个 `RuntimeView.Draft`。任何 intent 违反 context 状态、mountId、canonical path、capability exact type 或其他结构约束时，整个 mutation 返回 `MutationResult.rejected(diagnostics)`，不会发布旧 draft。全部 intents 通过后才调用一次 `draft.publishOnce()`，将不可变 `RuntimeView` 的 generation 加一并替换 volatile view。
+事务流程是：先在协调锁外执行宿主 callback，callback 中的操作被记录为 intents 并能拿到 provisional handle；随后进入 coordinator，把全部 intents 应用到一个 `RuntimeView.Draft`。任何 intent 违反 context 状态、mountId、canonical path、capability exact type 或其他结构约束时，事务抛出携带 `RuntimeDiagnostic` 的 `TransactionRejectedException`，不会发布 draft。全部 intents 通过后才调用一次 `draft.publishOnce()`，将 generation 加一并返回 `TransactionReceipt`。
 
 这意味着：
 
@@ -136,12 +137,12 @@ void dispose(ContextHandle context);
 - callback 可以使用同事务返回的 provisional registration/context handle 再撤销或继续构建结构。
 - callback 抛出运行异常时，mutation 拒绝，不会出现前几个 intent 已发布的结果。
 - 没有 view 变化的事务成功返回当前 generation，不制造空代际。
-- mutation committed 返回时，新 `RuntimeView` 已经发布并提交 side plan；`settlement()` 只等待本次 mutation 直接触发的 component/context transitions settle，不表示 runtime 全局 quiescence，也不覆盖之后独立 transition 或普通异步业务资源。特定 Handle 的终态应等待 `whenSettled()`。
+- `transact` 返回 receipt 时，新 `RuntimeView` 已发布并提交 side plan；`receipt.settlement()` 只等待本事务直接触发的 component/context transitions，不表示 Runtime 全局 quiescence。特定 Handle 的终态应等待 `whenSettled()`。
 - Runtime 进入 closing 后新的结构 mutation 被拒绝。
 
 `publishOnce()` 后才提交 executable side plan，例如调度 dirty component、登记 context disposal future、执行自动重启 reservation。这个顺序保证可执行代码看到的都是已发布 generation，不会基于一个可能被后续 intent 拒绝的 draft 运行用户逻辑。
 
-`ContextHandle.dispose()` 与 `runtime.closeAsync()` 是公开 lifecycle request，而不是要求调用方再包一层 host structural transaction；它们内部同样构造 draft、发布 generation 并返回 settlement。宿主仍可在显式 structural transaction 中表达结构性 dispose intent。
+`ContextHandle.disposeAsync()` 与 `runtime.closeAsync()` 是公开 lifecycle request，而不是要求调用方再包一层 host structural transaction；它们内部同样构造 draft、发布 generation 并返回 settlement。宿主仍可在显式 structural transaction 中表达结构性 dispose intent。
 
 ### Activation 事务与乐观校验
 
@@ -170,7 +171,7 @@ STARTING reservation 对 Snapshot 可见，但它的 staged registration 不进�
 9. 以当前 committed graph 加本次及其他 STARTING 的 tentative registration 构造依赖图，Tarjan 检查 SCC；发现环则拒绝本次提交并抑制自动重试。
 10. 以上结构校验都通过后，才把用户 `start()` 抛出的异常视为业务启动失败。
 
-如果变化只是 stale，例如 start 期间 provider/context/config/goal 改变，本次 Activation 先 rollback 自己的 LifecycleScope 和 staged child，不记录为组件业务失败；随后按最新 generation 重新 reconcile。业务 start 异常则 rollback 已登记资源与 staged registration，Handle 进入 FAILED，可通过 `retry()` 显式重试。
+如果变化只是 stale，例如 start 期间 provider/context/config/goal 改变，本次 Activation 先 rollback 自己的 LifecycleScope 和 staged child，不记录为组件业务失败；随后按最新 generation 重新 reconcile。业务 start 异常则 rollback 已登记资源与 staged registration，Handle 进入 FAILED，可通过 `retryAsync()` 显式重试。
 
 成功提交在同一个 `publishOnce()` 中完成：
 
@@ -195,9 +196,9 @@ stateDiagram-v2
     STOPPING --> DISPOSED: 清理成功 (Goal=DISPOSED)
     STOPPING --> FAILED: 资源清理失败 (现场隔离可重试)
     
-    FAILED --> WAITING: retry() 清理成功
-    FAILED --> STARTING: retry() 重新发起启动
-    FAILED --> DISPOSED: 显式 dispose()
+    FAILED --> WAITING: retryAsync() 清理成功
+    FAILED --> STARTING: retryAsync() 重新发起启动
+    FAILED --> DISPOSED: 显式 disposeAsync()
     
     DISPOSED --> [*]
 ```
@@ -223,7 +224,7 @@ sequenceDiagram
     participant Provider as 提供方 (Provider)
 
     Note over Consumer,Provider: 初始状态：Consumer 绑定 Provider(v1)，均为 ACTIVE
-    Host->>Core: runtime.mutate(revoke(v1), provide(v2))
+    Host->>Core: runtime.transact(revoke(v1), provide(v2))
     activate Core
     Core->>Core: 计算受影响闭包：Consumer 依赖旧 v1
     Core->>Consumer: 标记为 STOPPING，触发优雅收尾
@@ -259,12 +260,13 @@ Activation 内通过 `mountChild(...)` 创建的是 provisional handle。父提�
 ```java
 <T extends AutoCloseable> T manage(String description, T resource);
 ManagedHandle onClose(String description, Runnable disposer);
-ManagedHandle manageAsync(String description, AsyncDisposer disposer);
+ManagedHandle onCloseAsync(String description, AsyncDisposer disposer);
+<T extends AsyncCloseable> T manageAsync(String description, T resource);
 LifecycleScope child(String description);
 LifecycleScope parallelChild(String description);
 ```
 
-`manage(AutoCloseable)` 返回原资源，便于赋值和链式创建；`onClose` 适合 lambda 或没有 AutoCloseable 形态的对象；`manageAsync` 接受返回 `CompletionStage<Void>` 的 disposer。scope 可以嵌套。默认 scope 是确定性 LIFO：同一 boundary 的直接 node 按登记倒序清理，child scope 作为 parent 的一个 node，在被到达时递归清理。只有 `parallelChild` 显式声明并行时，该 boundary 的直接 nodes 才并行清理；并行边界内部每个 child scope 的语义仍由该 child 自己声明。
+`manage(AutoCloseable)` 返回原资源；`onClose` 登记同步动作，`onCloseAsync` 登记返回 stage 的异步动作，`manageAsync` 直接托管 `AsyncCloseable` 资源。Scope 默认确定性 LIFO；只有 `parallelChild` 的直属节点并行清理。
 
 cleanup 是异步的：
 
@@ -275,7 +277,7 @@ cleanup 是异步的：
 - 已 SUCCEEDED 的 entry 在 retry 中跳过，只有 FAILED entry 会重新调用 disposer。
 - scope 汇总为 `OPEN/STOPPING/FAILED/SUCCEEDED`。
 
-Activation cleanup 全部成功后，如果 goal 是 DISPOSED，则移除 Handle；如果 goal 是 RUNNING，则按最新结构进入 WAITING 并可能自动 reconcile。cleanup 有失败时 Handle 停在 FAILED，保留失败 Activation 和失败 entry，`ComponentHandle.retry()` 重新排队，只重试未成功清理项；清理成功后才会按当前 goal 和配置启动新 Activation。因此 cleanup retry 不会重启业务实例，也不会重复关闭已成功资源。
+Activation cleanup 全部成功后，如果 goal 是 DISPOSED，则移除 Handle；如果 goal 是 RUNNING，则按最新结构进入 WAITING 并可能自动 reconcile。cleanup 有失败时 Handle 停在 FAILED，保留失败 Activation 和失败 entry，`ComponentHandle.retryAsync()` 重新排队，只重试未成功清理项；清理成功后才会按当前 goal 和配置启动新 Activation。因此 cleanup retry 不会重启业务实例，也不会重复关闭已成功资源。
 
 ### SCC 与有界 reconcile
 
@@ -295,13 +297,13 @@ Core 使用当前 STARTING/ACTIVE Activation 的 BindingSet 构造“consumer ->
 - Lifecycle scope 树、managed entry 的 cleanup state、attempts 和 bounded error text。
 - 稳定 enum 诊断码。
 
-诊断码在 `DiagnosticCode` 中固定，包括 missing capability、slot occupied、type conflict、binding cycle、activation failed、rollback failed、cleanup failed、non-convergent reconcile、invalid lifecycle operation、invalid mount id 和 invalid config。其中 `INVALID_CONFIG` 目前是保留码；当前 schema 抛错、返回 null 或返回错误类型通常在 mutation 边界表现为 `INVALID_LIFECYCLE_OPERATION`。Schema 的契约是返回非空且类型正确的配置对象。Snapshot 与诊断不包含 live component、factory、disposer、Throwable 对象、`Class` 或 ClassLoader；错误只保留有界稳定文本。持有 Snapshot 不会阻止插件 ClassLoader 回收。
+诊断码在 `DiagnosticCode` 中固定，包括 missing capability、slot occupied、type conflict、binding cycle、activation failed、rollback failed、cleanup failed、non-convergent reconcile、invalid lifecycle operation、invalid mount id 和 invalid config。Factory typed normalizer 抛错或返回 null 时使用 `INVALID_CONFIG`；Loader 会稳定映射为 `CONFIG_INVALID`。Snapshot 与诊断不包含 live component、factory、disposer、Throwable、`Class` 或 ClassLoader。
 
 ## Events
 
-`knotra-events` 不把事件调度写成内核能力。`EventBusFactory` mount 一个 `EventBusComponent`，该组件创建 `DefaultEventBus`，把 bus 自己交给 `LifecycleScope.manageAsync(..., bus::closeAsync)` 托管，并发布 `CapabilityKey<EventBus>("knotra.event-bus", EventBus.class)`。消费者像依赖其他 capability 一样 require EventBus，订阅也必须由消费者 lifecycle 托管。
+`knotra-events` 不把事件调度写成内核能力。`EventBusFactory` mount 一个 `EventBusComponent`，该组件创建 `DefaultEventBus`，把 bus 作为 `AsyncCloseable` 交给 `LifecycleScope.manageAsync` 托管，并发布 `EventCapabilities.EVENT_BUS`。消费者像依赖其他 capability 一样 require EventBus，订阅也直接由消费者 lifecycle 托管。
 
-事件定义是 `EventDefinition<T>(EventKey<T>, EventMode)`，支持五种模式：
+事件 mode 编码在 `EventDefinition.Sync/Parallel/Serial/Bail/Waterfall<T>` 的静态类型中。订阅统一调用 `subscribe`，分发统一调用 `dispatch`，非法 mode 组合在编译期无法表达：
 
 - `SYNC`：调用线程顺序执行，每个 listener 失败进入结果。
 - `PARALLEL`：所有 listener 并行执行，汇总成功数和失败。
@@ -309,7 +311,7 @@ Core 使用当前 STARTING/ACTIVE Activation 的 BindingSet 构造“consumer ->
 - `BAIL`：串行，listener 返回 true 表示认领并停止后续。
 - `WATERFALL`：串行转换事件值，失败停止后续。
 
-Event identity 使用事件名加 exact JVM `Class`。`EventKey.name()` 是 `Class.getName()`，但 bus 内部为每个事件名维护 canonical `EventBinding`，保存首次绑定时的 `Class` 对象，并用引用计数同时跟踪活跃 subscription 和 accepted dispatch。同名不同 exact `Class` 的定义会被拒绝，即使二进制类名相同、来自另一个 ClassLoader。
+Event identity 使用 definition 的事件名加 exact JVM `Class`。默认名是 `Class.getName()`，也可以显式指定；bus 内部为每个事件名维护 canonical `EventBinding`，并用引用计数同时跟踪活跃 subscription 和 accepted dispatch。同名不同 exact `Class` 的定义会被拒绝，即使二进制类名相同、来自另一个 ClassLoader。
 
 subscription 取消或 bus close 会先封闭入口：订阅从 registry 移除，close 还会把订阅 registry 与 binding registry 清空。但已经 accepted 的 dispatch 对象持有原 `EventBinding`；它的计数在回调完成后释放。只有活跃 subscription 和 accepted dispatch 都归零，binding 才算 idle 并可移除。因此同一个长期 bus 不会因为按类名缓存而永久钉住已卸载插件，也不会允许同名不同类事件并发混用；binding idle 后，重新加载的插件可以重新绑定同一事件名。
 
@@ -333,7 +335,7 @@ quiescence 是 close 契约的一部分：
 Collection<ExportedComponentFactory<?>> factories();
 ```
 
-`ExportedComponentFactory<C>` 显式携带 `Class<C> configType` 和 `ComponentFactory<C>`。这个 config token 在 artifact discovery 时校验，不是普通元数据。
+`ExportedComponentFactory<C>` 显式携带 `Class<C> configType`、`ConfigDecoder<C>` 和 `ComponentFactory<C>`。Token 与 decoder 在 artifact discovery 时校验，factory 只归一化已经类型化的 `C`。
 
 artifact 加载是事务式的：
 
@@ -344,13 +346,13 @@ artifact 加载是事务式的：
 5. 发布 managed artifact 与 factory catalog；目标 artifact 必须导出 provider，依赖 artifact 可以作为依赖被管理。
 6. 任一步失败时按 journal 回滚已加载/已启动内容，保留结构化 load failure 诊断。
 
-tokenless API 是只读的。`factoryCatalog()`、`resolver().resolve(factoryId)` 和 `handles()` 返回 `ArtifactFactoryCatalogEntry`，只包含 artifact id/version/path、factoryId 和 config type name，不能 mount、normalize config，也不能 cast 回 executable handle。可挂载视图必须通过：
+工厂目录收敛为 `adapter.factories()`：`list/find` 返回不持有可执行对象的稳定元数据；`resolve(factoryId)` 返回 wildcard executable handle，供官方 bridge 捕获泛型；`resolve(factoryId, Class<C>)` 返回宿主直接使用的类型化 handle。
 
 ```java
 Optional<ArtifactFactoryHandle<C>> resolve(String factoryId, Class<C> configType);
 ```
 
-token 使用 exact `Class.equals`。factory 不存在时 typed resolve 返回 `Optional.empty()`；token 不匹配时立即抛 `IllegalArgumentException`，Loader 会把它记录为 `RESOLUTION_FAILED`，不会伪装成空结果。正确 typed handle 的 `mount(...)` 要求非空且是声明的 config type；输入可以仍是待归一化的 raw typed config，实际归一化由 Core 调 factory schema 完成。无配置 factory 必须传 `NoConfig.INSTANCE`。因此 raw cast 或绕过泛型不能把错误配置推迟到组件 `start()` 才失败。
+Token 使用 exact `Class.equals`。Typed handle 先通过 `decodeConfig(raw)` 执行 export decoder，再以 `mount(context, mountId, C)` 进入 Core typed normalizer。错误 token、decoder 输出和 raw cast 都在组件 `start()` 前失败。
 
 每个通过 typed handle mount 的 Handle 都归 artifact adapter 所有，即使 mount 提交瞬间 artifact 已进入 drain，也会进入 ownership 集合。unload/retryDrain/close 的 drain 过程是：
 
@@ -374,16 +376,16 @@ Artifact snapshot 和 ownership 也是稳定文本与 id：origin、handle、sta
 
 `KnotraLoader` 管理期望声明树，而不是监听文件或直接操作 PF4J。`KnotraLoader.owned(runtime, resolver)` 创建自己的 base context；`over(runtime, context, resolver)` 使用调用方指定 context。Loader 内部是单线程异步 coordinator，`reconcileAsync(...)` 与 `retryAsync(...)` 串行执行，`closeAsync(...)` 也经过同一队列，且禁止 coordinator 线程重入调用这些 API。
 
-期望树由 `ComponentEntry(path, FactoryRef, config, children)` 组成。路径被规范化为稳定 `/` 分隔树，不允许 `..`，不允许重复 normalized path，child 必须属于声明的 parent。每个 path 对应一个 loader 管理的 child Context，并把 path 作为 `mountId`，因此 Core 的逻辑键是 `(contextId, path)`。嵌套声明的 Context 路径与树路径一致。
+期望树由 `ComponentEntry(path, FactoryRef, rawConfig, children)` 组成。`ComponentEntry.of` 表示无配置，`configured` 表示非 null raw 配置。路径规范化为稳定 `/` 分隔树，不允许 `..` 或重复 path；每个 path 对应一个 Loader 管理的 child Context，并同时作为 mountId。
 
-Resolver 返回 opaque 的 `ResolvedComponentDefinition`：
+Resolver 返回 opaque 的 `ResolvedFactory`：
 
 - `FactoryIdentity`：必填 factory id、必填 implementation fingerprint；version 可选，空字符串表示未声明。identity 相等要求三者都相等。
-- `ConfigSchema<Object>`：把原始配置归一化为实现可接受的类型。
+- `ConfigDecoder<Object>`：在结构修改前把 raw 配置转换为 Core 接受的类型化配置。
 - `ControlledMountStrategy`：在 loader 分配的单一 slot 中执行一次 mount。
-- `ReconfigureStrategy`：默认直接调用 Core handle 的 reconfigure。
+- `ReconfigureStrategy`：默认直接调用 Core handle 的 `reconfigureAsync`。
 
-Loader 先完整 prepare 期望树：解析所有 factory、normalize 所有 config、检查 parent 完整性、base context 状态、canonical context 归属和 mount slot 冲突。prepare 或配置校验失败时不会修改当前树。
+Loader 先完整 prepare 期望树：解析所有 factory、decode 所有 raw config、检查 parent 完整性、base Context 状态、canonical path 归属和 mount slot 冲突。Resolver 或 decoder 失败时不会修改当前树；Core typed normalizer 在 mount/reconfigure 拒绝时继续以结构化 `INVALID_CONFIG` 返回并触发本批补偿。
 
 reconcile 按阶段执行：
 
@@ -399,13 +401,13 @@ Controlled mount 边界由 `ControlledMountContext` 定义：
 ```java
 ContextHandle context();
 String mountId();
-<C> CompletionStage<ComponentHandle<C>> mount(
+<C> CompletionStage<ComponentHandle<C>> mountAsync(
         ComponentFactory<C> factory, C config, MountOptions options);
 ```
 
-实现内部是 single-use slot：第二次 mount、非 ACTIVE context 或 slot 不匹配都会失败。strategy 只拿到这个对象和已归一化配置，拿不到 `KnotraRuntime`、`RuntimeMutation`、任意 context disposal 或 host provide 能力。Loader 会校验 strategy 返回的 handle 确实位于分配的 `(context, mountId)`，否则立即 dispose 并拒绝。
+实现内部是 single-use slot：第二次 mount、非 ACTIVE context 或 slot 不匹配都会失败。strategy 只拿到这个对象和已 decode 的 typed config，拿不到 `KnotraRuntime`、`RuntimeTransaction`、任意 context disposal 或 host provide 能力。Loader 会校验 strategy 返回的 handle 确实位于分配的 `(context, mountId)`，否则立即 dispose 并拒绝。
 
-PF4J 桥接由宿主提供 resolver：typed resolve artifact factory，包装其 config schema 与 controlled mount strategy。桥接定义的 schema 先把 desired tree 中的 raw config 归一化为正确类型，再传给 single-use controlled mount；直接调用 typed artifact handle 时则传非空 typed raw config，由 Core 的 factory schema 归一化。这样 Loader 自身无 PF4J 依赖，adapter 不向 Loader 暴露 raw factory 或 PluginManager。当 reconcile 与 artifact drain 并发时，被 drain 的 mount 失败并回滚，Loader 不留下 partial entry；下一次 reconcile 可选择其他 resolver 提供的本地或新 artifact 实现。
+官方 `knotra-pf4j-loader` 提供 `Pf4jFactoryResolver`：它从 wildcard catalog handle 捕获泛型，匹配 `FactoryRef.version`，调用 export decoder，生成稳定 fingerprint，并保留 Core 拒绝的结构化 diagnostics。Loader 本身仍无 PF4J 依赖。Reconcile 与 artifact drain 并发时，被 drain 的 mount 失败并回滚；下一次 reconcile 可选择新 artifact 或 classpath fallback。
 
 `LoaderSnapshot` 只包含 path、context/handle id、factory identity、config revision、state 与 goal。Loader close 在普通场景 dispose 它管理的顶层 context 或 owned base context；如果 Runtime close 已接管 base subtree，Loader 只识别该所有权、清理自身托管簿记并停止 coordinator，不重复发起 teardown，也不代替调用方等待 Runtime close future。需要确认 Core 收敛时，调用方继续等待 `runtime.closeAsync()`。
 
@@ -423,10 +425,10 @@ Core 的并发协议可以概括为三层：
 |---|---|---|
 | 结构事务任一 intent 无效 | 整个 mutation 拒绝，不发布 | 修正输入后重新提交 |
 | required capability 缺失 | Handle 停 WAITING，不执行 start | provider 出现后自动 reconcile |
-| start 抛错 | rollback resources/staged registrations，Handle FAILED | `retry()` 或修正后 reconfigure |
+| start 抛错 | rollback resources/staged registrations，Handle FAILED | `retryAsync()` 或修正后 reconfigure |
 | start 期间 binding/config/context/goal 变化 | stale activation rollback，不记业务失败 | 按最新 generation reconcile |
 | binding cycle / non-convergence | 拒绝提交；同一 fingerprint 超限后停止自动重启 | 改结构后 fingerprint 重置，或显式 retry |
-| cleanup 部分失败 | 继续尝试其他 entry，Handle FAILED，失败 entry 保留 | `retry()` 只重试失败 entry |
+| cleanup 部分失败 | 继续尝试其他 entry，Handle FAILED，失败 entry 保留 | `retryAsync()` 只重试失败 entry |
 | provider 撤销/替换 | 先 logical detach direct/indirect dependents 和 owned children，再物理清理 provider | 无需人工恢复；等待 settle |
 | Context cleanup 失败 | subtree Context 进入 FAILED 并保留 | 再次 dispose 同 Context 完成剩余清理 |
 | EventBus close | 拒绝新工作，等待 accepted dispatch | 重复 close 返回同一 future |
@@ -450,7 +452,7 @@ Core 的并发协议可以概括为三层：
 - PF4J stop/unload 半失败只能保留 `DRAIN_FAILED` 或 residual diagnostic 并等待 retry；不能在当前 JVM 内强制认为插件已安全卸载，极端情况下需要重启。
 - Core 的 SCC 检查覆盖当前 STARTING/ACTIVE 与 tentative graph；不做通用全局固定点求解，non-convergence 达到上限后停止自动重启。
 - 事件分发保证 accepted dispatch quiescence，不保证跨进程、持久队列、Exactly-once 或宕机恢复。
-- 配置语义由 factory schema 决定；Runtime 不提供统一 YAML/JSON schema、secret 管理或动态配置中心。
+- 类型化归一化由 factory 决定，raw decode 由集成边界决定；Runtime 不提供统一 YAML/JSON schema、secret 管理或动态配置中心。
 - `knotra-loader` 不内置 PF4J resolver；宿主需要显式提供 opaque bridge。
 - Cordis 只有思想来源关系，没有任何兼容 API 或迁移工具。
 
@@ -499,6 +501,6 @@ Core 的并发协议可以概括为三层：
 | Loader replacement | factory identity 变化且新实现失败 | 尝试恢复旧实现；补偿失败保留诊断 |
 | Loader/PF4J race | reconcile mount 与 artifact drain 并发 | 不留下 partial mount，下次 reconcile 可用本地实现恢复 |
 | 并发 close | Runtime、Loader、adapter、EventBus close 交叉 | 已接受的 Event/生命周期工作 settle，失败可重试，不互相伪成功 |
-| 集成链路 | 真实 fixture JAR + Core + Events + Loader bridge | nested tree、schema、ownership、snapshot 和 GC 全部走公开 API |
+| 集成链路 | 真实 fixture JAR + Core + Events + Loader bridge | nested tree、decoder、ownership、snapshot 和 GC 全部走公开 API |
 
 集成模块会构建真实 PF4J fixture JAR，只通过公开 API 断言行为；测试不依赖生产内部强转、`Thread.sleep()` 或专用后门。并发测试主要使用 latch、future 与 Awaitility 的有界等待。

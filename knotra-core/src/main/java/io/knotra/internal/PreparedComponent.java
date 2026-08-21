@@ -3,28 +3,17 @@ package io.knotra.internal;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ConfigSchema;
 import io.knotra.MountOptions;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.Objects;
-import java.util.Optional;
 
-
-/**
- * 挂载前准备完成的组件实例及其冻结合约。
- *
- * <p>准备阶段在宿主事务回调中执行，会调用工厂、schema 与组件描述符等用户代码，并发生在
- * {@link DefaultKnotraRuntime} 协调器锁外。descriptor、factoryId、MountOptions 和初始归一化配置在
- * 此后不再跟随有状态组件对象变化；后续 reconfigure 只复用 schema 的归一化句柄。组件实例和配置由
- * {@link ComponentRuntime} 持有，直到该 ComponentHandle 终止并被移除。</p>
- */
+/** 挂载前完成创建、声明冻结与类型化配置归一化的组件。 */
 final class PreparedComponent<C> {
     private final String factoryId;
     private final ComponentDescriptor descriptor;
-    private final Optional<ConfigSchema<C>> schema;
     private final Object config;
     private final MountOptions options;
     private final MethodHandle start;
@@ -33,14 +22,12 @@ final class PreparedComponent<C> {
     private PreparedComponent(
             String factoryId,
             ComponentDescriptor descriptor,
-            Optional<ConfigSchema<C>> schema,
             Object config,
             MountOptions options,
             MethodHandle start,
             MethodHandle normalize) {
         this.factoryId = factoryId;
         this.descriptor = descriptor;
-        this.schema = schema;
         this.config = config;
         this.options = options;
         this.start = start;
@@ -49,42 +36,40 @@ final class PreparedComponent<C> {
 
     static <C> PreparedComponent<C> prepare(
             ComponentFactory<C> factory,
-            C rawConfig,
+            C inputConfig,
             MountOptions options) {
         Objects.requireNonNull(factory, "factory");
         Objects.requireNonNull(options, "options");
-        Objects.requireNonNull(
-                rawConfig,
-                "config (use NoConfig.INSTANCE for components without configuration)");
+
         String factoryId = safeText(factory.factoryId());
         if (factoryId.isBlank()) {
             throw new IllegalArgumentException("factoryId must not be blank");
         }
-        // 工厂和描述符都是用户代码；准备发生在协调器锁外，慢实现不能阻塞其他宿主事务。
         Component<C> component = Objects.requireNonNull(
                 factory.create(), "factory.create() returned null");
-        // descriptor 只读取一次并冻结，防止有状态组件随后改变依赖声明破坏 BindingSet 语义。
-        ComponentDescriptor descriptor = component.descriptor();
+        ComponentDescriptor declared = Objects.requireNonNull(
+                component.descriptor(), "component.descriptor() returned null");
+        ComponentDescriptor descriptor = declared.componentId().isEmpty()
+                ? ComponentDescriptor.named(
+                        factoryId,
+                        declared.requirements().toArray(io.knotra.CapabilityRequirement[]::new))
+                : declared;
         for (String failure : descriptor.validate()) {
             throw new IllegalArgumentException(failure);
         }
-        Optional<ConfigSchema<C>> optionalSchema = factory.configSchema();
-        ConfigSchema<C> validator = optionalSchema.orElse(null);
-        // 配置在进入视图前归一化；失败停留在事务回调中，不会留下部分提交的挂载。
+
         C config;
         try {
-            config = validator == null
-                    ? rawConfig
-                    : Objects.requireNonNull(
-                            validator.validate(rawConfig),
-                            "config schema returned null");
-        } catch (RuntimeException error) {
-            throw error;
+            C nonNullConfig = Objects.requireNonNull(
+                    inputConfig,
+                    "config (use the no-config mount overload for components without configuration)");
+            config = Objects.requireNonNull(
+                    factory.normalizeConfig(nonNullConfig),
+                    "config normalizer returned null");
         } catch (Exception error) {
-            throw new IllegalArgumentException(
-                    LifecycleScopeImpl.safeError(error),
-                    error);
+            throw new InvalidConfigException(LifecycleScopeImpl.safeError(error), error);
         }
+
         try {
             MethodHandle start = MethodHandles.lookup()
                     .unreflect(Component.class.getMethod(
@@ -96,20 +81,15 @@ final class PreparedComponent<C> {
                             void.class,
                             io.knotra.ActivationContext.class,
                             Object.class));
-            MethodHandle normalize = validator == null
-                    ? MethodHandles.identity(Object.class)
-                    : MethodHandles.lookup()
-                            .unreflect(ConfigSchema.class.getMethod(
-                                    "validate",
-                                    Object.class))
-                            .bindTo(validator)
-                            .asType(MethodType.methodType(
-                                    Object.class,
-                                    Object.class));
+            MethodHandle normalize = MethodHandles.lookup()
+                    .unreflect(ComponentFactory.class.getMethod(
+                            "normalizeConfig",
+                            Object.class))
+                    .bindTo(factory)
+                    .asType(MethodType.methodType(Object.class, Object.class));
             return new PreparedComponent<>(
                     factoryId,
                     descriptor,
-                    optionalSchema,
                     config,
                     options,
                     start,
@@ -127,10 +107,6 @@ final class PreparedComponent<C> {
         return descriptor;
     }
 
-    Optional<ConfigSchema<C>> schema() {
-        return schema;
-    }
-
     Object config() {
         return config;
     }
@@ -143,20 +119,16 @@ final class PreparedComponent<C> {
         invoke(start, context, config);
     }
 
-    Object normalize(Object rawConfig) throws Exception {
-        return invoke(normalize, rawConfig);
+    Object normalize(Object config) throws Exception {
+        return invoke(normalize, config);
     }
 
-    private static Object invoke(MethodHandle handle, Object... arguments)
-            throws Exception {
+    private static Object invoke(MethodHandle handle, Object... arguments) throws Exception {
         try {
             return handle.invokeWithArguments(arguments);
         } catch (Exception | Error error) {
             throw error;
         } catch (Throwable error) {
-            if (error instanceof Exception failure) {
-                throw failure;
-            }
             throw new IllegalStateException(error);
         }
     }
@@ -169,6 +141,12 @@ final class PreparedComponent<C> {
             return value.trim();
         } catch (Throwable ignored) {
             return "";
+        }
+    }
+
+    static final class InvalidConfigException extends RuntimeException {
+        InvalidConfigException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 }

@@ -14,7 +14,7 @@ import io.knotra.events.EventBusFactory;
 import io.knotra.events.EventBusSnapshot;
 import io.knotra.loader.ComponentEntry;
 import io.knotra.loader.ComponentTree;
-import io.knotra.loader.CompositeComponentFactoryResolver;
+import io.knotra.pf4j.loader.Pf4jFactoryResolver;
 import io.knotra.loader.FactoryRef;
 import io.knotra.loader.KnotraLoader;
 import io.knotra.loader.LoaderSnapshot;
@@ -51,30 +51,27 @@ final class SnapshotClassLoaderIntegrationTest {
     void retainedSnapshotsDoNotPinThePluginClassLoader(@TempDir Path pluginsRoot)
             throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            ComponentHandle<String> greeting = adapter.resolver()
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            ComponentHandle<String> greeting = adapter.factories()
                     .resolve("integration-greeting", String.class).orElseThrow()
-                    .mount(runtime.rootContext(), "greeting", "hello");
-            ComponentHandle<NoConfig> parent = adapter.resolver()
+                    .mount(runtime.root(), "greeting", "hello");
+            ComponentHandle<NoConfig> parent = adapter.factories()
                     .resolve("integration-parent", NoConfig.class).orElseThrow()
-                    .mount(runtime.rootContext(), "parent", NoConfig.INSTANCE);
+                    .mount(runtime.root(), "parent", NoConfig.INSTANCE);
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(greeting));
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(parent));
 
-            ComponentHandle<NoConfig> busProvider = runtime.mutate(mutation -> mutation.mount(
-                    runtime.rootContext(), "bus", new EventBusFactory(), NoConfig.INSTANCE))
-                    .value();
+            ComponentHandle<NoConfig> busProvider = runtime.mount("bus", new EventBusFactory());
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(busProvider));
-            EventBus bus = runtime.context()
+            EventBus bus = runtime.root().view()
                     .find(io.knotra.events.EventCapabilities.EVENT_BUS).orElseThrow();
 
             KnotraLoader loader = KnotraLoader.over(
                     runtime,
-                    runtime.rootContext(),
-                    CompositeComponentFactoryResolver.of(ref ->
-                            IntegrationTestKit.bridge(adapter).apply(ref)));
+                    runtime.root(),
+                    Pf4jFactoryResolver.of(adapter));
             ReconcileResult reconcile = loader.reconcile(ComponentTree.of(
-                    ComponentEntry.of(
+                    ComponentEntry.configured(
                             "snapshot-entry",
                             FactoryRef.of("integration-greeting"),
                             "snapshot")));
@@ -87,8 +84,8 @@ final class SnapshotClassLoaderIntegrationTest {
             EventBusSnapshot busSnapshot = bus.snapshot();
             LoaderSnapshot loaderSnapshot = loader.snapshot();
 
-            adapter.unloadArtifact(IntegrationTestKit.ARTIFACT_ID).join();
-            busProvider.dispose().toCompletableFuture().get(10, java.util.concurrent.TimeUnit
+            adapter.unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID).toCompletableFuture().join();
+            busProvider.disposeAsync().toCompletableFuture().get(10, java.util.concurrent.TimeUnit
                     .SECONDS);
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());

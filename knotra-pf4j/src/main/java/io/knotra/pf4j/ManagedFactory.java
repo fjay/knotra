@@ -2,18 +2,17 @@ package io.knotra.pf4j;
 
 import io.knotra.ComponentFactory;
 import io.knotra.ComponentHandle;
-import io.knotra.ConfigSchema;
+import io.knotra.ConfigDecoder;
 import io.knotra.ContextHandle;
 
 import java.util.Objects;
-import java.util.Optional;
 
 /**
  * 活跃 artifact 工厂的内部句柄实现。
  *
- * <p>句柄只在 artifact 处于 ACTIVE 时有效；drain 会清空工厂与 schema，使陈旧句柄
- * 无法继续挂载。挂载前重新执行配置 token 与实例类型校验，防止 raw cast 绕过类型化
- * 解析。</p>
+ * <p>句柄只在 artifact 处于 ACTIVE 时有效；drain 会清空工厂与 decoder，使陈旧句柄
+ * 无法继续挂载或解码。挂载前重新执行配置 token 与实例类型校验，防止 raw cast
+ * 绕过类型化解析。</p>
  */
 final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
 
@@ -21,7 +20,7 @@ final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
     final ManagedArtifact artifact;
     final String factoryId;
     final Class<C> configType;
-    volatile Optional<ConfigSchema<C>> configSchema;
+    volatile ConfigDecoder<C> decoder;
     volatile ComponentFactory<C> factory;
 
     ManagedFactory(
@@ -29,14 +28,14 @@ final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
             ManagedArtifact artifact,
             String factoryId,
             Class<C> configType,
-            ComponentFactory<C> factory,
-            Optional<ConfigSchema<C>> configSchema) {
+            ConfigDecoder<C> decoder,
+            ComponentFactory<C> factory) {
         this.owner = owner;
         this.artifact = artifact;
         this.factoryId = factoryId;
         this.configType = configType;
+        this.decoder = decoder;
         this.factory = factory;
-        this.configSchema = configSchema;
     }
 
     @Override
@@ -70,21 +69,39 @@ final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
     }
 
     @Override
-    public Optional<ConfigSchema<C>> configSchema() {
-        requireFactory();
-        return configSchema;
+    public C decodeConfig(Object rawConfig) {
+        ConfigDecoder<C> current = requireUsable("decode");
+        C decoded;
+        try {
+            decoded = current.decode(rawConfig);
+        } catch (Throwable failure) {
+            throw new ArtifactOperationException(
+                    artifact.artifactId,
+                    "decode",
+                    "factory " + factoryId + " could not decode configuration: "
+                            + FailureText.describe(failure));
+        }
+        if (decoded == null || !configType.isInstance(decoded)) {
+            throw new ArtifactOperationException(
+                    artifact.artifactId,
+                    "decode",
+                    "factory " + factoryId + " decoder must produce "
+                            + configType.getName() + ", not "
+                            + (decoded == null ? "null" : decoded.getClass().getName()));
+        }
+        return decoded;
     }
 
     @Override
     public ComponentHandle<C> mount(ContextHandle context, String mountId, C config) {
-        ComponentFactory<C> current = requireFactory();
+        ComponentFactory<C> current = requireUsable("mount");
         if (config == null) {
             throw new ArtifactOperationException(
                     artifact.artifactId,
                     "mount",
                     "factory " + factoryId + " requires non-null config type "
                             + configType.getName()
-                            + "; use NoConfig.INSTANCE for NoConfig factories");
+                            + "; use mount(context, mountId) when the decoder supplies defaults");
         }
         if (!configType.isInstance(config)) {
             throw new ArtifactOperationException(
@@ -97,14 +114,14 @@ final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
         return owner.mount(this, context, mountId, current, config);
     }
 
-    private ComponentFactory<C> requireFactory() {
-        ComponentFactory<C> current = factory;
+    private <T> T requireUsable(String phase) {
+        T current = phase.equals("mount") ? (T) factory : (T) decoder;
         if (current == null
                 || !artifact.acceptingMounts
                 || artifact.state != ArtifactState.ACTIVE) {
             throw new ArtifactOperationException(
                     artifact.artifactId,
-                    "mount",
+                    phase,
                     "factory handle is no longer usable: " + factoryId);
         }
         return current;

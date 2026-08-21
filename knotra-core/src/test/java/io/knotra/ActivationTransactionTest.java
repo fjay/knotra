@@ -29,7 +29,7 @@ final class ActivationTransactionTest {
             String mountId,
             TestKit.Start<NoConfig> start,
             CapabilityRequirement... requirements) {
-        return TestKit.mount(runtime, runtime.rootContext(), mountId, mountId, start, requirements);
+        return TestKit.mount(runtime, runtime.root(), mountId, mountId, start, requirements);
     }
 
     private static Optional<String> currentActivation(KnotraRuntime runtime, ComponentHandle<?> handle) {
@@ -52,7 +52,7 @@ final class ActivationTransactionTest {
         AtomicReference<String> observed = new AtomicReference<>();
         var handle = mount("consumer", (context, config) ->
                 observed.set(context.require(TEXT)), CapabilityRequirement.required(TEXT));
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "value");
+        TestKit.provide(runtime, runtime.root(), TEXT, "value");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("value", observed.get());
         var activation = TestKit.component(runtime, handle);
@@ -93,7 +93,7 @@ final class ActivationTransactionTest {
         });
         assertEquals(ComponentState.FAILED, TestKit.settle(handle).call());
         assertEquals(1, closed.get());
-        assertTrue(runtime.context().find(TEXT).isEmpty());
+        assertTrue(runtime.root().view().find(TEXT).isEmpty());
         assertTrue(runtime.snapshot().registrations().isEmpty());
         assertTrue(runtime.snapshot().diagnostics().stream()
                 .anyMatch(diagnostic -> diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED));
@@ -122,12 +122,12 @@ final class ActivationTransactionTest {
         assertFalse(binding.present());
         assertEquals(CapabilityRequirement.Mode.OPTIONAL, binding.mode());
 
-        var registration = TestKit.provide(runtime, runtime.rootContext(), TEXT, "one");
+        var registration = TestKit.provide(runtime, runtime.root(), TEXT, "one");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(Optional.of("one"), observed.get());
         String first = TestKit.component(runtime, handle).currentActivationId();
 
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(registration);
             return null;
         }));
@@ -141,15 +141,15 @@ final class ActivationTransactionTest {
         AtomicReference<String> observed = new AtomicReference<>();
         var handle = mount("consumer", (context, config) ->
                 observed.set(context.require(TEXT)), CapabilityRequirement.required(TEXT));
-        var first = TestKit.provide(runtime, runtime.rootContext(), TEXT, "same");
+        var first = TestKit.provide(runtime, runtime.root(), TEXT, "same");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         String firstActivation = TestKit.component(runtime, handle).currentActivationId();
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(first);
             return null;
         }));
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call());
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "same");
+        TestKit.provide(runtime, runtime.root(), TEXT, "same");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertNotEquals(firstActivation, TestKit.component(runtime, handle).currentActivationId());
         assertEquals("same", observed.get());
@@ -165,16 +165,16 @@ final class ActivationTransactionTest {
             gate.get();
             observed.set(context.require(TEXT));
         }, CapabilityRequirement.required(TEXT));
-        var first = TestKit.provide(runtime, runtime.rootContext(), TEXT, "one");
+        var first = TestKit.provide(runtime, runtime.root(), TEXT, "one");
         assertTrue(started.await(10, TimeUnit.SECONDS));
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(first);
             return null;
         }));
         gate.complete(null);
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call(),
                 () -> runtime.snapshot().toString());
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "two");
+        TestKit.provide(runtime, runtime.root(), TEXT, "two");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("two", observed.get());
         assertTrue(runtime.snapshot().diagnostics().stream().noneMatch(diagnostic ->
@@ -191,7 +191,7 @@ final class ActivationTransactionTest {
             }
         });
         assertEquals(ComponentState.FAILED, TestKit.settle(handle).call());
-        assertEquals(ComponentState.ACTIVE, handle.retry().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.ACTIVE, handle.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(2, attempts.get());
     }
 
@@ -199,20 +199,20 @@ final class ActivationTransactionTest {
     void retryRejectedWhenComponentIsNotFailed() throws Exception {
         var handle = mount("active", (context, config) -> {});
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertTrue(handle.retry().toCompletableFuture().isCompletedExceptionally());
+        assertTrue(handle.retryAsync().toCompletableFuture().isCompletedExceptionally());
     }
 
     @Test
     void reconfigureUsesSameHandleAndNewActivation() throws Exception {
         var configs = new java.util.concurrent.CopyOnWriteArrayList<Object>();
         Component<Object> component = new TestKit.Scripted<>(
-                ComponentDescriptor.of("configured"), (context, config) -> configs.add(config));
+                ComponentDescriptor.named("configured"), (context, config) -> configs.add(config));
         ComponentFactory<Object> typedFactory = TestKit.factory("configured", component);
-        var handle = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "configured", typedFactory, new Object())).value();
+        var handle = runtime.transact(mutation -> mutation.mount(
+                runtime.root(), "configured", typedFactory, new Object())).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         String first = TestKit.component(runtime, handle).currentActivationId();
-        assertEquals(ComponentState.ACTIVE, handle.reconfigure(new Object())
+        assertEquals(ComponentState.ACTIVE, handle.reconfigureAsync(new Object())
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         String second = TestKit.component(runtime, handle).currentActivationId();
         assertNotEquals(first, second);
@@ -228,7 +228,7 @@ final class ActivationTransactionTest {
         var parent = mount("parent", (context, config) -> {
             child.set(context.mountChild("child",
                     TestKit.factory("child", new TestKit.Scripted<>(
-                            ComponentDescriptor.of("child"), (childContext, childConfig) -> {})),
+                            ComponentDescriptor.named("child"), (childContext, childConfig) -> {})),
                     NoConfig.INSTANCE));
             started.countDown();
             gate.get();
@@ -250,7 +250,7 @@ final class ActivationTransactionTest {
         AtomicReference<ComponentHandle<NoConfig>> secondChild = new AtomicReference<>();
         var parent = mount("parent", (context, config) -> {
             ComponentFactory<NoConfig> childFactory = TestKit.factory("child", new TestKit.Scripted<>(
-                    ComponentDescriptor.of("child"), (childContext, childConfig) -> {}));
+                    ComponentDescriptor.named("child"), (childContext, childConfig) -> {}));
             if (attempts.incrementAndGet() == 1) {
                 firstChild.set(context.mountChild("child", childFactory, NoConfig.INSTANCE));
                 throw new IllegalStateException("parent failed");
@@ -261,7 +261,7 @@ final class ActivationTransactionTest {
         assertEquals(ComponentState.DISPOSED, firstChild.get().state());
         assertTrue(runtime.snapshot().components().stream()
                 .noneMatch(component -> component.mountId().equals("child")));
-        assertEquals(ComponentState.ACTIVE, parent.retry().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.ACTIVE, parent.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(secondChild.get()).call());
         assertNotEquals(firstChild.get().handleId(), secondChild.get().handleId());
         assertEquals("child", secondChild.get().mountId());
@@ -281,7 +281,7 @@ final class ActivationTransactionTest {
         AtomicInteger cleanupAttempts = new AtomicInteger();
         AtomicInteger starts = new AtomicInteger();
         Component<Config> component = new TestKit.Scripted<>(
-                ComponentDescriptor.of("configured"), (context, config) -> {
+                ComponentDescriptor.named("configured"), (context, config) -> {
                     starts.incrementAndGet();
                     context.lifecycle().onClose("cleanup", () -> {
                         cleanupAttempts.incrementAndGet();
@@ -291,14 +291,14 @@ final class ActivationTransactionTest {
                     });
                 });
         ComponentFactory<Config> typedFactory = TestKit.factory("configured", component);
-        var handle = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "configured", typedFactory, new Config("one"))).value();
+        var handle = runtime.transact(mutation -> mutation.mount(
+                runtime.root(), "configured", typedFactory, new Config("one"))).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.reconfigure(new Config("two"))
+        assertEquals(ComponentState.FAILED, handle.reconfigureAsync(new Config("two"))
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(1, starts.get());
         assertEquals(1, cleanupAttempts.get());
-        assertEquals(ComponentState.ACTIVE, handle.retry().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.ACTIVE, handle.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(2, starts.get());
         assertEquals(2, cleanupAttempts.get());
     }

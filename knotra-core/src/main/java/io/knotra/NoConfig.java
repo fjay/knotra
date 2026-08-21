@@ -1,12 +1,11 @@
 package io.knotra;
 
 /**
- * 无配置组件的配置哨兵值。
+ * 无配置组件的 unit 类型。
  *
- * <p>工厂未声明配置 schema 时，挂载与重配置都使用 {@link #INSTANCE}；
- * 配置参数不允许为 null。
+ * <p>宿主和组件的 no-config mount overload 会在内部提供 {@link #INSTANCE}；
+ * typed artifact handle 的两参数 mount 也通过 decoder 提供该值。配置对象本身不使用 null。</p>
  */
 public enum NoConfig {
-    /** 唯一实例。 */
     INSTANCE
 }

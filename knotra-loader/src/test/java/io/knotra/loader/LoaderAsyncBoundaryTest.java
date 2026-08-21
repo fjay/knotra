@@ -46,19 +46,22 @@ final class LoaderAsyncBoundaryTest {
     }
 
     @Test
-    void controlledMountSurfaceDoesNotExposeRuntimeMutation() {
+    void controlledMountSurfaceDoesNotExposeRuntimeTransaction() {
         for (Class<?> surface : List.of(
                 ControlledMountStrategy.class,
                 ControlledMountContext.class,
-                ResolvedComponentDefinition.class)) {
+                ResolvedFactory.class)) {
             for (Method method : surface.getMethods()) {
                 for (Class<?> parameter : method.getParameterTypes()) {
                     assertNotEquals(KnotraRuntime.class, parameter, method::toString);
-                    assertNotEquals("io.knotra.RuntimeMutation", parameter.getName(), method::toString);
+                    assertNotEquals(
+                            "io.knotra.RuntimeTransaction",
+                            parameter.getName(),
+                            method::toString);
                 }
                 assertNotEquals(KnotraRuntime.class, method.getReturnType(), method::toString);
                 assertNotEquals(
-                        "io.knotra.RuntimeMutation",
+                        "io.knotra.RuntimeTransaction",
                         method.getReturnType().getName(),
                         method::toString);
             }
@@ -70,14 +73,14 @@ final class LoaderAsyncBoundaryTest {
         FactoryRef ref = FactoryRef.of("controlled");
         var factory = LoaderTestKit.factory("controlled", (context, config) -> {
         });
-        ResolvedComponentDefinition definition = new ResolvedComponentDefinition(
+        ResolvedFactory definition = new ResolvedFactory(
                 FactoryIdentity.of("controlled", "", "test"),
                 null,
                 (context, config) -> {
                     assertFalse(context instanceof KnotraRuntime);
                     assertEquals("controlled", context.mountId());
-                    CompletionStage<?> mounted = context.mount(factory, config, MountOptions.DEFAULT);
-                    CompletionStage<?> second = context.mount(factory, config, MountOptions.DEFAULT);
+                    CompletionStage<?> mounted = context.mountAsync(factory, config, MountOptions.DEFAULT);
+                    CompletionStage<?> second = context.mountAsync(factory, config, MountOptions.DEFAULT);
                     assertTrue(second.toCompletableFuture().isCompletedExceptionally());
                     @SuppressWarnings("unchecked")
                     CompletionStage<ComponentHandle<?>> first =
@@ -85,7 +88,7 @@ final class LoaderAsyncBoundaryTest {
                     return first;
                 },
                 ReconfigureStrategy.direct());
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), wanted ->
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), wanted ->
                 Optional.of(definition));
         try {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
@@ -103,19 +106,18 @@ final class LoaderAsyncBoundaryTest {
         FactoryRef ref = FactoryRef.of("wrong-slot");
         var factory = LoaderTestKit.factory("wrong-slot", (context, config) -> {
         });
-        var externalContext = runtime.mutate(mutation ->
-                mutation.childContext(runtime.rootContext(), "external")).value();
-        ResolvedComponentDefinition definition = new ResolvedComponentDefinition(
+        var externalContext = runtime.transact(mutation ->
+                mutation.childContext(runtime.root(), "external")).value();
+        ResolvedFactory definition = new ResolvedFactory(
                 FactoryIdentity.of("wrong-slot", "", "test"),
                 null,
                 (context, config) -> {
-                    var external = runtime.mutate(mutation -> mutation.mount(
+                    var external = runtime.transact(mutation -> mutation.mount(
                             externalContext, "external", factory, config, MountOptions.DEFAULT));
-                    assertTrue(external.committed(), () -> external.diagnostics().toString());
                     return CompletableFuture.completedFuture(external.value());
                 },
                 ReconfigureStrategy.direct());
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), wanted ->
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), wanted ->
                 Optional.of(definition));
         try {
             ReconcileResult result = loader.reconcile(ComponentTree.of(
@@ -138,7 +140,7 @@ final class LoaderAsyncBoundaryTest {
             entered.countDown();
             gate.join();
         });
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, factory));
         try {
             var first = loader.reconcileAsync(ComponentTree.of(
@@ -183,7 +185,7 @@ final class LoaderAsyncBoundaryTest {
             entered.countDown();
             gate.join();
         });
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, factory));
         var reconcile = loader.reconcileAsync(ComponentTree.of(
                 LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE)));
@@ -202,7 +204,7 @@ final class LoaderAsyncBoundaryTest {
         FactoryRef ref = FactoryRef.of("reentrant");
         AtomicReference<RuntimeException> rejected = new AtomicReference<>();
         AtomicReference<KnotraLoader> owningLoader = new AtomicReference<>();
-        ResolvedComponentDefinition definition = new ResolvedComponentDefinition(
+        ResolvedFactory definition = new ResolvedFactory(
                 FactoryIdentity.of("reentrant", "", "test"),
                 null,
                 (context, config) -> {
@@ -216,7 +218,7 @@ final class LoaderAsyncBoundaryTest {
                     return CompletableFuture.failedFuture(new IllegalStateException("mount stopped"));
                 },
                 ReconfigureStrategy.direct());
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), wanted ->
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), wanted ->
                 Optional.of(definition));
         owningLoader.set(loader);
         try {
@@ -236,7 +238,7 @@ final class LoaderAsyncBoundaryTest {
         FactoryRef good = FactoryRef.of("good");
         FactoryRef bad = FactoryRef.of("bad");
         AtomicInteger goodStarts = new AtomicInteger();
-        ResolvedComponentDefinition badDefinition = new ResolvedComponentDefinition(
+        ResolvedFactory badDefinition = new ResolvedFactory(
                 FactoryIdentity.of("bad", "", "bad"),
                 null,
                 (context, config) -> CompletableFuture.failedFuture(
@@ -246,12 +248,12 @@ final class LoaderAsyncBoundaryTest {
                                 "external coordinator rejected mount")))),
                 ReconfigureStrategy.direct());
         ComponentFactoryResolver resolver = (FactoryRef wanted) -> wanted.equals(good)
-                ? Optional.of(ResolvedComponentDefinition.of(
+                ? Optional.of(ResolvedFactory.of(
                         FactoryIdentity.of("good", "", "good"),
                         LoaderTestKit.factory("good", (context, config) ->
                                 goodStarts.incrementAndGet())))
                 : Optional.of(badDefinition);
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), resolver);
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver);
         try {
             var result = loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("alpha", good, NoConfig.INSTANCE),
@@ -282,7 +284,7 @@ final class LoaderAsyncBoundaryTest {
                 throw new IllegalStateException("temporary");
             }
         });
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, factory));
         try {
             var failed = loader.reconcile(ComponentTree.of(
@@ -306,9 +308,9 @@ final class LoaderAsyncBoundaryTest {
     @Test
     void disposedBaseIsRejectedBeforeTheFirstOperation() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        var baseResult = runtime.mutate(mutation ->
-                mutation.childContext(runtime.rootContext(), "base"));
-        runtime.mutate(mutation -> {
+        var baseResult = runtime.transact(mutation ->
+                mutation.childContext(runtime.root(), "base"));
+        runtime.transact(mutation -> {
             mutation.dispose(baseResult.value());
             return null;
         }).settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -326,9 +328,9 @@ final class LoaderAsyncBoundaryTest {
     @Test
     void foreignChildUnderExternalBaseIsRejected() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        var baseResult = runtime.mutate(mutation ->
-                mutation.childContext(runtime.rootContext(), "base"));
-        runtime.mutate(mutation ->
+        var baseResult = runtime.transact(mutation ->
+                mutation.childContext(runtime.root(), "base"));
+        runtime.transact(mutation ->
                 mutation.childContext(baseResult.value(), "alpha"));
         KnotraLoader loader = KnotraLoader.over(runtime, baseResult.value(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
@@ -354,8 +356,8 @@ final class LoaderAsyncBoundaryTest {
                         throw new IllegalStateException(error);
                     }
                 }));
-        var baseResult = runtime.mutate(mutation ->
-                mutation.childContext(runtime.rootContext(), "base"));
+        var baseResult = runtime.transact(mutation ->
+                mutation.childContext(runtime.root(), "base"));
         KnotraLoader loader = KnotraLoader.over(runtime, baseResult.value(),
                 LoaderTestKit.resolver(ref, factory));
         LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
@@ -373,7 +375,7 @@ final class LoaderAsyncBoundaryTest {
     void closedRuntimeReconcileIsRejectedWithStructuredBaseDiagnostic() throws Exception {
         FactoryRef ref = FactoryRef.of("late");
         runtime.close();
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("late", (context, config) -> {})));
         try {
             var result = loader.reconcile(ComponentTree.empty());

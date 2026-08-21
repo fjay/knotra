@@ -3,17 +3,12 @@ package io.knotra.internal;
 import io.knotra.ContextHandle;
 import io.knotra.ContextInfo;
 import io.knotra.ContextState;
-import io.knotra.RuntimeContext;
+import io.knotra.ContextView;
 
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 
-
-/**
- * 层级 Context 的句柄实现。
- *
- * <p>ID 在 {@link DefaultKnotraRuntime} 的视图和句柄表中唯一；读取与处置均委托回 Runtime，
- * 句柄不持有组件或 Capability 值。Context 成功清理后会从视图移除，但句柄身份仍可与随后重建的同名 Context 区分。</p>
- */
+/** Context 树节点的稳定结构句柄。 */
 final class ContextHandleImpl implements ContextHandle {
     final DefaultKnotraRuntime runtime;
     final String id;
@@ -29,12 +24,13 @@ final class ContextHandleImpl implements ContextHandle {
     }
 
     @Override
-    public ContextInfo contextInfo() {
+    public ContextInfo info() {
         return runtime.contextInfo(id);
     }
 
-    public RuntimeContext context() {
-        return new RuntimeContextImpl(runtime, id);
+    @Override
+    public ContextView view() {
+        return new ContextViewImpl(runtime, id);
     }
 
     @Override
@@ -43,20 +39,20 @@ final class ContextHandleImpl implements ContextHandle {
     }
 
     @Override
-    public CompletionStage<Void> disposeAsync() {
-        return runtime.disposeContext(this);
+    public CompletionStage<ContextState> disposeAsync() {
+        return runtime.disposeContext(this).handle((ignored, error) -> {
+            ContextState settled = state();
+            if (error != null && settled != ContextState.FAILED) {
+                throw new CompletionException(error);
+            }
+            return settled;
+        });
     }
 
     @Override
     public boolean equals(Object other) {
-        if (this == other) {
-            return true;
-        }
-        if (other == null || other.getClass() != getClass()) {
-            return false;
-        }
-        ContextHandleImpl handle = (ContextHandleImpl) other;
-        return runtime == handle.runtime && id.equals(handle.id);
+        return this == other || other instanceof ContextHandleImpl handle
+                && runtime == handle.runtime && id.equals(handle.id);
     }
 
     @Override

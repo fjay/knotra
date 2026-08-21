@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.KnotraRuntime;
-import io.knotra.MutationResult;
+import io.knotra.TransactionReceipt;
 import io.knotra.NoConfig;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
@@ -31,7 +31,7 @@ final class LoaderStructureTest {
     @Test
     void equivalentNormalizedPathsReuseTheSameHandle() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         try {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
@@ -50,7 +50,7 @@ final class LoaderStructureTest {
     @Test
     void duplicateNormalizedPathsAreRejectedBeforeMutation() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         try {
             var result = loader.reconcile(ComponentTree.of(
@@ -68,7 +68,7 @@ final class LoaderStructureTest {
     void sameFactoryCanBeMountedAtMultiplePaths() throws Exception {
         FactoryRef ref = FactoryRef.of("shared");
         var factory = LoaderTestKit.factory("shared", (context, config) -> {});
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, factory));
         try {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
@@ -87,7 +87,7 @@ final class LoaderStructureTest {
     @Test
     void removalDisposesEntryContextAndHandle() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         try {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
@@ -105,13 +105,12 @@ final class LoaderStructureTest {
     @Test
     void nestedEntryHasAContextPerPathAndStableMountId() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         try {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(ComponentEntry.of(
                     "alpha",
                     ref,
-                    NoConfig.INSTANCE,
                     LoaderTestKit.entry("child", ref, NoConfig.INSTANCE)))));
             var parent = loader.snapshot().entry("alpha").orElseThrow();
             var child = loader.snapshot().entry("alpha/child").orElseThrow();
@@ -127,7 +126,7 @@ final class LoaderStructureTest {
     @Test
     void orphanNestedPathIsRejected() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         try {
             var result = loader.reconcile(ComponentTree.of(
@@ -142,10 +141,9 @@ final class LoaderStructureTest {
     @Test
     void foreignContextAtDesiredPathIsNotClaimed() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        MutationResult<ContextHandle> foreign = runtime.mutate(mutation ->
-                mutation.childContext(runtime.rootContext(), "alpha"));
-        assertTrue(foreign.committed());
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        TransactionReceipt<ContextHandle> foreign = runtime.transact(mutation ->
+                mutation.childContext(runtime.root(), "alpha"));
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         try {
             var result = loader.reconcile(ComponentTree.of(
@@ -172,29 +170,29 @@ final class LoaderStructureTest {
         assertTrue(runtime.snapshot().components().isEmpty());
         assertTrue(runtime.snapshot().contexts().stream()
                 .noneMatch(context -> context.contextId().equals(loader.baseContext().contextId())));
-        assertEquals(io.knotra.ContextState.ACTIVE, runtime.rootContext().state());
+        assertEquals(io.knotra.ContextState.ACTIVE, runtime.root().state());
     }
 
     @Test
     void overCloseDisposesOnlyItsContexts() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(),
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
         LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
                 LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE))));
         loader.close();
         assertTrue(runtime.snapshot().components().isEmpty());
-        assertEquals(io.knotra.ContextState.ACTIVE, runtime.rootContext().state());
+        assertEquals(io.knotra.ContextState.ACTIVE, runtime.root().state());
     }
 
     @Test
     void compositeResolverUsesFirstMatchInOrder() throws Exception {
         FactoryRef firstRef = FactoryRef.of("first");
         FactoryRef secondRef = FactoryRef.of("second");
-        ComponentFactoryResolver composite = CompositeComponentFactoryResolver.of(
+        ComponentFactoryResolver composite = CompositeFactoryResolver.of(
                 LoaderTestKit.resolver(firstRef, LoaderTestKit.factory("first", (context, config) -> {})),
                 LoaderTestKit.resolver(secondRef, LoaderTestKit.factory("second", (context, config) -> {})));
-        KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), composite);
+        KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), composite);
         try {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("one", firstRef, NoConfig.INSTANCE),

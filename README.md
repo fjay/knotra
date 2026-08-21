@@ -1,47 +1,29 @@
 # Knotra
 
-**应用不重启，组件可替换。** Knotra 是一个 JVM 模块化运行时，解决一个具体问题：应用启动之后，组成它的组件还要变化——替换实现、升级插件、局部重启、按租户切换，而且不能靠重启进程解决。
+**应用不重启，组件可替换。** Knotra 是一个 JVM 动态组件运行时：应用启动后仍可以替换实现、升级插件、局部重启或按 Context 切换服务，同时保持依赖绑定、在途任务与资源清理的一致性。
 
 ![Java](https://img.shields.io/badge/Java-21%2B-orange)
 ![Maven](https://img.shields.io/badge/Maven-3.9%2B-blue)
 ![Version](https://img.shields.io/badge/version-0.1.0--SNAPSHOT-blue)
-![Tests](https://img.shields.io/badge/tests-227%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-230%20passing-brightgreen)
 
-> **项目状态**：`0.1.0-SNAPSHOT`，尚未发布到 Maven Central。核心、事件、PF4J 适配器、Loader 均已实现并有完整测试覆盖。0.x 阶段不提供跨版本兼容承诺（包括 API、诊断码、SPI 与快照结构）；1.0 发布前会公布版本稳定性政策。
+> **项目状态**：`0.1.0-SNAPSHOT`，尚未发布到 Maven Central。0.x 阶段不承诺跨版本 API 兼容；当前公开 API 已按“默认失败不可忽略、Core 配置强类型、集成边界显式 decode”重构。
 
 ## 为什么需要它
 
-把一个新 JAR 加载进 JVM 很容易，难的是加载之后的事：
+把一个 JAR 加载进 JVM 很容易，困难的是加载之后的运行语义：
 
-- 新组件还没初始化完时，不该被其他组件看见；
-- 旧组件还有人引用时，要等在途任务收尾再关闭，而不是立刻掐断；
-- 组件启动到一半，它依赖的服务被替换了，这次启动应当作废重来，而不是带着过期状态继续跑；
-- 插件卸载时清理失败，要保留现场、可以重试，而不是被标记成成功。
+- 新组件初始化完成前不能被其他组件看见。
+- 旧组件仍有在途任务时，必须先排空再关闭。
+- 组件启动期间依赖被替换，这次启动必须作废并按新依赖重试。
+- 插件卸载清理失败时要保留现场并允许重试，不能伪造成功。
+- 一组结构修改必须整体提交或整体拒绝。
 
-这些问题靠“注册表 + `start()/stop()`”拼不出来：普通查找只能回答“现在能不能拿到对象”，回答不了“谁绑定的是哪一次注册”“旧的运行收尾了没有”。Knotra 把这些关系作为运行时的一等结构来管理。
-
-## 核心能力
-
-- **事务化结构变更**：挂载、提供、撤销要么整体提交，要么整体拒绝，不存在“改了一半”的运行时状态。
-- **依赖代际追踪**：运行时记录每个组件绑定的是哪一次服务注册；提供方替换时，消费方自动收尾并按新注册重启。
-- **可逆生命周期**：组件打开的连接、订阅、后台任务登记在 `LifecycleScope`，销毁按逆序回收，失败的条目可单独重试。
-- **真实的插件卸载**：PF4J 插件卸载前先排空在途挂载、按依赖顺序清理；清理失败保留现场可重试，最终让插件 ClassLoader 可被回收。
-- **声明式期望状态**：Loader 把“我想要一棵这样的组件树”与当前状态协调，失败批次整体回滚。
-- **可观测性内建**：不可变 Snapshot 不持有任何运行中的对象，诊断码是稳定枚举，适合直接接告警。
-
-## 与常见方案对比
-
-| 方案 | 它解决 | 剩下要自己解决 |
-|---|---|---|
-| 手写注册表 / ServiceLoader | 对象查找与基本替换 | 依赖代际、旧运行收尾、事务可见性、清理顺序 |
-| PF4J 单独使用 | JAR 加载、插件生命周期 | 消费方重激活、收尾顺序、配置类型边界、失败卸载的重试语义 |
-| OSGi | 完整的模块化规范与服务动态性 | 引入整套 OSGi 体系；Knotra 不是 OSGi 实现，只聚焦动态组合这一层 |
-| Spring 等 DI 容器 | 静态装配、作用域管理 | 运行中结构变更不是一等模型，热替换与 ClassLoader 回收不在核心承诺 |
-| **Knotra** | 运行期组件替换、依赖重激活、资源可逆、插件真卸载 | DI/AOP、插件市场、分布式协调等明确不做（见[非目标](#非目标)） |
+Knotra 把 Context、Capability、Activation、依赖代际和资源所有权作为一等运行时结构管理，而不是把这些责任留给普通注册表或 `start()/stop()` 回调。
 
 ## 快速开始
 
-当前版本需在本地 reactor 内引用，或先 `mvn install` 到本机 Maven 缓存：
+当前版本需在同一个 Maven reactor 内引用，或先执行 `mvn install`：
 
 ```xml
 <dependency>
@@ -51,32 +33,34 @@
 </dependency>
 ```
 
-一个最小的完整例子：定义一个服务合约、一个消费它的组件，然后替换提供方，观察组件自动重启。
+下面定义一个消费 `Greeting` 的无配置组件，发布 v1 provider，再用原子事务替换为 v2：
 
 ```java
 import io.knotra.*;
 import java.util.concurrent.TimeUnit;
 
-public class Demo {
-    public interface Greeting { String greet(String name); }
+public final class Demo {
+    interface Greeting {
+        String greet(String name);
+    }
 
     static final CapabilityKey<Greeting> GREETING =
             CapabilityKey.of("app.greeting", Greeting.class);
 
-    // 消费方：声明 REQUIRED 依赖，每次启动绑定当前这一代提供方
-    static final class GreetingFactory implements ComponentFactory<NoConfig> {
-        @Override public String factoryId() { return "greeter"; }
-
-        @Override public Component<NoConfig> create() {
+    static final class GreeterFactory implements ComponentFactory<NoConfig> {
+        @Override
+        public Component<NoConfig> create() {
             return new Component<>() {
-                @Override public ComponentDescriptor descriptor() {
-                    return ComponentDescriptor.of("greeter",
+                @Override
+                public ComponentDescriptor descriptor() {
+                    return ComponentDescriptor.of(
                             CapabilityRequirement.required(GREETING));
                 }
 
-                @Override public void start(ActivationContext context, NoConfig config) {
+                @Override
+                public void start(ActivationContext context, NoConfig config) {
                     Greeting greeting = context.require(GREETING);
-                    System.out.println("greeter bound to: " + greeting.greet("world"));
+                    System.out.println(greeting.greet("world"));
                 }
             };
         }
@@ -84,334 +68,276 @@ public class Demo {
 
     public static void main(String[] args) throws Exception {
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
-            // 1. 发布 v1 提供方
-            MutationResult<RegistrationHandle> v1 = runtime.mutate(tx ->
-                    tx.provide(runtime.rootContext(), GREETING,
-                            name -> "v1: hello " + name));
+            RegistrationHandle v1 = runtime.provide(
+                    GREETING, name -> "v1: hello " + name);
 
-            // 2. 挂载消费方，等待它完成第一次启动
-            MutationResult<ComponentHandle<NoConfig>> mounted = runtime.mutate(tx ->
-                    tx.mount(runtime.rootContext(), "greeter",
-                            new GreetingFactory(), NoConfig.INSTANCE));
-            mounted.value().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            // 无配置 mount 不需要传 NoConfig.INSTANCE。
+            ComponentHandle<NoConfig> greeter =
+                    runtime.mount("greeter", new GreeterFactory());
+            greeter.whenSettled().toCompletableFuture()
+                    .get(10, TimeUnit.SECONDS);
 
-            // 3. 替换提供方：消费方自动收尾旧运行，再绑定 v2 重新启动
-            runtime.mutate(tx -> {
-                tx.revoke(v1.value());
-                return tx.provide(runtime.rootContext(), GREETING,
+            runtime.transact(tx -> {
+                tx.revoke(v1);
+                return tx.provide(
+                        runtime.root(),
+                        GREETING,
                         name -> "v2: bonjour " + name);
             });
-            mounted.value().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            greeter.whenSettled().toCompletableFuture()
+                    .get(10, TimeUnit.SECONDS);
         }
     }
 }
 ```
 
-控制台输出：
+输出：
 
 ```text
-greeter bound to: v1: hello world
-greeter bound to: v2: bonjour world
+v1: hello world
+v2: bonjour world
 ```
 
-第二行没有任何手动重启代码——这就是 Knotra 的核心价值。完整场景（插件 JAR 从 v1 升级到 v2、旧任务收尾、ClassLoader 回收）见[实战案例](<docs/Knotra 实战案例：动态物流路由系统.md>)。
+替换 provider 后没有手工重启代码。Runtime 会先停止绑定旧 registration 的消费方，逆序清理其 Activation 资源，再绑定新 registration 启动下一代 Activation。
 
-## 架构总览
+## 默认路径与专家路径
 
-```mermaid
-flowchart TB
-    HOST["宿主应用"]
-    LOADER["knotra-loader（声明式装配，可选）"]
-    ADAPTER["knotra-pf4j（插件边界，可选）"]
-    EVENTS["knotra-events（类型化事件，可选）"]
-    CORE["knotra-core：Context 树 · Capability · Activation 事务 · LifecycleScope · Snapshot"]
-    PLUGINS["PF4J 插件 JAR"]
+单个根 Context 操作使用 Runtime convenience：
 
-    HOST -->|"mutate() / snapshot()"| CORE
-    LOADER --> CORE
-    ADAPTER --> CORE
-    EVENTS -->|"普通 Capability，无内核特权"| CORE
-    PLUGINS --> ADAPTER
+```java
+RegistrationHandle registration = runtime.provide(KEY, value);
+ComponentHandle<AppConfig> app = runtime.mount("app", factory, config);
+ComponentHandle<NoConfig> metrics = runtime.mount("metrics", metricsFactory);
 ```
 
-可选模块按需引入：最小宿主只需要 `knotra-core`；需要事件加 `knotra-events`；需要插件加 `knotra-pf4j` 与 SPI；需要声明式装配加 `knotra-loader`。
+多个结构修改需要原子提交时使用 `transact`：
+
+```java
+TransactionReceipt<RegistrationHandle> receipt = runtime.transact(tx -> {
+    tx.revoke(oldRegistration);
+    tx.mount(runtime.root(), "worker", workerFactory);
+    return tx.provide(runtime.root(), SERVICE, replacement);
+});
+
+receipt.settlement().toCompletableFuture().join();
+```
+
+事务成功才返回 `TransactionReceipt`。配置拒绝、slot 冲突或非法生命周期操作会抛出 `TransactionRejectedException`，异常携带 `List<RuntimeDiagnostic>`；即使调用方忽略返回值，也不会静默丢失失败。
+
+`settlement()` 只等待该事务直接触发的过渡，不表示 Runtime 全局静止。观察特定组件使用 `ComponentHandle.whenSettled()`。
 
 ## 一分钟理解模型
 
-| 概念 | 是什么 |
+| 概念 | 含义 |
 |---|---|
-| `Context` | 可见范围。一棵树，子 Context 能看到父 Context 发布的服务，也可以发布自己的实现遮蔽父级 |
-| `Capability` | 类型化的服务合约。运行时按“哪一次注册”追踪依赖，而不是按对象相等 |
-| `ComponentHandle` | 稳定的挂载点。逻辑身份不变，每次启动产生一次新的运行 |
-| `Activation` | 一次可回滚的运行。先绑定依赖、再执行启动代码，成功后才对外可见，失败自动撤销 |
-| `LifecycleScope` | 资源清单。组件打开的连接、订阅、后台任务都登记在这里，销毁时按逆序回收，失败的条目可以重试 |
+| `Context` | Capability 可见范围。子 Context 能看到父级注册，也可以用本地注册遮蔽父级 |
+| `CapabilityKey<T>` | 名称与 JVM 合约类型组成的服务身份；依赖按 registration 代际跟踪 |
+| `ComponentHandle<C>` | 跨多次 Activation 保持稳定的逻辑挂载点 |
+| `Activation` | 组件按固定 BindingSet 运行的一代实例；启动失败或 stale 会回滚 |
+| `LifecycleScope` | Activation 拥有的资源树，默认确定性 LIFO 清理，失败条目可重试 |
+| `TransactionReceipt` | 已成功提交的结构代际、返回值和直接 settlement |
 
-替换一个服务时，运行时会自动找到绑定旧注册的组件：旧运行先收尾，然后按新注册重新启动。新组件在启动成功前对别人不可见，启动失败就整体回滚，不会留下半成品。
+组件依赖必须预先声明：
 
-## 术语表
+```java
+ComponentDescriptor.of(
+        CapabilityRequirement.required(DATABASE),
+        CapabilityRequirement.optional(METRICS));
+```
 
-| 术语 | 含义 |
-|---|---|
-| 宿主（host） | 嵌入 Knotra 的那个常驻 JVM 应用。它创建 `KnotraRuntime`、发起结构事务、决定何时关闭——通常就是你的 main 程序或 Spring Boot 应用 |
-| artifact / 插件 JAR | 同一个东西：被 PF4J 适配器管理的一个插件 JAR。运行时 `artifactId` 来自插件描述符的 `Plugin-Id` |
-| PF4J | 轻量 Java 插件框架，负责插件 JAR 的加载与生命周期。Knotra 的 `knotra-pf4j` 只把它当作 artifact 边界 |
-| OSGi | Java 最早的模块化运行时规范，体系完整但重量级。Knotra 不是 OSGi 实现，只做动态组合这一层 |
-| Activation（激活） | 组件按某一代依赖绑定的一次运行。依赖或配置变化会产生新的 Activation |
-| generation（代际） | Runtime 结构的全局版本号，每次成功事务递增 |
-| settle（收敛） | 一次过渡完成并稳定到某个状态；`whenSettled()` 等待的就是它 |
-| BindingSet（绑定集） | 组件一次 Activation 固定绑定的那组注册，按注册身份追踪 |
-| drain（排空） | 卸载前等待在途工作收尾、按依赖顺序清理资源的过程 |
+`ActivationContext.require/find` 只能访问 descriptor 声明的 key。宿主读取使用唯一入口 `runtime.root().view()` 或其他 `ContextHandle.view()`；读取不会建立依赖绑定。
 
-## 文档
+## 配置边界
 
-- 想看完整故事：[实战案例：动态物流路由系统](<docs/Knotra 实战案例：动态物流路由系统.md>)——仓库级能力覆盖、依赖重激活、插件排空卸载。
-- 要写代码：[API 与集成指南](<docs/Knotra API 与集成指南.md>)——公开 API、模块依赖、宿主事务、EventBus、PF4J 与 Loader 接入。
-- 想弄懂语义：[运行时设计文档](<docs/Knotra 运行时设计文档.md>)——Context、Capability、Activation、LifecycleScope、依赖图和失败恢复的详细语义。
-- 遇到问题排障：[FAQ 与排障指南](<docs/Knotra FAQ 与排障指南.md>)——按症状组织的排查流程，附状态速查与全部诊断码对照表。
-- 要做插件 JAR：[插件工程化手册](<docs/Knotra 插件工程化手册.md>)——从空 Maven 工程到可加载插件 JAR 的完整步骤。
-- 要上生产：[线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)——回调线程、阻塞边界、Spring 共存、监控接线与容量边界。
-- 要写测试：[测试指南](<docs/Knotra 测试指南.md>)——依赖替换、清理失败、drain 竞态、ClassLoader 回收怎么测。
+Core 的配置是强类型的。`ComponentFactory<C>` 可以校验并归一化同一个 `C`：
+
+```java
+public final class ToolFactory implements ComponentFactory<ToolConfig> {
+    @Override
+    public ToolConfig normalizeConfig(ToolConfig config) {
+        if (config.command().isBlank()) {
+            throw new IllegalArgumentException("command must not be blank");
+        }
+        return new ToolConfig(config.command().trim(), config.timeoutSeconds());
+    }
+
+    @Override
+    public Component<ToolConfig> create() {
+        return new ToolComponent();
+    }
+}
+```
+
+Map、JSON tree 或配置文件节点不属于 Core mount 类型。Loader 和 PF4J export 使用 `ConfigDecoder<C>` 在集成边界把 raw 值转换成 `C`，之后才进入 Core。这样直接调用保持编译期类型安全，声明式装配仍可接受外部配置形态。
+
+配置归一化抛错或返回 null 时使用稳定诊断码 `INVALID_CONFIG`。
+
+## 生命周期与资源
+
+同步资源、同步动作、异步动作和异步资源分别登记：
+
+```java
+Connection connection = context.lifecycle()
+        .manage("database", openConnection());
+context.lifecycle().onClose("flush", this::flush);
+context.lifecycle().onCloseAsync("worker", this::stopWorkerAsync);
+
+EventSubscription subscription = bus.subscribe(EVENT, listener);
+context.lifecycle().manageAsync("listener", subscription);
+```
+
+`AsyncCloseable` 资源可直接交给 `manageAsync`。串行 scope 按全局 LIFO 清理；显式 `parallelChild` 的直属条目并发清理。
+
+组件动作均明确使用异步后缀：
+
+```java
+handle.reconfigureAsync(newConfig);
+handle.retryAsync();
+handle.disposeAsync();
+```
+
+启动或清理失败结算为 `ComponentState.FAILED`，保留诊断与可重试现场。`ComponentHandle.close()` 会阻塞等待清理，最终不是 `DISPOSED` 时抛出异常，不会静默接受失败。
+
+## EventBus
+
+添加 `knotra-events` 后，将 `EventBusFactory` 作为普通组件挂载：
+
+```java
+ComponentHandle<NoConfig> provider =
+        runtime.mount("event-bus", new EventBusFactory());
+provider.whenSettled().toCompletableFuture().join();
+```
+
+事件 mode 编码在 definition 的静态类型里，只声明一次：
+
+```java
+static final EventDefinition.Serial<JobFinished> JOB_FINISHED =
+        EventDefinition.serial(JobFinished.class);
+
+EventBus bus = context.require(EventCapabilities.EVENT_BUS);
+EventSubscription subscription = bus.subscribe(JOB_FINISHED, event -> {
+    persist(event);
+    return CompletableFuture.completedFuture(true);
+});
+context.lifecycle().manageAsync("job-finished", subscription);
+
+EventDispatch<JobFinished> report = bus.dispatch(JOB_FINISHED, event)
+        .toCompletableFuture()
+        .join();
+```
+
+`Sync`、`Parallel`、`Serial`、`Bail` 和 `Waterfall` 是不同 definition 类型。`subscribe` 与 `dispatch` 通过 overload 推断正确 listener，无法把 serial definition 传给 parallel dispatch。
+
+Listener 失败进入 `EventDispatch.failures()`；accepted dispatch、subscription close 与 bus close 仍遵循排空语义。
+
+## PF4J 与 Loader
+
+插件导出共享配置 token、raw decoder 和类型化 factory：
+
+```java
+@Extension
+public final class ToolProvider implements RuntimeComponentProvider {
+    @Override
+    public Collection<ExportedComponentFactory<?>> factories() {
+        return List.of(ExportedComponentFactory.of(
+                ToolConfig.class,
+                raw -> decodeToolConfig(raw),
+                new ToolFactory()));
+    }
+}
+```
+
+宿主可以直接类型化挂载：
+
+```java
+try (Pf4jArtifactAdapter plugins = Pf4jArtifactAdapter.create(
+        Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
+
+    plugins.loadArtifact(Path.of("plugins/tool.jar"));
+
+    ArtifactFactoryHandle<ToolConfig> factory = plugins.factories()
+            .resolve("tool", ToolConfig.class)
+            .orElseThrow();
+    ToolConfig config = factory.decodeConfig(rawConfig);
+    ComponentHandle<ToolConfig> tool =
+            factory.mount(runtime.root(), "tool", config);
+}
+```
+
+工厂目录只有一个入口 `plugins.factories()`：
+
+- `list()` / `find(id)` 返回只读文本元数据。
+- `resolve(id)` 返回 wildcard executable handle，供官方桥接安全捕获泛型。
+- `resolve(id, Class<C>)` 返回宿主直接使用的类型化 handle。
+
+声明式装配使用 `knotra-loader` 与官方 `knotra-pf4j-loader`：
+
+```java
+try (KnotraLoader loader = KnotraLoader.over(
+        runtime,
+        runtime.root(),
+        Pf4jFactoryResolver.of(plugins))) {
+
+    loader.reconcile(ComponentTree.of(
+            ComponentEntry.configured(
+                    "tools/main", FactoryRef.of("tool", "1.0.0"), rawConfig),
+            ComponentEntry.of(
+                    "metrics", FactoryRef.of("metrics", "1.0.0"))))
+            .requireConverged();
+}
+```
+
+桥接负责 factory 版本匹配、decoder、实现 fingerprint、泛型捕获和受控槽位挂载。宿主不再编写 `Class<C>` 映射、unchecked cast 或 fingerprint 拼接。需要 classpath fallback 时使用：
+
+```java
+ComponentFactoryResolver resolver = Pf4jFactoryResolver.withFallbacks(
+        plugins, classpathResolver);
+```
+
+Loader 的 `reconcile` 返回时相关条目已 settle，但 settle 不等于 `ACTIVE`：必需依赖缺失可以是 `WAITING`。`requireConverged()` 验证 desired state 无诊断，不把合法的 `WAITING` 错当成异常。
+
+## 可观测性
+
+`runtime.snapshot()`、`loader.snapshot()`、artifact snapshot 和 EventBus snapshot 都是不可变 DTO，不引用 component、listener、provider value、Throwable、Class 或 ClassLoader。长期保存 Snapshot 不会阻止插件卸载后的 ClassLoader 回收。
+
+诊断消费者应匹配稳定枚举，不要匹配 message 文本：
+
+```java
+runtime.snapshot().diagnostics().stream()
+        .filter(item -> item.code() == DiagnosticCode.CLEANUP_FAILED)
+        .forEach(this::alert);
+```
 
 ## 模块
 
-| 模块 | 职责 | 运行时依赖 | 测试 |
-|---|---|---|---|
-| `knotra-core` | Runtime 内核：Context、Capability、ComponentHandle、Activation、LifecycleScope、Snapshot | 无 | 96 |
-| `knotra-events` | 作为普通 Capability 发布的类型化 EventBus | `knotra-core` | 44 |
-| `knotra-pf4j-spi` | 由 PF4J artifact 实现的共享提供方 SPI | `knotra-core`、PF4J（provided 作用域） | - |
-| `knotra-pf4j` | PF4J artifact 适配器：加载/启动、类型化受控挂载、只读工厂目录、drain、卸载、ClassLoader 防护 | `knotra-core`、`knotra-pf4j-spi`、PF4J、ASM | 37 |
-| `knotra-loader` | 基于 Core 的声明式期望状态收敛 | `knotra-core` | 36 |
-| `knotra-integration-tests` | 跨模块真实测试样例验证（仅测试，不发布） | 所有模块（测试作用域） | 14 |
+| 模块 | 职责 | 编译依赖 |
+|---|---|---|
+| `knotra-core` | Context、Capability、事务、Activation、LifecycleScope、Snapshot | 无运行时依赖 |
+| `knotra-events` | 类型化、可排空的 EventBus | Core |
+| `knotra-pf4j-spi` | 插件导出的共享 factory/decoder SPI | Core、PF4J provided |
+| `knotra-pf4j` | artifact 加载、目录、受控挂载、drain、ClassLoader 防护 | Core、SPI、PF4J、ASM |
+| `knotra-loader` | desired component tree reconcile | Core |
+| `knotra-pf4j-loader` | PF4J catalog 到 Loader resolver 的官方桥接 | Loader、PF4J |
+| `knotra-integration-tests` | 真实插件 JAR 与跨模块验证，仅测试 | 全部模块 |
 
-## 深入设计
+## 文档
 
-以下每节回答一个具体问题：先说清这东西解决什么，再给用法，最后点出关键规则。完整语义在链接的文档里，不在首页堆满。
-
-### 核心模型
-
-运行时由五层组成：
-
-1. **Context** 定义可见性。Context 是树中的一个节点；每个 Context 可以看到发布在自身及其祖先中的 Capability，子 Context 可以遮蔽父 Context 中的 Capability，直到子注册被撤销。
-2. **Capability** 是类型化的命名值（`CapabilityKey<T>`）。注册由注册身份标识，而不是由对象相等性标识；即使用相等的值替换提供方，也会为消费方产生新的绑定代际。
-3. **ComponentHandle** 是稳定的逻辑挂载点。`ComponentHandle` 拥有一个挂载 ID（`contextId + mountId`），并跨多次重新激活保持不变；该句柄的每次启动都会创建新的 `Activation`。
-4. **Activation** 是组件的一次事务化执行。依赖需求会被解析为固定的 `BindingSet`；用户 `start()` 代码在协调器锁外执行，暂存注册只有在验证成功后才原子发布。过期候选会被回滚，并基于最新代际重试，而不是报告为业务失败。
-5. **LifecycleScope** 拥有可逆资源。LifecycleScope 按 LIFO 顺序组成树（必要时使用显式并行组）；释放是异步且聚合的，清理失败的条目会保持可重试，并可通过 `ComponentHandle.retry()` 重试。
-
-组件预先声明依赖需求，并在启动时收到 `ActivationContext`：
-
-```java
-public interface Component<C> {
-    ComponentDescriptor descriptor();
-
-    void start(ActivationContext context, C config) throws Exception;
-}
-```
-
-`REQUIRED` 绑定会在所绑定的注册变化时重新激活消费方；`OPTIONAL` 绑定也属于同一个 `BindingSet`，因此可选提供方出现或消失同样会产生新的 Activation。Capability 合约类型在 Runtime 生命周期内按名称固定。
-
-### 组件状态机
-
-组件挂载点（`ComponentHandle`）在 Runtime 中遵循明确的状态流转。启动代码在锁外异步执行，依赖变更或失败均有确定性的状态边界：
-
-```mermaid
-stateDiagram-v2
-    [*] --> WAITING: mount / 依赖待满足
-    WAITING --> STARTING: 必需依赖就绪
-    STARTING --> ACTIVE: start 成功 & 乐观验证通过
-    STARTING --> WAITING: 启动期依赖变化 (Stale 回滚重试)
-    STARTING --> FAILED: 启动异常 / 依赖环路
-    
-    ACTIVE --> STOPPING: 依赖变更 / 重配置 / 收到卸载
-    
-    STOPPING --> WAITING: 清理完成 (目标为 RUNNING, 自动重激活)
-    STOPPING --> DISPOSED: 清理完成 (目标为 DISPOSED)
-    STOPPING --> FAILED: 资源清理失败 (保留现场可重试)
-    
-    FAILED --> WAITING: retry 清理成功
-    FAILED --> STARTING: retry 重新启动
-    FAILED --> DISPOSED: 放弃并销毁
-    
-    DISPOSED --> [*]
-```
-
-### 依赖重激活与优雅收尾时序
-
-当依赖的服务提供方发生替换时，Knotra 确保消费方先优雅收尾，再绑定新提供方重新启动，避免在途请求损坏或带过期状态运行：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Host as 宿主 (Host)
-    participant Core as 运行时 (Knotra Core)
-    participant Consumer as 消费方组件 (Consumer)
-    participant Provider as 服务提供方 (Provider)
-
-    Note over Consumer,Provider: 初始：Consumer 绑定 Provider(v1)，均为 ACTIVE
-    Host->>Core: runtime.mutate(revoke(v1), provide(v2))
-    activate Core
-    Core->>Core: 计算受影响闭包：发现 Consumer 依赖旧 v1
-    Core->>Consumer: 标记为 STOPPING，触发优雅收尾
-    deactivate Core
-    
-    activate Consumer
-    Consumer->>Consumer: LifecycleScope 逆序释放资源 / 排空在途请求
-    Consumer-->>Core: 清理完成 (Consumer 进入 WAITING)
-    deactivate Consumer
-
-    Core->>Provider: 释放旧 v1 底层资源 (确保无存活引用)
-    Core->>Core: 原子发布 v2，生成新 Generation
-
-    Note over Core,Consumer: 自动 Reconcile：新依赖 v2 已就绪
-    Core->>Consumer: 创建新 Activation (代际+1, 绑定 v2)
-    activate Consumer
-    Consumer->>Consumer: 锁外执行 start(context, config)
-    Consumer-->>Core: start 成功，提交暂存注册
-    deactivate Consumer
-    
-    Core->>Core: 乐观校验通过，Consumer 切换为 ACTIVE
-    Core-->>Host: 事务收敛完成 (whenSettled 达成)
-```
-
-### 宿主事务
-
-宿主不会通过共享可变对象修改 Runtime。结构调整通过短事务完成；事务被拒绝时不会发布任何内容：
-
-```java
-try (KnotraRuntime runtime = KnotraRuntime.create()) {
-    CapabilityKey<Shell> SHELL = CapabilityKey.of("app.shell", Shell.class);
-
-    MutationResult<ComponentHandle<AppConfig>> result = runtime.mutate(tx ->
-            tx.mount(runtime.rootContext(), "app", new AppComponentFactory(), new AppConfig()));
-    if (!result.committed()) {
-        throw new IllegalStateException(result.diagnostics().toString());
-    }
-    ComponentHandle<AppConfig> app = result.value();
-    app.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
-
-    // 宿主提供的 capability 通过同一个事务接口撤销
-    MutationResult<RegistrationHandle> shell =
-            runtime.mutate(tx -> tx.provide(runtime.rootContext(), SHELL, defaultShell()));
-    runtime.mutate(tx -> {
-        tx.revoke(shell.value());
-        return null;
-    });
-}
-```
-
-读取通过 `RuntimeContext`（`require`、`find`、`info`）和 `RuntimeSnapshot` 完成；二者都不会暴露存活的组件实例、资源、释放器、`Throwable`、`Class` 或 `ClassLoader`。
-
-### 事件
-
-组件之间怎么通信？Knotra 的答案是一个事件组件。它不是内核的特权部件，和路由规则、HTTP 客户端一样，是个普通的可挂载组件。
-
-先挂载事件总线，之后 `EventBus` 就成了一个可以 require 的普通能力：
-
-```java
-MutationResult<ComponentHandle<NoConfig>> bus = runtime.mutate(tx ->
-        tx.mount(runtime.rootContext(), "event-bus",
-                new EventBusFactory(), NoConfig.INSTANCE));
-bus.value().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
-```
-
-然后消费方订阅事件。看两处：依赖要在 descriptor 里声明（和依赖任何其他能力一样）；订阅是资源，交给 lifecycle 托管——组件停止时，运行时会先等在途事件处理完，再关闭订阅：
-
-```java
-EventBus bus = context.require(EventCapabilities.EVENT_BUS);
-EventDefinition<JobFinished> JOB_FINISHED =
-        EventDefinition.serial(EventKey.of(JobFinished.class));
-
-EventSubscription subscription = bus.onSerial(JOB_FINISHED, event -> {
-    persist(event);
-    return CompletableFuture.completedFuture(true);   // 返回 stage，分发链保持异步
-});
-context.lifecycle().manageAsync("job-listener", subscription::closeAsync);
-```
-
-两条规则先记住：事件的身份是精确的 JVM `Class`，两个插件里同名的类是两个不同事件；关闭是收尾式的——`closeAsync()` 等已接受的事件处理完、拒绝新事件，不丢在途的，也不假装成功。
-
-### PF4J Artifact 边界
-
-这一节回答一个问题：插件 JAR 里的组件，怎么进入运行时？
-
-分工是这样的：PF4J 负责 JAR 的加载与卸载，Knotra 负责组件的挂载与清理，`knotra-pf4j` 适配器站在中间。加载插件后，适配器不直接挂载任何组件，只发布一个类型化的工厂目录；宿主从目录解析工厂，再显式挂载：
-
-```java
-try (KnotraRuntime runtime = KnotraRuntime.create();
-     Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
-             Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
-
-    adapter.loadArtifact(Path.of("plugins/tool-1.0.0.jar")).join();
-
-    ArtifactFactoryHandle<ToolConfig> factory =
-            adapter.resolver().resolve("tool", ToolConfig.class).orElseThrow();
-    ComponentHandle<ToolConfig> tool =
-            factory.mount(runtime.rootContext(), "tool", new ToolConfig());
-
-    adapter.unloadArtifact("tool-plugin").join();   // 先排空这个插件拥有的挂载
-}
-```
-
-为什么要经过工厂目录这一层？为了边界。不带配置类型的查询只能看到元数据（工厂名、配置类型名），不能挂载；想挂载，必须给出正确的配置类型。类型不对，解析时就失败；就算用 raw cast 硬塞，组件启动前还会被再拦一次。
-
-卸载是这一节真正值钱的语义。`unloadArtifact` 的顺序是：停止新挂载 → 等在途挂载收尾 → 按"下游先走"清理这个插件创建的全部组件 → 停止并卸载 PF4J 插件 → 释放 ClassLoader。中途失败则进入 `DRAIN_FAILED`，保留现场，修复后 `retryDrain` 从断点继续。适配器不会伪造一次成功的卸载。
-
-怎么从零打出一个能被加载的插件 JAR，见[插件工程化手册](<docs/Knotra 插件工程化手册.md>)。
-
-### Loader
-
-前面都是"宿主手动挂载"。组件多了以后，手动管理很脆弱：哪个组件该在哪个范围、用哪个版本、配什么参数，散落在调用代码里。Loader 解决这个问题：描述一棵期望的组件树，它把运行时收敛成这棵树。
-
-```java
-FactoryRef ref = FactoryRef.of("tool", "1.0.0");
-ComponentFactoryResolver classpath = ClasspathComponentFactoryResolver.builder()
-        .add(ref, new ToolComponentFactory())
-        .build();
-
-try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), classpath)) {
-    ReconcileResult result = loader.reconcile(ComponentTree.of(
-            ComponentEntry.of("tools/tool", ref, new ToolConfig())));
-    if (!result.converged()) {
-        result.diagnostics().forEach(d -> log.warn("{}: {}", d.path(), d.message()));
-    }
-}
-```
-
-`reconcile` 做三件事：树上多的，新增；树上少的，递归释放；配置或实现版本变了的，替换。任何一步失败，整批回滚，不会留半个挂载。路径就是归属：每个条目路径对应一个专属子 Context（名字取最后一段），mountId 是完整路径；嵌套路径要求父条目存在，兄弟条目共享同一个父 Context。
-
-插件工厂怎么接进 Loader（typed bridge）属于进阶内容，完整代码见[API 与集成指南](<docs/Knotra API 与集成指南.md>)。
-
-### Snapshot 与诊断
-
-运行中的系统必须能被观察。Knotra 的答案是不可变快照：随时调用 `runtime.snapshot()`，拿到当前结构的完整拷贝——有哪些 Context 和组件、每个组件绑定的是哪一次注册、哪些清理失败了、诊断码是什么。适配器和 Loader 各有自己的快照，规则相同。
-
-关键设计是快照只含数据，不引用任何活对象。拿着一份快照，不会阻止已卸载插件的 ClassLoader 被回收。诊断码是稳定枚举（`MISSING_CAPABILITY`、`CLEANUP_FAILED` 等），直接按码接告警，不要匹配消息文本。
-
-### ClassLoader 合约
-
-插件卸载之后，JVM 什么时候真正回收它的类？条件只有一个：没有人再引用它的 ClassLoader。Knotra 用四条规则保证运行时自己是干净的：
-
-- `knotra-core` 和 `knotra-loader` 完全不知道 PF4J 的存在，这条边界由构建工具强制。
-- 合约类型（`io.knotra`、`io.knotra.pf4j.spi`、`org.pf4j` 等）永远从宿主加载；插件私有的同名类不算同一个类型。
-- 卸载成功和加载失败回滚，都会让插件 ClassLoader 变为弱可达，两条路径都有 GC 测试断言。
-- 最后一段责任在业务代码：宿主自己保存了插件对象的话，运行时无能为力。
+- [API 与集成指南](<docs/Knotra API 与集成指南.md>)：公开接口、失败语义与完整组合示例。
+- [运行时设计文档](<docs/Knotra 运行时设计文档.md>)：Context、BindingSet、Activation、事务提交与清理状态机。
+- [实战案例：动态物流路由系统](<docs/Knotra 实战案例：动态物流路由系统.md>)：插件升级、旧任务排空和 ClassLoader 回收。
+- [插件工程化手册](<docs/Knotra 插件工程化手册.md>)：从 Maven 工程到可加载 artifact。
+- [线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)：回调线程、阻塞边界、关闭顺序和监控。
+- [测试指南](<docs/Knotra 测试指南.md>)：依赖替换、清理失败、drain 竞态和 GC 测试。
+- [FAQ 与排障指南](<docs/Knotra FAQ 与排障指南.md>)：按状态与诊断码排查。
+- [公开 API 重构设计](<docs/20260821 Knotra 公开 API 重构设计文档.md>)：本次破坏性 API 重构的边界、机制与验证要求。
 
 ## 非目标
 
-以下事情 Knotra 明确不做，避免预期错位：
-
-- 不提供通用 DI 容器、AOP、代理拦截或 Spring 兼容层。
-- 不自研插件仓库、插件市场、版本解析 UI 或远程安装协议。
-- 不做分布式协调、跨进程一致性或多 JVM 热替换。
-- 不做安全隔离：无插件权限模型、代码签名校验或资源配额，只应加载可信来源的插件 JAR。
-- Loader 不监听文件系统；期望状态由调用方显式提交。
-- 配置没有全局文件格式；每个工厂通过 `ConfigSchema` 归一化自己的配置。
-- 不提供 Cordis 兼容 API 或旧版本共存迁移。
-
-## 限制
-
-- `stop()` 或 `unload()` 失败的 PF4J 插件会留下 `DRAIN_FAILED` 或残余诊断，必须重试；最坏情况下需要重启 JVM 恢复。适配器不会伪造成功的卸载。
-- ClassLoader 回收在测试中通过弱引用和显式 GC 验证；生产环境中的回收仍取决于没有其他对象持有该 ClassLoader。
-- Artifact 类型化挂载拒绝 null 配置；工厂声明没有配置时使用 `NoConfig.INSTANCE`。
+- 不提供通用 DI、AOP 或 Spring 替代品。
+- 不做分布式协调或跨 JVM 热替换。
+- 不提供插件权限沙箱、签名校验或资源配额，只应加载可信代码。
+- Loader 不监听文件系统，期望状态由调用方显式提交。
+- 不规定 YAML、JSON 或配置中心格式；raw decode 属于集成边界。
 
 ## 构建与验证
 
@@ -419,14 +345,4 @@ try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.rootContext(), cla
 mvn clean verify
 ```
 
-Maven reactor 会按依赖顺序构建，不需要先执行 `mvn install`。`mvn clean verify` 会运行 227 项测试（Core 96、Events 44、PF4J 适配器 37、Loader 36、跨模块集成 14）。集成模块会构建真实的 PF4J 样例 jar，并只通过公开 API 验证：没有内部强制转换，没有 `Thread.sleep`，没有生产代码后门。
-
-## 贡献
-
-- 需要 Java 21+ 和 Maven 3.9+；提交前请确保 `mvn clean verify` 全绿。
-- 模块依赖边界由 Maven Enforcer 和架构回归测试强制，改动前请先读[运行时设计文档](<docs/Knotra 运行时设计文档.md>)。
-- 行为变更需要同步更新文档与测试；文档与代码在同一仓库，保持一致是合并前提。
-
-## 设计来源
-
-Knotra 的设计参考了 Cordis 运行时模型中的思想；Knotra 是具有自身合约与语义的独立实现。
+当前 reactor 包含 230 项测试：Core 98、Events 44、PF4J 37、Loader 36、跨模块集成 15。集成测试会构建真实 PF4J fixture JAR，并验证官方 Loader bridge、nested tree、配置拒绝、ownership、drain 竞态、并发关闭和 ClassLoader GC。

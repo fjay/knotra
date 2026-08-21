@@ -2,7 +2,6 @@ package io.knotra.events;
 
 import io.knotra.ComponentHandle;
 import io.knotra.KnotraRuntime;
-import io.knotra.MutationResult;
 import io.knotra.NoConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -27,30 +26,26 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @SuppressWarnings("unchecked")
 final class EventBusQuiescenceTest {
-    private static final EventDefinition<TextEvent> SYNC =
-            EventDefinition.sync(EventKey.of(TextEvent.class));
-    private static final EventDefinition<TextEvent> PARALLEL =
-            EventDefinition.parallel(EventKey.of(TextEvent.class));
-    private static final EventDefinition<TextEvent> SERIAL =
-            EventDefinition.serial(EventKey.of(TextEvent.class));
-    private static final EventDefinition<TextEvent> BAIL =
-            EventDefinition.bail(EventKey.of(TextEvent.class));
-    private static final EventDefinition<TextEvent> WATERFALL =
-            EventDefinition.waterfall(EventKey.of(TextEvent.class));
-
+    private static final EventDefinition.Sync<TextEvent> SYNC =
+            EventDefinition.sync(TextEvent.class);
+    private static final EventDefinition.Parallel<TextEvent> PARALLEL =
+            EventDefinition.parallel(TextEvent.class);
+    private static final EventDefinition.Serial<TextEvent> SERIAL =
+            EventDefinition.serial(TextEvent.class);
+    private static final EventDefinition.Bail<TextEvent> BAIL =
+            EventDefinition.bail(TextEvent.class);
+    private static final EventDefinition.Waterfall<TextEvent> WATERFALL =
+            EventDefinition.waterfall(TextEvent.class);
     private KnotraRuntime runtime;
     private EventBus bus;
 
     @BeforeEach
     void setUp() throws Exception {
         runtime = KnotraRuntime.create();
-        MutationResult<ComponentHandle<NoConfig>> result = runtime.mutate(mutation ->
-                mutation.mount(runtime.rootContext(), "event-bus", new EventBusFactory(),
-                        NoConfig.INSTANCE));
-        assertTrue(result.committed(), () -> result.diagnostics().toString());
-        assertEquals(io.knotra.ComponentState.ACTIVE, result.value().whenSettled()
+        ComponentHandle<NoConfig> handle = runtime.mount("event-bus", new EventBusFactory());
+        assertEquals(io.knotra.ComponentState.ACTIVE, handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        bus = runtime.context().require(EventCapabilities.EVENT_BUS);
+        bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
     }
 
     @AfterEach
@@ -62,12 +57,12 @@ final class EventBusQuiescenceTest {
     void unsubscribeIsNonBlockingAndCloseAsyncWaitsAcceptedDispatch() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CompletableFuture<Void> gate = new CompletableFuture<>();
-        EventSubscription subscription = bus.onParallel(PARALLEL, event -> {
+        EventSubscription subscription = bus.subscribe(PARALLEL, event -> {
             started.countDown();
             return gate;
         });
 
-        var dispatch = bus.parallel(PARALLEL, new TextEvent("held"))
+        var dispatch = bus.dispatch(PARALLEL, new TextEvent("held"))
                 .toCompletableFuture();
         assertTrue(started.await(10, TimeUnit.SECONDS));
         subscription.unsubscribe();
@@ -85,12 +80,12 @@ final class EventBusQuiescenceTest {
     @Test
     void callbackCanUnsubscribeItselfWithoutDeadlock() {
         AtomicReference<EventSubscription> reference = new AtomicReference<>();
-        EventSubscription subscription = bus.on(SYNC, event -> {
+        EventSubscription subscription = bus.subscribe(SYNC, event -> {
             reference.get().unsubscribe();
         });
         reference.set(subscription);
 
-        EventDispatch<TextEvent> result = bus.emit(SYNC, new TextEvent("self"));
+        EventDispatch<TextEvent> result = bus.dispatch(SYNC, new TextEvent("self"));
 
         assertTrue(result.successful());
         assertEquals(1, result.completedCount());
@@ -104,13 +99,13 @@ final class EventBusQuiescenceTest {
         CompletableFuture<CompletableFuture<Void>> closing =
                 new CompletableFuture<>();
         EventBus closingBus = new DefaultEventBus();
-        closingBus.onParallel(PARALLEL, event -> {
+        closingBus.subscribe(PARALLEL, event -> {
             started.countDown();
             closing.complete(closingBus.closeAsync().toCompletableFuture());
             return gate;
         });
 
-        var dispatch = closingBus.parallel(PARALLEL, new TextEvent("closing"))
+        var dispatch = closingBus.dispatch(PARALLEL, new TextEvent("closing"))
                 .toCompletableFuture();
         assertTrue(started.await(10, TimeUnit.SECONDS));
         CompletableFuture<Void> closingFuture = closing.get(10, TimeUnit.SECONDS);
@@ -126,12 +121,12 @@ final class EventBusQuiescenceTest {
     void busWhenIdleAndCloseWaitForAcceptedDispatch() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CompletableFuture<Void> gate = new CompletableFuture<>();
-        bus.onParallel(PARALLEL, event -> {
+        bus.subscribe(PARALLEL, event -> {
             started.countDown();
             return gate;
         });
 
-        var dispatch = bus.parallel(PARALLEL, new TextEvent("idle"))
+        var dispatch = bus.dispatch(PARALLEL, new TextEvent("idle"))
                 .toCompletableFuture();
         assertTrue(started.await(10, TimeUnit.SECONDS));
         CompletableFuture<Void> idle = bus.whenIdle().toCompletableFuture();
@@ -154,13 +149,13 @@ final class EventBusQuiescenceTest {
         CompletableFuture<Boolean> gate = new CompletableFuture<>();
         AtomicReference<EventSubscription> first = new AtomicReference<>();
         AtomicReference<EventSubscription> second = new AtomicReference<>();
-        first.set(bus.onSerial(SERIAL, event -> {
+        first.set(bus.subscribe(SERIAL, event -> {
             started.countDown();
             return gate;
         }));
-        second.set(bus.onSerial(SERIAL, event -> CompletableFuture.completedFuture(true)));
+        second.set(bus.subscribe(SERIAL, event -> CompletableFuture.completedFuture(true)));
 
-        var dispatch = bus.serial(SERIAL, new TextEvent("stop"))
+        var dispatch = bus.dispatch(SERIAL, new TextEvent("stop"))
                 .toCompletableFuture();
         assertTrue(started.await(10, TimeUnit.SECONDS));
         CompletableFuture<Void> closing = second.get().closeAsync().toCompletableFuture();
@@ -178,18 +173,18 @@ final class EventBusQuiescenceTest {
         CountDownLatch release = new CountDownLatch(1);
         AtomicReference<EventSubscription> first = new AtomicReference<>();
         AtomicReference<EventSubscription> second = new AtomicReference<>();
-        first.set(bus.onBail(BAIL, event -> {
+        first.set(bus.subscribe(BAIL, event -> {
             started.countDown();
             release.await();
             return true;
         }));
-        second.set(bus.onBail(BAIL, event -> false));
+        second.set(bus.subscribe(BAIL, event -> false));
 
         java.util.concurrent.ExecutorService executor =
                 java.util.concurrent.Executors.newSingleThreadExecutor();
         try {
             var dispatch = CompletableFuture.supplyAsync(() ->
-                            bus.bail(BAIL, new TextEvent("claim")).toCompletableFuture().join(),
+                            bus.dispatch(BAIL, new TextEvent("claim")).toCompletableFuture().join(),
                             executor)
                     .toCompletableFuture();
             assertTrue(started.await(10, TimeUnit.SECONDS));
@@ -213,14 +208,14 @@ final class EventBusQuiescenceTest {
         CompletableFuture<TextEvent> gate = new CompletableFuture<>();
         AtomicReference<EventSubscription> first = new AtomicReference<>();
         AtomicReference<EventSubscription> second = new AtomicReference<>();
-        first.set(bus.onWaterfall(WATERFALL, event -> {
+        first.set(bus.subscribe(WATERFALL, event -> {
             started.countDown();
             return gate;
         }));
-        second.set(bus.onWaterfall(WATERFALL, event ->
+        second.set(bus.subscribe(WATERFALL, event ->
                 CompletableFuture.completedFuture(event)));
 
-        var dispatch = bus.waterfall(WATERFALL, new TextEvent("fail"))
+        var dispatch = bus.dispatch(WATERFALL, new TextEvent("fail"))
                 .toCompletableFuture();
         assertTrue(started.await(10, TimeUnit.SECONDS));
         CompletableFuture<Void> closing = second.get().closeAsync().toCompletableFuture();
@@ -234,12 +229,12 @@ final class EventBusQuiescenceTest {
 
     @Test
     void wrongEventTypeIsRejectedBeforeListenerDispatch() {
-        bus.on(SYNC, event -> fail("listener must not run"));
-        EventDefinition<Object> definition =
-                EventDefinition.sync(EventKey.of((Class<Object>) (Class<?>) TextEvent.class));
+        bus.subscribe(SYNC, event -> fail("listener must not run"));
+        EventDefinition.Sync<Object> definition =
+                EventDefinition.sync((Class<Object>) (Class<?>) TextEvent.class);
 
         assertThrows(ClassCastException.class, () ->
-                bus.emit(definition, new Object()));
+                bus.dispatch(definition, new Object()));
         assertTrue(bus.whenIdle().toCompletableFuture().isDone());
     }
 
@@ -251,20 +246,20 @@ final class EventBusQuiescenceTest {
             Class<?> secondType = secondLoader.loadClass("dynamic.SameName");
             assertNotSame(firstType, secondType);
 
-            EventDefinition<Object> first =
-                    EventDefinition.sync(EventKey.of((Class<Object>) firstType));
-            EventDefinition<Object> second =
-                    EventDefinition.sync(EventKey.of((Class<Object>) secondType));
-            EventSubscription subscription = bus.on(first, event -> {});
+            EventDefinition.Sync<Object> first =
+                    EventDefinition.sync((Class<Object>) firstType);
+            EventDefinition.Sync<Object> second =
+                    EventDefinition.sync((Class<Object>) secondType);
+            EventSubscription subscription = bus.subscribe(first, event -> {});
 
-            assertThrows(IllegalArgumentException.class, () -> bus.on(second, event -> {}));
+            assertThrows(IllegalArgumentException.class, () -> bus.subscribe(second, event -> {}));
             assertThrows(IllegalArgumentException.class, () ->
-                    bus.emit(second, secondType.cast(newInstance(secondType))));
+                    bus.dispatch(second, secondType.cast(newInstance(secondType))));
 
             subscription.unsubscribe();
-            EventSubscription rebound = bus.on(second, event -> {});
+            EventSubscription rebound = bus.subscribe(second, event -> {});
             assertTrue(rebound.active());
-            assertEquals(1, bus.emit(second, secondType.cast(newInstance(secondType)))
+            assertEquals(1, bus.dispatch(second, secondType.cast(newInstance(secondType)))
                     .listenerCount());
             rebound.unsubscribe();
         }
@@ -276,30 +271,30 @@ final class EventBusQuiescenceTest {
              ByteClassLoader secondLoader = new ByteClassLoader()) {
             Class<?> firstType = firstLoader.loadClass("dynamic.SameName");
             Class<?> secondType = secondLoader.loadClass("dynamic.SameName");
-            EventDefinition<Object> first = serialDefinition(firstType);
-            EventDefinition<Object> second = serialDefinition(secondType);
+            EventDefinition.Serial<Object> first = serialDefinition(firstType);
+            EventDefinition.Serial<Object> second = serialDefinition(secondType);
             CountDownLatch entered = new CountDownLatch(1);
             CompletableFuture<Boolean> gate = new CompletableFuture<>();
-            EventSubscription subscription = bus.onSerial(first, event -> {
+            EventSubscription subscription = bus.subscribe(first, event -> {
                 entered.countDown();
                 return gate;
             });
 
-            var held = bus.serial(first, firstType.cast(newInstance(firstType)))
+            var held = bus.dispatch(first, firstType.cast(newInstance(firstType)))
                     .toCompletableFuture();
             assertTrue(entered.await(10, TimeUnit.SECONDS));
             subscription.unsubscribe();
-            assertThrows(IllegalArgumentException.class, () -> bus.onSerial(second, event ->
+            assertThrows(IllegalArgumentException.class, () -> bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true)));
             assertThrows(IllegalArgumentException.class, () ->
-                    bus.serial(second, secondType.cast(newInstance(secondType))));
+                    bus.dispatch(second, secondType.cast(newInstance(secondType))));
 
             CompletableFuture<Void> idle = bus.whenIdle().toCompletableFuture();
             assertFalse(idle.isDone());
             gate.complete(true);
             idle.get(10, TimeUnit.SECONDS);
             assertTrue(held.get(10, TimeUnit.SECONDS).successful());
-            EventSubscription rebound = bus.onSerial(second, event ->
+            EventSubscription rebound = bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true));
             assertTrue(rebound.active());
             rebound.unsubscribe();
@@ -312,25 +307,25 @@ final class EventBusQuiescenceTest {
              ByteClassLoader secondLoader = new ByteClassLoader()) {
             Class<?> firstType = firstLoader.loadClass("dynamic.SameName");
             Class<?> secondType = secondLoader.loadClass("dynamic.SameName");
-            EventDefinition<Object> first = serialDefinition(firstType);
-            EventDefinition<Object> second = serialDefinition(secondType);
+            EventDefinition.Serial<Object> first = serialDefinition(firstType);
+            EventDefinition.Serial<Object> second = serialDefinition(secondType);
             CountDownLatch entered = new CountDownLatch(1);
             CompletableFuture<Boolean> gate = new CompletableFuture<>();
-            EventSubscription subscription = bus.onSerial(first, event -> {
+            EventSubscription subscription = bus.subscribe(first, event -> {
                 entered.countDown();
                 return gate;
             });
 
-            var failed = bus.serial(first, firstType.cast(newInstance(firstType)))
+            var failed = bus.dispatch(first, firstType.cast(newInstance(firstType)))
                     .toCompletableFuture();
             assertTrue(entered.await(10, TimeUnit.SECONDS));
             subscription.unsubscribe();
-            assertThrows(IllegalArgumentException.class, () -> bus.onSerial(second, event ->
+            assertThrows(IllegalArgumentException.class, () -> bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true)));
 
             gate.completeExceptionally(new IllegalStateException("listener failed"));
             assertEquals(1, failed.get(10, TimeUnit.SECONDS).failureCount());
-            EventSubscription rebound = bus.onSerial(second, event ->
+            EventSubscription rebound = bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true));
             assertTrue(rebound.active());
             rebound.unsubscribe();
@@ -343,25 +338,25 @@ final class EventBusQuiescenceTest {
              ByteClassLoader secondLoader = new ByteClassLoader()) {
             Class<?> firstType = firstLoader.loadClass("dynamic.SameName");
             Class<?> secondType = secondLoader.loadClass("dynamic.SameName");
-            EventDefinition<Object> first = serialDefinition(firstType);
-            EventDefinition<Object> second = serialDefinition(secondType);
+            EventDefinition.Serial<Object> first = serialDefinition(firstType);
+            EventDefinition.Serial<Object> second = serialDefinition(secondType);
             CountDownLatch entered = new CountDownLatch(1);
             CompletableFuture<Boolean> gate = new CompletableFuture<>();
-            EventSubscription subscription = bus.onSerial(first, event -> {
+            EventSubscription subscription = bus.subscribe(first, event -> {
                 entered.countDown();
                 return gate;
             });
 
-            var stopped = bus.serial(first, firstType.cast(newInstance(firstType)))
+            var stopped = bus.dispatch(first, firstType.cast(newInstance(firstType)))
                     .toCompletableFuture();
             assertTrue(entered.await(10, TimeUnit.SECONDS));
             subscription.unsubscribe();
-            assertThrows(IllegalArgumentException.class, () -> bus.onSerial(second, event ->
+            assertThrows(IllegalArgumentException.class, () -> bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true)));
 
             gate.complete(false);
             assertTrue(stopped.get(10, TimeUnit.SECONDS).stoppedEarly());
-            EventSubscription rebound = bus.onSerial(second, event ->
+            EventSubscription rebound = bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true));
             assertTrue(rebound.active());
             rebound.unsubscribe();
@@ -375,7 +370,7 @@ final class EventBusQuiescenceTest {
              ByteClassLoader secondLoader = new ByteClassLoader()) {
             Class<?> firstType = firstLoader.loadClass("dynamic.SameName");
             Class<?> secondType = secondLoader.loadClass("dynamic.SameName");
-            EventDefinition<Object> first = serialDefinition(firstType);
+            EventDefinition.Serial<Object> first = serialDefinition(firstType);
             AtomicInteger deliveries = new AtomicInteger();
             ExecutorService executor = Executors.newFixedThreadPool(6);
             try {
@@ -383,12 +378,12 @@ final class EventBusQuiescenceTest {
                 for (int worker = 0; worker < 6; worker++) {
                     workers.add(CompletableFuture.runAsync(() -> {
                         for (int iteration = 0; iteration < 100; iteration++) {
-                            EventSubscription subscription = bus.onSerial(first, event -> {
+                            EventSubscription subscription = bus.subscribe(first, event -> {
                                 deliveries.incrementAndGet();
                                 return CompletableFuture.completedFuture(true);
                             });
                             try {
-                                EventDispatch<Object> dispatch = bus.serial(
+                                EventDispatch<Object> dispatch = bus.dispatch(
                                                 first, firstType.cast(newInstance(firstType)))
                                         .toCompletableFuture().get(10, TimeUnit.SECONDS);
                                 assertTrue(dispatch.successful(), dispatch.toString());
@@ -409,7 +404,7 @@ final class EventBusQuiescenceTest {
 
             bus.whenIdle().toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertTrue(deliveries.get() >= 600);
-            EventSubscription rebound = bus.onSerial(serialDefinition(secondType), event ->
+            EventSubscription rebound = bus.subscribe(serialDefinition(secondType), event ->
                     CompletableFuture.completedFuture(true));
             assertTrue(rebound.active());
             rebound.unsubscribe();
@@ -422,8 +417,8 @@ final class EventBusQuiescenceTest {
         AtomicReference<ClassLoader> callbackLoader = new AtomicReference<>();
         try (ByteClassLoader pluginLoader = new ByteClassLoader()) {
             Class<?> eventType = pluginLoader.loadClass("dynamic.PluginEvent");
-            EventDefinition<Object> definition =
-                    EventDefinition.sync(EventKey.of((Class<Object>) eventType));
+            EventDefinition.Sync<Object> definition =
+                    EventDefinition.sync((Class<Object>) eventType);
             EventListener<Object> listener = (EventListener<Object>) Proxy.newProxyInstance(
                     pluginLoader,
                     new Class<?>[]{EventListener.class},
@@ -432,8 +427,8 @@ final class EventBusQuiescenceTest {
                         return null;
                     });
 
-            EventSubscription subscription = bus.on(definition, listener);
-            bus.emit(definition, eventType.cast(eventType.getDeclaredConstructor().newInstance()));
+            EventSubscription subscription = bus.subscribe(definition, listener);
+            bus.dispatch(definition, eventType.cast(eventType.getDeclaredConstructor().newInstance()));
 
             assertSame(pluginLoader, callbackLoader.get());
             assertSame(host, Thread.currentThread().getContextClassLoader());
@@ -443,11 +438,11 @@ final class EventBusQuiescenceTest {
 
     @Test
     void maliciousFailureTextIsBoundedAndStable() {
-        EventSubscription subscription = bus.on(SYNC, event -> {
+        EventSubscription subscription = bus.subscribe(SYNC, event -> {
             throw new EvilThrowable();
         });
 
-        EventDispatch<TextEvent> result = bus.emit(SYNC, new TextEvent("evil"));
+        EventDispatch<TextEvent> result = bus.dispatch(SYNC, new TextEvent("evil"));
 
         assertEquals(1, result.failureCount());
         assertEquals(EvilThrowable.class.getName(), result.failures().getFirst().message());
@@ -458,14 +453,13 @@ final class EventBusQuiescenceTest {
 
     @Test
     void snapshotIsSortedByNameModeAndSequence() {
-        EventDefinition<AlphaEvent> alpha = EventDefinition.sync(EventKey.of(AlphaEvent.class));
-        EventDefinition<BetaEvent> betaSync = EventDefinition.sync(EventKey.of(BetaEvent.class));
-        EventDefinition<BetaEvent> betaParallel =
-                EventDefinition.parallel(EventKey.of(BetaEvent.class));
-
-        EventSubscription betaFirst = bus.on(betaSync, event -> {});
-        EventSubscription alphaSecond = bus.on(alpha, event -> {});
-        EventSubscription betaThird = bus.onParallel(betaParallel,
+        EventDefinition.Sync<AlphaEvent> alpha = EventDefinition.sync(AlphaEvent.class);
+        EventDefinition.Sync<BetaEvent> betaSync = EventDefinition.sync(BetaEvent.class);
+        EventDefinition.Parallel<BetaEvent> betaParallel =
+                EventDefinition.parallel(BetaEvent.class);
+        EventSubscription betaFirst = bus.subscribe(betaSync, event -> {});
+        EventSubscription alphaSecond = bus.subscribe(alpha, event -> {});
+        EventSubscription betaThird = bus.subscribe(betaParallel,
                 event -> CompletableFuture.completedFuture(null));
 
         List<String> ids = bus.snapshot().subscriptions().stream()
@@ -482,12 +476,12 @@ final class EventBusQuiescenceTest {
             EventBus cycleBus = new DefaultEventBus();
             CountDownLatch started = new CountDownLatch(1);
             CompletableFuture<Void> gate = new CompletableFuture<>();
-            EventSubscription subscription = cycleBus.onParallel(PARALLEL, event -> {
+            EventSubscription subscription = cycleBus.subscribe(PARALLEL, event -> {
                 started.countDown();
                 return gate;
             });
 
-            var dispatch = cycleBus.parallel(PARALLEL, new TextEvent("cycle-" + cycle))
+            var dispatch = cycleBus.dispatch(PARALLEL, new TextEvent("cycle-" + cycle))
                     .toCompletableFuture();
             assertTrue(started.await(10, TimeUnit.SECONDS));
             CompletableFuture<Void> subscriptionClose =
@@ -515,15 +509,15 @@ final class EventBusQuiescenceTest {
         EventBus bus = new DefaultEventBus();
         ByteClassLoader loader = new ByteClassLoader();
         Class<?> eventType = loadClass(loader, "dynamic.RecycledEvent");
-        EventDefinition<Object> definition =
-                EventDefinition.sync(EventKey.of((Class<Object>) eventType));
+        EventDefinition.Sync<Object> definition =
+                EventDefinition.sync((Class<Object>) eventType);
         EventListener<Object> listener = (EventListener<Object>) Proxy.newProxyInstance(
                 loader,
                 new Class<?>[]{EventListener.class},
                 (proxy, method, args) -> null);
-        EventSubscription subscription = bus.on(definition, listener);
+        EventSubscription subscription = bus.subscribe(definition, listener);
 
-        bus.emit(definition, eventType.cast(newInstance(eventType)));
+        bus.dispatch(definition, eventType.cast(newInstance(eventType)));
         // Close must be responsible for this still-active canonical binding.
         bus.close();
 
@@ -533,8 +527,8 @@ final class EventBusQuiescenceTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static EventDefinition<Object> serialDefinition(Class<?> type) {
-        return EventDefinition.serial(EventKey.of((Class<Object>) type));
+    private static EventDefinition.Serial<Object> serialDefinition(Class<?> type) {
+        return EventDefinition.serial((Class<Object>) type);
     }
 
     private static Class<?> loadClass(ClassLoader loader, String name) {

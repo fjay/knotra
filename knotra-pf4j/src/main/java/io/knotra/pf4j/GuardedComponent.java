@@ -7,7 +7,6 @@ import io.knotra.ActivationContext;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ConfigSchema;
 
 /**
  * 固定描述符并守护一个组件实例所有用户 start 调用的包装器。

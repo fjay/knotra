@@ -22,21 +22,21 @@ Knotra 没有全局线程池，各模块使用独立执行器：
 - 虚拟线程上应避免长时间持有 `synchronized` 或执行会 pin 载体的原生调用；需要重锁的代码优先用 `ReentrantLock` 或把锁移出 `start()`。
 - **组件实例跨 Activation 复用**：`ComponentFactory.create()` 只在挂载时调用一次；reconfigure、provider 替换都会重新调用同一个组件实例的 `start()`，且前一次 Activation 的资源应已通过 LifecycleScope 清理。跨代状态放组件字段时，必须在 `start()` 里重置。
 - `start()` 抛 `Exception` 或 `Error` 都会被捕获：暂存注册与资源回滚，组件进入 `FAILED`，错误文本进入诊断；`whenSettled()` 正常完成为 `FAILED` 状态，不会异常完成。
-- 同步 disposer 在执行清理的虚拟线程上直接调用；`manageAsync` 登记的 disposer 返回的 `CompletionStage` 由 disposer 自身决定在哪个线程完成，Runtime 不强制。
+- 同步 disposer 在清理虚拟线程上调用；`onCloseAsync` 登记的动作自行决定 stage 完成线程，`manageAsync` 则直接托管实现 `AsyncCloseable` 的资源。
 
 ## 宿主调用线程
 
-- `runtime.mutate(...)` 的回调在**调用线程**执行，包括 `ConfigSchema` 归一化和工厂 `create()`。回调抛异常时事务拒绝，返回 `INVALID_LIFECYCLE_OPERATION` 诊断，不会向调用方传播。
-- 协调器临界区只做确定性校验与代际发布：工厂、schema、用户 `start()` 都不持有协调器锁。
-- `retry()` 只对 `FAILED` 组件合法；其他状态（含 `ACTIVE`）返回异常完成的 `IllegalStateException`，不排队、不修改状态。
+- `runtime.transact(...)` 的 callback 在**调用线程**执行，包括 factory `create()` 与 typed `normalizeConfig()`；拒绝时抛出携带诊断的 `TransactionRejectedException`，不返回可忽略的失败值。
+- 协调器临界区只做确定性校验与代际发布：factory、normalizer 和用户 `start()` 都不持有协调器锁。
+- `retryAsync()` 只对 `FAILED` 组件合法；其他状态返回异常完成的 `IllegalStateException`，不排队、不修改状态。
 - `whenSettled()` 的完成线程是推动最后一次过渡完成的线程（通常是 Core 虚拟线程，或最后一个异步 disposer 的完成线程）；不要在回调里假设线程身份。
 - `runtime.closeAsync()` 复用根 Context 清理路径：设置 closing（之后新 mutation 被拒绝）、组件过渡仍在 Core 虚拟线程执行、close future 在最后一段 settlement 完成线程上完成。成功时组件 `whenSettled()` 得到 `DISPOSED`；清理失败时组件保持 `FAILED`、close future 异常完成、执行器保留供重试。
 
 ## EventBus 线程
 
-- `emit(...)`（sync 模式）：accept 后在**调用线程**逐个执行 listener。
-- `parallel(...)`：每个 listener 调用提交到 `event-bus-<N>-worker`。
-- `serial/bail/waterfall`：折叠成 stage 链，第一段可能在调用线程执行，后续各段在前一段的完成线程执行。
+- `dispatch(EventDefinition.Sync, ...)`：accept 后在**调用线程**逐个执行 listener。
+- `dispatch(EventDefinition.Parallel, ...)`：每个 listener 调用提交到 `event-bus-<N>-worker`。
+- Serial/Bail/Waterfall 的 `dispatch(...)` 折叠成 stage 链，第一段可能在调用线程执行，后续各段在前一段的完成线程执行。
 - **TCCL 规则**：listener 回调执行前，TCCL 切换为 `listener.getClass().getClassLoader()`，回调结束恢复。插件 listener 里用 TCCL 加载资源时拿到的是插件自己的 loader。
 - `closeAsync()` 拒绝新工作、等待关闭前已接受的分发收敛，然后 `shutdownNow()` 自有执行器；若构造时注入了外部执行器则不会关闭它。
 
@@ -56,7 +56,7 @@ class KnotraHostConfig {
 }
 ```
 
-Spring 管理的 Bean 可以照常通过 `runtime.mutate(...)` 做结构变更；关闭顺序交给 Spring 的依赖关系，确保 adapter/loader 先于 runtime 销毁。
+Spring 管理的 Bean 可以通过 `runtime.transact(...)` 做原子结构变更，或使用 Runtime 的单操作 convenience；关闭顺序确保 adapter/loader 先于 Runtime。
 
 **组件内嵌 DI 模式**：组件 `start()` 里创建自己的小型容器（例如一个 `AnnotationConfigApplicationContext`），把容器关闭登记进 LifecycleScope：
 

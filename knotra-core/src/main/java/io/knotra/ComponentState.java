@@ -14,7 +14,7 @@ public enum ComponentState {
     ACTIVE,
     /** 正在停止当前 Activation，等待清理收敛。 */
     STOPPING,
-    /** 启动或清理失败；保留诊断，可通过 {@link ComponentHandle#retry()} 重试。 */
+    /** 启动或清理失败；保留诊断，可通过 {@link ComponentHandle#retryAsync()} 重试。 */
     FAILED,
     /** 终态：组件已释放并从运行时移除。 */
     DISPOSED

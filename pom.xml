@@ -37,6 +37,7 @@
         <module>knotra-pf4j-spi</module>
         <module>knotra-pf4j</module>
         <module>knotra-loader</module>
+        <module>knotra-pf4j-loader</module>
         <module>knotra-integration-tests</module>
     </modules>
 
@@ -65,6 +66,11 @@
             <dependency>
                 <groupId>io.knotra</groupId>
                 <artifactId>knotra-loader</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-pf4j-loader</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

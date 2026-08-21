@@ -3,8 +3,8 @@ package com.example.knotra.plugin;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-
 import com.example.knotra.contract.CleanupCoordinator;
 import com.example.knotra.contract.ControlledGate;
 import com.example.knotra.contract.MountCoordinator;
@@ -13,7 +13,8 @@ import io.knotra.CapabilityKey;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ConfigSchema;
+import io.knotra.ConfigDecoder;
+import java.util.Map;
 import io.knotra.NoConfig;
 import io.knotra.pf4j.spi.ExportedComponentFactory;
 import io.knotra.pf4j.spi.RuntimeComponentProvider;
@@ -34,7 +35,8 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
     @Override
     public Collection<ExportedComponentFactory<?>> factories() {
         List<ExportedComponentFactory<?>> exported = List.of(
-                ExportedComponentFactory.of(String.class, configured("alpha")),
+                ExportedComponentFactory.of(
+                        String.class, alphaDecoder(), configured("alpha")),
                 ExportedComponentFactory.of(String.class, configured("beta")),
                 ExportedComponentFactory.noConfig(new AsyncCleanupFactory()),
                 ExportedComponentFactory.noConfig(new InFlightFactory()),
@@ -70,7 +72,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("private-config");
+                        return ComponentDescriptor.named("private-config");
                     }
 
                     @Override
@@ -80,6 +82,21 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                     }
                 };
             }
+        };
+    }
+
+    private static ConfigDecoder<String> alphaDecoder() {
+        return raw -> {
+            if (raw instanceof Map<?, ?> map
+                    && map.containsKey("value")
+                    && map.get("value") instanceof String value) {
+                return value;
+            }
+            if (raw instanceof String value) {
+                return value;
+            }
+            throw new IllegalArgumentException(
+                    "alpha config must be a value string or a map with a string value");
         };
     }
 
@@ -95,7 +112,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of(id);
+                        return ComponentDescriptor.named(id);
                     }
 
                     @Override
@@ -108,13 +125,11 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
             }
 
             @Override
-            public Optional<ConfigSchema<String>> configSchema() {
-                return Optional.of(raw -> {
-                    if (!(raw instanceof String value) || value.isBlank()) {
-                        throw new IllegalArgumentException("config must be non-blank");
-                    }
-                    return value.trim();
-                });
+            public String normalizeConfig(String config) {
+                if (config == null || config.isBlank()) {
+                    throw new IllegalArgumentException("config must be non-blank");
+                }
+                return config.trim();
             }
         };
     }
@@ -148,8 +163,8 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                 @Override
                 public ComponentDescriptor descriptor() {
                     return mode == Mode.DESCRIPTOR
-                            ? ComponentDescriptor.of(id, requirement())
-                            : ComponentDescriptor.of(id);
+                            ? ComponentDescriptor.named(id, requirement())
+                            : ComponentDescriptor.named(id);
                 }
 
                 private io.knotra.CapabilityRequirement requirement() {
@@ -183,7 +198,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                             return new Component<>() {
                                 @Override
                                 public ComponentDescriptor descriptor() {
-                                    return ComponentDescriptor.of(
+                                    return ComponentDescriptor.named(
                                             "private-child", requirement());
                                 }
 
@@ -211,7 +226,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
             return new Component<>() {
                 @Override
                 public ComponentDescriptor descriptor() {
-                    return ComponentDescriptor.of("async-cleanup");
+                    return ComponentDescriptor.named("async-cleanup");
                 }
 
                 @Override
@@ -244,7 +259,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
             return new Component<>() {
                 @Override
                 public ComponentDescriptor descriptor() {
-                    return ComponentDescriptor.of("in-flight");
+                    return ComponentDescriptor.named("in-flight");
                 }
 
                 @Override
@@ -267,7 +282,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
             return new Component<>() {
                 @Override
                 public ComponentDescriptor descriptor() {
-                    return ComponentDescriptor.of("parent");
+                    return ComponentDescriptor.named("parent");
                 }
 
                 @Override
@@ -287,7 +302,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                                     return new Component<>() {
                                         @Override
                                         public ComponentDescriptor descriptor() {
-                                            return ComponentDescriptor.of("artifact-child");
+                                            return ComponentDescriptor.named("artifact-child");
                                         }
 
                                         @Override
@@ -317,7 +332,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
             return new Component<>() {
                 @Override
                 public ComponentDescriptor descriptor() {
-                    return ComponentDescriptor.of("lost-race");
+                    return ComponentDescriptor.named("lost-race");
                 }
 
                 @Override
@@ -351,7 +366,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
             return new Component<>() {
                 @Override
                 public ComponentDescriptor descriptor() {
-                    return ComponentDescriptor.of("failing-cleanup");
+                    return ComponentDescriptor.named("failing-cleanup");
                 }
 
                 @Override

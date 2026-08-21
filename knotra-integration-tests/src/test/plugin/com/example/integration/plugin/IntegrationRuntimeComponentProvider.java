@@ -2,7 +2,6 @@ package com.example.integration.plugin;
 
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import com.example.integration.contract.ContractEvent;
@@ -12,12 +11,10 @@ import io.knotra.CapabilityKey;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ConfigSchema;
 import io.knotra.NoConfig;
 import io.knotra.events.EventBus;
 import io.knotra.events.EventCapabilities;
 import io.knotra.events.EventDefinition;
-import io.knotra.events.EventKey;
 import io.knotra.events.EventSubscription;
 import io.knotra.pf4j.spi.ExportedComponentFactory;
 import io.knotra.pf4j.spi.RuntimeComponentProvider;
@@ -56,13 +53,11 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
             }
 
             @Override
-            public Optional<ConfigSchema<String>> configSchema() {
-                return Optional.of(raw -> {
-                    if (!(raw instanceof String value) || value.isBlank()) {
-                        throw new IllegalArgumentException("greeting config must be non-blank");
-                    }
-                    return value.trim();
-                });
+            public String normalizeConfig(String config) {
+                if (config.isBlank()) {
+                    throw new IllegalArgumentException("greeting config must be non-blank");
+                }
+                return config.trim();
             }
 
             @Override
@@ -70,7 +65,7 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("integration-greeting");
+                        return ComponentDescriptor.named("integration-greeting");
                     }
 
                     @Override
@@ -94,15 +89,12 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("integration-parent");
+                        return ComponentDescriptor.named("integration-parent");
                     }
 
                     @Override
                     public void start(ActivationContext context, NoConfig config) {
-                        context.mountChild(
-                                "integration-child",
-                                childFactory(),
-                                NoConfig.INSTANCE);
+                        context.mountChild("integration-child", childFactory());
                     }
 
                     private ComponentFactory<NoConfig> childFactory() {
@@ -117,7 +109,7 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                                 return new Component<>() {
                                     @Override
                                     public ComponentDescriptor descriptor() {
-                                        return ComponentDescriptor.of("integration-child");
+                                        return ComponentDescriptor.named("integration-child");
                                     }
 
                                     @Override
@@ -150,7 +142,7 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("integration-in-flight");
+                        return ComponentDescriptor.named("integration-in-flight");
                     }
 
                     @Override
@@ -173,7 +165,7 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("integration-failing-cleanup");
+                        return ComponentDescriptor.named("integration-failing-cleanup");
                     }
 
                     @Override
@@ -202,7 +194,7 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of(
+                        return ComponentDescriptor.named(
                                 "integration-event-consumer",
                                 io.knotra.CapabilityRequirement.required(
                                         EventCapabilities.EVENT_BUS));
@@ -212,21 +204,21 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                     public void start(ActivationContext context, NoConfig config) {
                         EventBus bus = context.require(EventCapabilities.EVENT_BUS);
 
-                        EventSubscription shared = bus.onSerial(
-                                EventDefinition.serial(EventKey.of(ContractEvent.class)),
+                        EventSubscription shared = bus.subscribe(
+                                EventDefinition.serial(ContractEvent.class),
                                 event -> {
                                     IntegrationCoordinator.recordDelivery();
                                     IntegrationCoordinator.enterEvent();
                                     return IntegrationCoordinator.eventGate();
                                 });
                         context.lifecycle().manageAsync(
-                                "integration-shared-listener", shared::closeAsync);
+                                "integration-shared-listener", shared);
 
-                        EventSubscription pluginPrivate = bus.onSerial(
-                                EventDefinition.serial(EventKey.of(PluginEvent.class)),
+                        EventSubscription pluginPrivate = bus.subscribe(
+                                EventDefinition.serial(PluginEvent.class),
                                 event -> CompletableFuture.completedFuture(true));
                         context.lifecycle().manageAsync(
-                                "integration-private-listener", pluginPrivate::closeAsync);
+                                "integration-private-listener", pluginPrivate);
                     }
                 };
             }

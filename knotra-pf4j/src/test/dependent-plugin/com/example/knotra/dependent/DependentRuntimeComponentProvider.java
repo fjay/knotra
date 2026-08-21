@@ -28,7 +28,7 @@ public final class DependentRuntimeComponentProvider implements RuntimeComponent
                 return new Component<>() {
                     @Override
                     public ComponentDescriptor descriptor() {
-                        return ComponentDescriptor.of("dependent");
+                        return ComponentDescriptor.named("dependent");
                     }
 
                     @Override

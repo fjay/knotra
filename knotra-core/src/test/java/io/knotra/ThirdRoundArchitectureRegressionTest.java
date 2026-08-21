@@ -4,7 +4,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -35,14 +34,14 @@ final class ThirdRoundArchitectureRegressionTest {
     void childCapabilityTypeConflictFailsParentAndCanCloseRuntime() throws Exception {
         AtomicReference<ComponentHandle<NoConfig>> first = new AtomicReference<>();
         AtomicReference<ComponentHandle<NoConfig>> second = new AtomicReference<>();
-        var parent = TestKit.mount(runtime, runtime.rootContext(), "parent",
+        var parent = TestKit.mount(runtime, runtime.root(), "parent",
                 (context, config) -> {
                     first.set(context.mountChild("first", TestKit.factory("first",
-                            new TestKit.Scripted<>(ComponentDescriptor.of("first",
+                            new TestKit.Scripted<>(ComponentDescriptor.named("first",
                                     CapabilityRequirement.required(A)),
                                     (childContext, childConfig) -> {})), NoConfig.INSTANCE));
                     second.set(context.mountChild("second", TestKit.factory("second",
-                            new TestKit.Scripted<>(ComponentDescriptor.of("second",
+                            new TestKit.Scripted<>(ComponentDescriptor.named("second",
                                     CapabilityRequirement.required(A_NUMBER)),
                                     (childContext, childConfig) -> {})), NoConfig.INSTANCE));
                 });
@@ -59,20 +58,20 @@ final class ThirdRoundArchitectureRegressionTest {
         ExecutorService executor = Executors.newFixedThreadPool(4);
         try {
             for (int round = 0; round < 500; round++) {
-                var handle = TestKit.mount(runtime, runtime.rootContext(),
+                var handle = TestKit.mount(runtime, runtime.root(),
                         "race-" + round, (context, config) -> {},
                         CapabilityRequirement.required(A));
                 assertEquals(ComponentState.WAITING, TestKit.settle(handle).call());
 
-                CompletableFuture<MutationResult<RegistrationHandle>> provide =
+                CompletableFuture<TransactionReceipt<RegistrationHandle>> provide =
                         CompletableFuture.supplyAsync(() ->
-                                runtime.mutate(mutation ->
-                                        mutation.provide(runtime.rootContext(), A, "v")),
+                                runtime.transact(mutation ->
+                                        mutation.provide(runtime.root(), A, "v")),
                                 executor);
                 CompletableFuture<ComponentState> dispose =
                         CompletableFuture.supplyAsync(() -> {
                             try {
-                                return handle.dispose().toCompletableFuture()
+                                return handle.disposeAsync().toCompletableFuture()
                                         .get(10, TimeUnit.SECONDS);
                             } catch (Exception error) {
                                 throw new IllegalStateException(error);
@@ -82,7 +81,7 @@ final class ThirdRoundArchitectureRegressionTest {
                 provide.get(10, TimeUnit.SECONDS);
                 assertEquals(ComponentState.DISPOSED, dispose.get(10, TimeUnit.SECONDS));
                 RegistrationHandle registration = provide.join().value();
-                TestKit.assertCommitted(runtime.mutate(mutation -> {
+                TestKit.assertCommitted(runtime.transact(mutation -> {
                     mutation.revoke(registration);
                     return null;
                 }));
@@ -97,21 +96,21 @@ final class ThirdRoundArchitectureRegressionTest {
     @Test
     void sequentialChildAndParallelAsyncCleanupFailuresContinueEarlierEntries() throws Exception {
         List<String> events = new java.util.concurrent.CopyOnWriteArrayList<>();
-        var handle = TestKit.mount(runtime, runtime.rootContext(), "cleanup", (context, config) -> {
+        var handle = TestKit.mount(runtime, runtime.root(), "cleanup", (context, config) -> {
             context.lifecycle().onClose("root-earlier", () -> events.add("root-earlier"));
 
             var sequential = context.lifecycle().child("sequential");
-            sequential.manageAsync("sequential-later", () -> {
+            sequential.onCloseAsync("sequential-later", () -> {
                 events.add("sequential-later");
                 return CompletableFuture.completedFuture(null);
             });
-            sequential.manageAsync("sequential-earlier", () ->
+            sequential.onCloseAsync("sequential-earlier", () ->
                     CompletableFuture.failedFuture(new IllegalStateException("sequential child failed")));
 
             var parallel = context.lifecycle().parallelChild("parallel");
-            parallel.manageAsync("parallel-bad", () ->
+            parallel.onCloseAsync("parallel-bad", () ->
                     CompletableFuture.failedFuture(new IllegalStateException("parallel child failed")));
-            parallel.manageAsync("parallel-good", () -> {
+            parallel.onCloseAsync("parallel-good", () -> {
                 events.add("parallel-good");
                 return CompletableFuture.completedFuture(null);
             });
@@ -120,7 +119,7 @@ final class ThirdRoundArchitectureRegressionTest {
         });
 
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.dispose()
+        assertEquals(ComponentState.FAILED, handle.disposeAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
         assertTrue(events.contains("root-latest"));
@@ -137,7 +136,7 @@ final class ThirdRoundArchitectureRegressionTest {
 
     @Test
     void startingConsumerIsStaledByCommittedShadowProviderAndReconciles() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "shadow");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "shadow");
         CountDownLatch consumerStarted = new CountDownLatch(1);
         CompletableFuture<Void> consumerGate = new CompletableFuture<>();
         AtomicReference<String> observed = new AtomicReference<>();
@@ -148,7 +147,7 @@ final class ThirdRoundArchitectureRegressionTest {
                     consumerGate.get();
                     observed.set(context.require(A));
                 }, CapabilityRequirement.required(A));
-        var rootRegistration = TestKit.provide(runtime, runtime.rootContext(), A, "root");
+        var rootRegistration = TestKit.provide(runtime, runtime.root(), A, "root");
         assertTrue(consumerStarted.await(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.STARTING, consumer.state());
 
@@ -163,7 +162,7 @@ final class ThirdRoundArchitectureRegressionTest {
                 TestKit.component(runtime, consumer).currentActivationId());
         assertEquals("child", observed.get());
 
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(rootRegistration);
             return null;
         }));
@@ -171,17 +170,17 @@ final class ThirdRoundArchitectureRegressionTest {
 
     @Test
     void contextDisposeSettlementWaitsForSubtreeAndFinalizesNamespace() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "workspace");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "workspace");
         CountDownLatch cleanupEntered = new CountDownLatch(1);
         CompletableFuture<Void> cleanupGate = new CompletableFuture<>();
         var handle = TestKit.mount(runtime, child, "component", (context, config) ->
-                context.lifecycle().manageAsync("cleanup", () -> {
+                context.lifecycle().onCloseAsync("cleanup", () -> {
                     cleanupEntered.countDown();
                     return cleanupGate;
                 }));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
 
-        MutationResult<Void> result = runtime.mutate(mutation -> {
+        TransactionReceipt<Void> result = runtime.transact(mutation -> {
             mutation.dispose(child);
             return null;
         });
@@ -201,9 +200,9 @@ final class ThirdRoundArchitectureRegressionTest {
     void invalidContextNamesAndCanonicalPathsAreRejected() {
         List<String> names = List.of("a/b", "a\\b", "a\tb", ".", "..");
         for (String name : names) {
-            var result = runtime.mutate(mutation ->
-                    mutation.childContext(runtime.rootContext(), name));
-            TestKit.assertRejected(result, DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
+            TestKit.assertRejected(() -> runtime.transact(mutation ->
+                    mutation.childContext(runtime.root(), name)),
+                    DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
         }
         assertTrue(runtime.snapshot().contexts().stream()
                 .allMatch(context -> context.contextId().equals("ctx-root")));
@@ -211,11 +210,11 @@ final class ThirdRoundArchitectureRegressionTest {
 
     @Test
     void repeatedAndNestedContextDisposalsDeduplicateToOneSettlement() throws Exception {
-        ContextHandle parent = TestKit.child(runtime, runtime.rootContext(), "parent");
+        ContextHandle parent = TestKit.child(runtime, runtime.root(), "parent");
         ContextHandle child = TestKit.child(runtime, parent, "child");
         TestKit.provide(runtime, child, A, "child-value");
 
-        MutationResult<Void> result = runtime.mutate(mutation -> {
+        TransactionReceipt<Void> result = runtime.transact(mutation -> {
             mutation.dispose(child);
             mutation.dispose(child);
             mutation.dispose(parent);
@@ -244,22 +243,19 @@ final class ThirdRoundArchitectureRegressionTest {
             @Override
             public Component<String> create() {
                 return new TestKit.Scripted<>(
-                        ComponentDescriptor.of("configured"),
+                        ComponentDescriptor.named("configured"),
                         (context, config) -> configs.add(config));
             }
 
             @Override
-            public Optional<ConfigSchema<String>> configSchema() {
-                ConfigSchema<String> schema = raw -> {
-                    validations.incrementAndGet();
-                    return ((String) raw).trim();
-                };
-                return Optional.of(schema);
+            public String normalizeConfig(String config) {
+                validations.incrementAndGet();
+                return config.trim();
             }
         };
 
-        var result = runtime.mutate(mutation -> {
-            var handle = mutation.mount(runtime.rootContext(), "configured", factory, " one ");
+        var result = runtime.transact(mutation -> {
+            var handle = mutation.mount(runtime.root(), "configured", factory, " one ");
             mutation.reconfigure(handle, " two ");
             mutation.reconfigure(handle, " three ");
             return handle;

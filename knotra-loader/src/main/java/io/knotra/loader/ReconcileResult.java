@@ -23,6 +23,14 @@ public record ReconcileResult(
         diagnostics = List.copyOf(diagnostics).stream().sorted().toList();
     }
 
+    /** 已收敛时返回自身；否则抛出携带诊断的 ReconcileException。 */
+    public ReconcileResult requireConverged() {
+        if (!converged) {
+            throw new ReconcileException(diagnostics);
+        }
+        return this;
+    }
+
     /** reconcile 或显式 retry 产生的变更类型。 */
     public enum ChangeType {
         /** 新条目完成挂载。 */

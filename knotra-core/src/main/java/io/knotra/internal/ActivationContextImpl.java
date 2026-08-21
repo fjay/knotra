@@ -7,21 +7,14 @@ import io.knotra.ComponentHandle;
 import io.knotra.ContextInfo;
 import io.knotra.LifecycleScope;
 import io.knotra.MountOptions;
+import io.knotra.NoConfig;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-
-/**
- * 交给用户组件 {@code start()} 的 ActivationContext 实现。
- *
- * <p>读取只允许访问启动前固定的 BindingSet 及其捕获值，未声明的 Capability 会被拒绝，避免组件
- * 绕过依赖声明参与一致性检查。{@code provide} 与 {@code mountChild} 写入的是
- * {@link ActivationRuntime} 的暂存状态，父 Activation 验证并原子发布前对其他读取方不可见。
- * {@code start()} 返回后上下文立即关闭；若协调器已将候选标记为 stale，则新的暂存也会被拒绝。</p>
- */
+/** 交给用户组件 start 的一次性 ActivationContext。 */
 final class ActivationContextImpl implements ActivationContext {
     private final DefaultKnotraRuntime runtime;
     private final ActivationRuntime activation;
@@ -54,9 +47,8 @@ final class ActivationContextImpl implements ActivationContext {
         if (!binding.present()) {
             return Optional.empty();
         }
-        // 只读取启动代际捕获的值，避免用户代码在 start() 中观察到后续发布的新注册。
-        Object value = activation.capturedValues.get(key.name());
-        return Optional.ofNullable(key.type().cast(value));
+        return Optional.ofNullable(key.type().cast(
+                activation.capturedValues.get(key.name())));
     }
 
     @Override
@@ -69,7 +61,6 @@ final class ActivationContextImpl implements ActivationContext {
             throw new IllegalArgumentException(
                     "capability value is not an instance of " + key.typeName());
         }
-        // 先按已发布视图做类型检查；槽位占用和并发注册在 Activation 提交临界区内最终裁决。
         runtime.validateCapabilityType(key);
         if (activation.stagedRegistrations.containsKey(key.name())) {
             throw new IllegalArgumentException("capability already staged: " + key.name());
@@ -96,7 +87,7 @@ final class ActivationContextImpl implements ActivationContext {
         if (mountId == null || mountId.isBlank()) {
             throw new IllegalArgumentException("mountId must not be blank");
         }
-        for (ChildMountPlan plan : childPlans) {
+        for (ChildMountPlan<?> plan : childPlans) {
             if (plan.mountId().equals(mountId)) {
                 throw new IllegalArgumentException("mountId is already staged: " + mountId);
             }
@@ -104,17 +95,28 @@ final class ActivationContextImpl implements ActivationContext {
         MountOptions effectiveOptions = options == null
                 ? new MountOptions(activation.owner.prepared.options().origin())
                 : options;
-        PreparedComponent<C> prepared = PreparedComponent.prepare(
-                factory,
-                config,
-                effectiveOptions);
-        // 挂载 ID 采用乐观查重：用户工厂代码在协调器锁外执行，提交时必须基于最新视图重试冲突判定。
+        PreparedComponent<C> prepared = PreparedComponent.prepare(factory, config, effectiveOptions);
         if (runtime.mountIdReserved(activation.owner.contextId, mountId)) {
             throw new IllegalArgumentException("mountId is already in use: " + mountId);
         }
         ComponentHandleImpl<C> handle = runtime.createProvisionalHandle();
-        addPlan(handle, mountId, prepared);
+        childPlans.add(new ChildMountPlan<>(handle, mountId, prepared));
         return handle;
+    }
+
+    @Override
+    public ComponentHandle<NoConfig> mountChild(
+            String mountId,
+            ComponentFactory<NoConfig> factory) {
+        return mountChild(mountId, factory, NoConfig.INSTANCE, null);
+    }
+
+    @Override
+    public ComponentHandle<NoConfig> mountChild(
+            String mountId,
+            ComponentFactory<NoConfig> factory,
+            MountOptions options) {
+        return mountChild(mountId, factory, NoConfig.INSTANCE, options);
     }
 
     @Override
@@ -124,16 +126,9 @@ final class ActivationContextImpl implements ActivationContext {
     }
 
     @Override
-    public ContextInfo contextInfo() {
+    public ContextInfo info() {
         ensureOpen();
         return runtime.contextInfo(activation.owner.contextId);
-    }
-
-    private <C> void addPlan(
-            ComponentHandleImpl<C> handle,
-            String mountId,
-            PreparedComponent<C> prepared) {
-        childPlans.add(new ChildMountPlan<>(handle, mountId, prepared));
     }
 
     List<ChildMountPlan<?>> plans() {

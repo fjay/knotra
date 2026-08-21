@@ -42,7 +42,7 @@ final class Pf4jArtifactIntegrationTest {
     void loadStartDiscoversControlledFactoriesWithoutMountingComponents(
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
-            var snapshot = adapter.loadArtifact(IntegrationTestKit.fixture()).join();
+            var snapshot = adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
 
             assertEquals(IntegrationTestKit.ARTIFACT_ID, snapshot.artifactId());
             assertEquals(ArtifactState.ACTIVE, snapshot.state());
@@ -56,15 +56,15 @@ final class Pf4jArtifactIntegrationTest {
                             "integration-greeting",
                             "integration-in-flight",
                             "integration-parent"),
-                    adapter.factoryCatalog().stream()
+                    adapter.factories().list().stream()
                             .map(ArtifactFactoryCatalogEntry::factoryId)
                             .sorted()
                             .toList());
-            ArtifactFactoryCatalogEntry greeting = adapter.resolver()
-                    .resolve("integration-greeting").orElseThrow();
+            ArtifactFactoryCatalogEntry greeting = adapter.factories()
+                    .find("integration-greeting").orElseThrow();
             assertEquals(String.class.getName(), greeting.configTypeName());
             assertFalse(greeting instanceof ArtifactFactoryHandle<?>);
-            assertTrue(adapter.resolver().resolve("absent-factory").isEmpty());
+            assertTrue(adapter.factories().resolve("absent-factory").isEmpty());
             assertTrue(runtime.snapshot().registrations().isEmpty());
         }
     }
@@ -73,12 +73,12 @@ final class Pf4jArtifactIntegrationTest {
     void controlledMountNormalizesConfigAndKeepsArtifactOrigin(@TempDir Path pluginsRoot)
             throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            ArtifactFactoryHandle<String> factory = adapter.resolver()
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            ArtifactFactoryHandle<String> factory = adapter.factories()
                     .resolve("integration-greeting", String.class).orElseThrow();
 
             ComponentHandle<String> handle = factory.mount(
-                    runtime.rootContext(), "greeting", "  hello  ");
+                    runtime.root(), "greeting", "  hello  ");
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(handle));
 
             RuntimeSnapshot.ComponentSnapshot component = runtime.snapshot().components()
@@ -89,11 +89,11 @@ final class Pf4jArtifactIntegrationTest {
             assertEquals(IntegrationTestKit.ARTIFACT_ID, component.origin().sourceId());
             assertEquals("1.0.0", component.origin().version());
             assertEquals("greeting", component.mountId());
-            assertEquals("hello", runtime.context().require(IntegrationTestKit.VALUE));
+            assertEquals("hello", runtime.root().view().require(IntegrationTestKit.VALUE));
             assertEquals(1, adapter.ownership(IntegrationTestKit.ARTIFACT_ID).size());
-            assertTrue(factory.configSchema().isPresent());
+            assertEquals("decoded", factory.decodeConfig("decoded"));
 
-            adapter.unloadArtifact(IntegrationTestKit.ARTIFACT_ID).join();
+            adapter.unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID).toCompletableFuture().join();
             assertTrue(runtime.snapshot().components().isEmpty());
             assertTrue(adapter.ownership(IntegrationTestKit.ARTIFACT_ID).isEmpty());
         }
@@ -103,10 +103,10 @@ final class Pf4jArtifactIntegrationTest {
     void artifactChildMountInheritsParentOriginAndDrainsWithTheArtifact(
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
-            adapter.loadArtifact(IntegrationTestKit.fixture()).join();
-            ComponentHandle<NoConfig> parent = adapter.resolver()
+            adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
+            ComponentHandle<NoConfig> parent = adapter.factories()
                     .resolve("integration-parent", NoConfig.class).orElseThrow()
-                    .mount(runtime.rootContext(), "parent", NoConfig.INSTANCE);
+                    .mount(runtime.root(), "parent", NoConfig.INSTANCE);
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(parent));
 
             RuntimeSnapshot.ComponentSnapshot child = runtime.snapshot().components().stream()
@@ -117,7 +117,7 @@ final class Pf4jArtifactIntegrationTest {
             assertEquals(parent.handleId(), child.parentHandleId());
             assertEquals(2, adapter.ownership(IntegrationTestKit.ARTIFACT_ID).size());
 
-            adapter.unloadArtifact(IntegrationTestKit.ARTIFACT_ID).join();
+            adapter.unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID).toCompletableFuture().join();
             assertTrue(runtime.snapshot().components().isEmpty());
         }
     }

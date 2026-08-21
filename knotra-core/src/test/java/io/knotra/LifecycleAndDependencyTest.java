@@ -29,7 +29,7 @@ final class LifecycleAndDependencyTest {
 
     private ComponentHandle<NoConfig> mount(String id, TestKit.Start<NoConfig> start,
                                              CapabilityRequirement... requirements) {
-        return TestKit.mount(runtime, runtime.rootContext(), id, id, start, requirements);
+        return TestKit.mount(runtime, runtime.root(), id, id, start, requirements);
     }
 
     @Test
@@ -41,7 +41,7 @@ final class LifecycleAndDependencyTest {
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertSame(returned.get(), returned.get());
-        handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertTrue(returned.get().closed);
     }
 
@@ -55,7 +55,7 @@ final class LifecycleAndDependencyTest {
             context.lifecycle().onClose("last", () -> events.add("last"));
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(List.of("last", "nested-entry", "first"), events);
     }
 
@@ -64,12 +64,12 @@ final class LifecycleAndDependencyTest {
         CountDownLatch entered = new CountDownLatch(1);
         CompletableFuture<Void> gate = new CompletableFuture<>();
         var handle = mount("async", (context, config) ->
-                context.lifecycle().manageAsync("async", () -> {
+                context.lifecycle().onCloseAsync("async", () -> {
                     entered.countDown();
                     return gate;
                 }));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        var disposed = handle.dispose().toCompletableFuture();
+        var disposed = handle.disposeAsync().toCompletableFuture();
         assertTrue(entered.await(10, TimeUnit.SECONDS));
         assertFalse(disposed.isDone());
         gate.complete(null);
@@ -84,12 +84,12 @@ final class LifecycleAndDependencyTest {
         List<String> events = new java.util.concurrent.CopyOnWriteArrayList<>();
         var handle = mount("parallel", (context, config) -> {
             var group = context.lifecycle().parallelChild("group");
-            group.manageAsync("first", () -> {
+            group.onCloseAsync("first", () -> {
                 enteredCount.incrementAndGet();
                 bothRunning.countDown();
                 return gate.whenComplete((ignored, error) -> events.add("first"));
             });
-            group.manageAsync("second", () -> {
+            group.onCloseAsync("second", () -> {
                 enteredCount.incrementAndGet();
                 bothRunning.countDown();
                 return gate.whenComplete((ignored, error) -> events.add("second"));
@@ -97,7 +97,7 @@ final class LifecycleAndDependencyTest {
             context.lifecycle().onClose("later", () -> events.add("later"));
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        var disposing = handle.dispose().toCompletableFuture();
+        var disposing = handle.disposeAsync().toCompletableFuture();
         try {
             assertEquals(ComponentState.STOPPING, handle.state(),
                     () -> runtime.snapshot().toString());
@@ -128,7 +128,7 @@ final class LifecycleAndDependencyTest {
             context.lifecycle().onClose("after", () -> events.add("after"));
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.FAILED, handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(List.of("after", "before"), events);
         assertTrue(runtime.snapshot().diagnostics().stream()
                 .anyMatch(diagnostic -> diagnostic.code() == DiagnosticCode.CLEANUP_FAILED));
@@ -147,9 +147,9 @@ final class LifecycleAndDependencyTest {
             });
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS));
-        assertEquals(ComponentState.FAILED, handle.retry().toCompletableFuture().get(10, TimeUnit.SECONDS));
-        assertEquals(ComponentState.DISPOSED, handle.retry().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.FAILED, handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.FAILED, handle.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.DISPOSED, handle.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(1, goodAttempts.get());
         assertEquals(3, badAttempts.get());
     }
@@ -161,7 +161,7 @@ final class LifecycleAndDependencyTest {
         var handle = mount("dynamic", (context, config) -> scope.set(context.lifecycle()));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         scope.get().onClose("late", () -> closed.add("late"));
-        handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(List.of("late"), closed);
     }
 
@@ -172,13 +172,13 @@ final class LifecycleAndDependencyTest {
         AtomicReference<LifecycleScope> scope = new AtomicReference<>();
         var handle = mount("stopping", (context, config) -> {
             scope.set(context.lifecycle());
-            context.lifecycle().manageAsync("blocked", () -> {
+            context.lifecycle().onCloseAsync("blocked", () -> {
                 entered.countDown();
                 return gate;
             });
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        var stopping = handle.dispose().toCompletableFuture();
+        var stopping = handle.disposeAsync().toCompletableFuture();
         assertTrue(entered.await(10, TimeUnit.SECONDS));
         assertThrows(IllegalStateException.class, () ->
                 scope.get().onClose("late", () -> {}));
@@ -199,7 +199,7 @@ final class LifecycleAndDependencyTest {
             context.lifecycle().onClose("consumer", () -> order.add("consumer"));
         }, CapabilityRequirement.required(A));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
-        provider.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        provider.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(List.of("consumer", "provider"), order, () -> runtime.snapshot().toString());
         assertEquals(ComponentState.WAITING, consumer.state());
     }
@@ -223,7 +223,7 @@ final class LifecycleAndDependencyTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(middle).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(leaf).call());
-        provider.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        provider.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(List.of("leaf", "middle", "provider"), order);
     }
 
@@ -243,7 +243,7 @@ final class LifecycleAndDependencyTest {
         }, CapabilityRequirement.required(A));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
-        assertEquals(ComponentState.DISPOSED, provider.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.DISPOSED, provider.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.FAILED, consumer.state());
     }
 
@@ -255,16 +255,16 @@ final class LifecycleAndDependencyTest {
         var provider = mount("provider", (context, config) -> context.provide(A, "first"));
         var consumer = mount("consumer", (context, config) -> {
             observed.set(context.require(A));
-            context.lifecycle().manageAsync("consumer", () -> {
+            context.lifecycle().onCloseAsync("consumer", () -> {
                 consumerCleanupStarted.countDown();
                 return cleanupGate;
             });
         }, CapabilityRequirement.required(A));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
-        var providerDisposed = provider.dispose().toCompletableFuture();
+        var providerDisposed = provider.disposeAsync().toCompletableFuture();
         assertTrue(consumerCleanupStarted.await(10, TimeUnit.SECONDS));
-        TestKit.provide(runtime, runtime.rootContext(), A, "second");
+        TestKit.provide(runtime, runtime.root(), A, "second");
         assertEquals(ComponentState.STOPPING, consumer.state());
         cleanupGate.complete(null);
         assertEquals(ComponentState.DISPOSED, providerDisposed.get(10, TimeUnit.SECONDS));
@@ -282,9 +282,9 @@ final class LifecycleAndDependencyTest {
                     }
                 }));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertEquals(ComponentState.FAILED, handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.FAILED, handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentGoal.DISPOSED, handle.goal());
-        assertEquals(ComponentState.DISPOSED, handle.retry().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.DISPOSED, handle.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
     }
 
     @Test
@@ -298,7 +298,7 @@ final class LifecycleAndDependencyTest {
             var futures = new ArrayList<java.util.concurrent.Future<ComponentState>>();
             for (int i = 0; i < 8; i++) {
                 futures.add(executor.submit(() ->
-                        handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS)));
+                        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS)));
             }
             for (var future : futures) {
                 assertEquals(ComponentState.DISPOSED, future.get(10, TimeUnit.SECONDS));
@@ -313,7 +313,7 @@ final class LifecycleAndDependencyTest {
     @Test
     void failedContextDisposalCanBeRetried() throws Exception {
         AtomicBoolean failOnce = new AtomicBoolean(true);
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "retry-child");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "retry-child");
         var handle = TestKit.mount(runtime, child, "component", (context, config) ->
                 context.lifecycle().onClose("bad", () -> {
                     if (failOnce.getAndSet(false)) {
@@ -321,11 +321,28 @@ final class LifecycleAndDependencyTest {
                     }
                 }));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        assertTrue(assertThrows(java.util.concurrent.ExecutionException.class, () ->
-                child.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS))
-                instanceof java.util.concurrent.ExecutionException);
+        assertEquals(ContextState.FAILED,
+                child.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         child.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ContextState.DISPOSED, child.state());
+    }
+
+    @Test
+    void componentCloseSurfacesRetryableCleanupFailure() throws Exception {
+        AtomicBoolean failOnce = new AtomicBoolean(true);
+        var handle = mount("close-failure", (context, config) ->
+                context.lifecycle().onClose("bad", () -> {
+                    if (failOnce.getAndSet(false)) {
+                        throw new IllegalStateException("close failed");
+                    }
+                }));
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, handle::close);
+        assertTrue(failure.getMessage().contains("FAILED"));
+        assertEquals(ComponentState.FAILED, handle.state());
+        assertEquals(ComponentState.DISPOSED, handle.retryAsync()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
     }
 
     private static final class TestResource implements AutoCloseable {

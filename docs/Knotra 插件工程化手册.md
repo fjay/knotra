@@ -136,7 +136,7 @@ public final class GreetingProvider implements RuntimeComponentProvider {
 }
 ```
 
-无配置的工厂用 `ExportedComponentFactory.noConfig(factory)` 导出，挂载时配置传 `NoConfig.INSTANCE`：
+无配置工厂用 `ExportedComponentFactory.noConfig(factory)` 导出。Typed artifact handle 可直接调用 `mount(context, mountId)`；Loader desired tree 使用 `ComponentEntry.of(...)`：
 
 ```java
 ExportedComponentFactory.noConfig(new SimpleFactory())
@@ -148,8 +148,6 @@ package com.example.plugin;
 import com.example.contract.Greeting;
 import com.example.contract.GreetingConfig;
 import io.knotra.*;
-
-import java.util.Optional;
 
 public final class GreetingFactory implements ComponentFactory<GreetingConfig> {
     static final CapabilityKey<Greeting> GREETING =
@@ -165,7 +163,7 @@ public final class GreetingFactory implements ComponentFactory<GreetingConfig> {
         return new Component<>() {
             @Override
             public ComponentDescriptor descriptor() {
-                return ComponentDescriptor.of("greeting");
+                return ComponentDescriptor.of();
             }
 
             @Override
@@ -180,15 +178,11 @@ public final class GreetingFactory implements ComponentFactory<GreetingConfig> {
     }
 
     @Override
-    public Optional<ConfigSchema<GreetingConfig>> configSchema() {
-        return Optional.of(raw -> {
-            if (!(raw instanceof GreetingConfig value)
-                    || value.template() == null
-                    || value.template().isBlank()) {
-                throw new IllegalArgumentException("template must not be blank");
-            }
-            return new GreetingConfig(value.template().trim());
-        });
+    public GreetingConfig normalizeConfig(GreetingConfig config) {
+        if (config.template() == null || config.template().isBlank()) {
+            throw new IllegalArgumentException("template must not be blank");
+        }
+        return new GreetingConfig(config.template().trim());
     }
 }
 ```
@@ -265,16 +259,16 @@ try (KnotraRuntime runtime = KnotraRuntime.create();
      Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
              Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
 
-    adapter.loadArtifact(Path.of("plugins/greeting-plugin-2.0.0.jar")).join();
+    adapter.loadArtifact(Path.of("plugins/greeting-plugin-2.0.0.jar"));
 
     // 只读目录可先确认 factory id 与配置类型名
-    adapter.resolver().resolve("greeting")
+    adapter.factories().find("greeting")
             .ifPresent(entry -> System.out.println(entry.configTypeName()));
 
     ArtifactFactoryHandle<GreetingConfig> factory =
-            adapter.resolver().resolve("greeting", GreetingConfig.class).orElseThrow();
+            adapter.factories().resolve("greeting", GreetingConfig.class).orElseThrow();
     ComponentHandle<GreetingConfig> handle = factory.mount(
-            runtime.rootContext(), "greeting", new GreetingConfig("hello %s"));
+            runtime.root(), "greeting", new GreetingConfig("hello %s"));
     handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
 }
 ```
@@ -315,7 +309,7 @@ try (KnotraRuntime runtime = KnotraRuntime.create();
 | `missing required PF4J dependencies` | `Plugin-Dependencies` 声明的插件不在扫描范围 | 把依赖 JAR 放进 plugins root，或修正依赖声明 |
 | `ambiguous PF4J repository entry` | 同 `Plugin-Id` 存在两个 JAR | 清理旧版本文件或改用不同 id |
 | `factory id is already cataloged` | 另一个活跃 artifact 已占用该 factoryId | 先卸载旧 artifact，或使用新 factoryId |
-| mount 报 null config | 无配置工厂传了 null | 无配置也必须传 `NoConfig.INSTANCE` |
+| mount 报 null config | 调用了三参数 typed mount 并传 null | 无配置工厂改用 `mount(context, mountId)` |
 
 ## 相关文档
 

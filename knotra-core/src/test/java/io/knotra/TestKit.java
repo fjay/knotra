@@ -1,8 +1,5 @@
 package io.knotra;
 
-
-import java.util.List;
-import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 
@@ -14,10 +11,15 @@ final class TestKit {
         void start(ActivationContext context, C config) throws Exception;
     }
 
+    @FunctionalInterface
+    interface Attempt {
+        void run() throws Exception;
+    }
+
     record Scripted<C>(ComponentDescriptor descriptor, Start<C> start) implements Component<C> {
         @Override
         public void start(ActivationContext context, C config) throws Exception {
-            this.start.start(context, config);
+            start.start(context, config);
         }
     }
 
@@ -43,6 +45,7 @@ final class TestKit {
             CapabilityRequirement... requirements) {
         return mount(runtime, context, mountId, "component-" + mountId, start, requirements);
     }
+
     static ComponentHandle<NoConfig> mount(
             KnotraRuntime runtime,
             ContextHandle context,
@@ -51,15 +54,11 @@ final class TestKit {
             Start<NoConfig> start,
             CapabilityRequirement... requirements) {
         Component<NoConfig> component = new Scripted<>(
-                ComponentDescriptor.of(componentId, requirements),
+                ComponentDescriptor.named(componentId, requirements),
                 start);
-        ComponentFactory<NoConfig> typedFactory = factory(componentId, component);
-        MutationResult<ComponentHandle<NoConfig>> result = runtime.mutate(mutation ->
-                mutation.mount(context, mountId, typedFactory, NoConfig.INSTANCE));
-        if (!result.committed()) {
-            throw new AssertionError(result.diagnostics().toString());
-        }
-        return result.value();
+        ComponentFactory<NoConfig> factory = factory(componentId, component);
+        return runtime.transact(transaction ->
+                transaction.mount(context, mountId, factory)).value();
     }
 
     static NoConfig noConfig() {
@@ -71,24 +70,18 @@ final class TestKit {
             ContextHandle context,
             CapabilityKey<String> key,
             String value) {
-        MutationResult<RegistrationHandle> result = runtime.mutate(mutation ->
-                mutation.provide(context, key, value));
-        if (!result.committed()) {
-            throw new AssertionError(result.diagnostics().toString());
-        }
-        return result.value();
+        return runtime.transact(transaction ->
+                transaction.provide(context, key, value)).value();
     }
 
     static ContextHandle child(KnotraRuntime runtime, ContextHandle parent, String name) {
-        MutationResult<ContextHandle> result = runtime.mutate(mutation ->
-                mutation.childContext(parent, name));
-        if (!result.committed()) {
-            throw new AssertionError(result.diagnostics().toString());
-        }
-        return result.value();
+        return runtime.transact(transaction ->
+                transaction.childContext(parent, name)).value();
     }
 
-    static RuntimeSnapshot.ComponentSnapshot component(KnotraRuntime runtime, ComponentHandle<?> handle) {
+    static RuntimeSnapshot.ComponentSnapshot component(
+            KnotraRuntime runtime,
+            ComponentHandle<?> handle) {
         return runtime.snapshot().components().stream()
                 .filter(item -> item.handleId().equals(handle.handleId()))
                 .findFirst()
@@ -99,15 +92,23 @@ final class TestKit {
         return () -> handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
-    static void assertCommitted(MutationResult<?> result) {
-        if (!result.committed()) {
-            throw new AssertionError(result.diagnostics().toString());
+    static void assertCommitted(TransactionReceipt<?> receipt) {
+        if (receipt == null || receipt.generation() < 0) {
+            throw new AssertionError("transaction did not return a valid receipt");
         }
     }
 
-    static void assertRejected(MutationResult<?> result, DiagnosticCode code) {
-        if (result.committed() || result.diagnostics().getFirst().code() != code) {
-            throw new AssertionError(result.diagnostics().toString());
+    static TransactionRejectedException assertRejected(Attempt attempt, DiagnosticCode code) {
+        try {
+            attempt.run();
+        } catch (TransactionRejectedException rejection) {
+            if (rejection.diagnostics().getFirst().code() != code) {
+                throw new AssertionError(rejection.diagnostics().toString());
+            }
+            return rejection;
+        } catch (Exception error) {
+            throw new AssertionError("unexpected exception", error);
         }
+        throw new AssertionError("transaction was committed");
     }
 }

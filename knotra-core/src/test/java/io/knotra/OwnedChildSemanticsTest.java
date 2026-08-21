@@ -29,11 +29,11 @@ final class OwnedChildSemanticsTest {
         AtomicReference<ComponentHandle<NoConfig>> secondGrandchild = new AtomicReference<>();
         AtomicInteger starts = new AtomicInteger();
 
-        var parent = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(),
+        var parent = runtime.transact(mutation -> mutation.mount(
+                runtime.root(),
                 "parent",
                 TestKit.factory("parent", new TestKit.Scripted<>(
-                        ComponentDescriptor.of("parent"),
+                        ComponentDescriptor.named("parent"),
                         (context, config) -> {
                             starts.incrementAndGet();
                             ComponentHandle<NoConfig> child = context.mountChild(
@@ -54,7 +54,7 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(firstGrandchild.get()).call());
         String firstParentActivation = TestKit.component(runtime, parent).currentActivationId();
 
-        assertEquals(ComponentState.ACTIVE, parent.reconfigure(new Config("two"))
+        assertEquals(ComponentState.ACTIVE, parent.reconfigureAsync(new Config("two"))
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(secondChild.get()).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(secondGrandchild.get()).call());
@@ -90,8 +90,8 @@ final class OwnedChildSemanticsTest {
         AtomicInteger starts = new AtomicInteger();
 
         RegistrationHandle firstProvider = TestKit.provide(
-                runtime, runtime.rootContext(), A, "one");
-        var parent = TestKit.mount(runtime, runtime.rootContext(), "parent",
+                runtime, runtime.root(), A, "one");
+        var parent = TestKit.mount(runtime, runtime.root(), "parent",
                 (context, config) -> {
                     ComponentHandle<NoConfig> child = context.mountChild(
                             "child", childFactory("ignored-grandchild", new AtomicReference<>()),
@@ -105,9 +105,9 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(oldChild.get()).call());
 
-        var replacement = runtime.mutate(mutation -> {
+        var replacement = runtime.transact(mutation -> {
             mutation.revoke(firstProvider);
-            mutation.provide(runtime.rootContext(), A, "two");
+            mutation.provide(runtime.root(), A, "two");
             return null;
         });
         TestKit.assertCommitted(replacement);
@@ -140,18 +140,18 @@ final class OwnedChildSemanticsTest {
         AtomicInteger starts = new AtomicInteger();
 
         ComponentFactory<NoConfig> failingChildFactory = TestKit.factory("child",
-                new TestKit.Scripted<>(ComponentDescriptor.of("child"),
+                new TestKit.Scripted<>(ComponentDescriptor.named("child"),
                         (context, config) -> context.lifecycle().onClose("cleanup", () -> {
                             cleanupAttempts.incrementAndGet();
                             if (failCleanup.getAndSet(false)) {
                                 throw new IllegalStateException("child cleanup failed");
                             }
                         })));
-        var parent = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(),
+        var parent = runtime.transact(mutation -> mutation.mount(
+                runtime.root(),
                 "parent",
                 TestKit.factory("parent", new TestKit.Scripted<>(
-                        ComponentDescriptor.of("parent"),
+                        ComponentDescriptor.named("parent"),
                         (context, config) -> {
                             ComponentHandle<NoConfig> child = context.mountChild(
                                     "child", failingChildFactory, NoConfig.INSTANCE);
@@ -166,16 +166,16 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(oldChild.get()).call());
 
-        assertEquals(ComponentState.FAILED, parent.reconfigure(new Config("two"))
+        assertEquals(ComponentState.FAILED, parent.reconfigureAsync(new Config("two"))
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.FAILED, oldChild.get().state());
         assertEquals(ComponentGoal.DISPOSED, oldChild.get().goal());
         assertEquals(1, cleanupAttempts.get());
 
-        assertEquals(ComponentState.DISPOSED, oldChild.get().retry()
+        assertEquals(ComponentState.DISPOSED, oldChild.get().retryAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(2, cleanupAttempts.get());
-        assertEquals(ComponentState.ACTIVE, parent.retry()
+        assertEquals(ComponentState.ACTIVE, parent.retryAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(newChild.get()).call());
 
@@ -190,30 +190,30 @@ final class OwnedChildSemanticsTest {
 
     @Test
     void runnableDisposerApiRequiresNoCast() throws Exception {
-        var handle = TestKit.mount(runtime, runtime.rootContext(), "scope",
+        var handle = TestKit.mount(runtime, runtime.root(), "scope",
                 (context, config) -> {
                     context.lifecycle().onClose("plain", () -> { });
                     context.lifecycle().manage("resource", new TestResource());
                 });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        handle.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
     @Test
     void handlesCompareOnlyWithinExactRuntimeImplementation() throws Exception {
         KnotraRuntime other = KnotraRuntime.create();
         try {
-            assertFalse(runtime.rootContext().equals(other.rootContext()));
-            assertFalse(runtime.rootContext().equals(new ExternalContext("ctx-root")));
+            assertFalse(runtime.root().equals(other.root()));
+            assertFalse(runtime.root().equals(new ExternalContext("ctx-root")));
 
-            var component = TestKit.mount(runtime, runtime.rootContext(), "component",
+            var component = TestKit.mount(runtime, runtime.root(), "component",
                     (context, config) -> { });
             assertFalse(component.equals(new ExternalComponent(component.handleId())));
             assertFalse(component.equals(null));
             assertEquals(component.hashCode(), component.hashCode());
 
             RegistrationHandle registration = TestKit.provide(
-                    runtime, runtime.rootContext(), A, "value");
+                    runtime, runtime.root(), A, "value");
             assertFalse(registration.equals(new ExternalRegistration(registration.registrationId())));
             assertEquals(registration.hashCode(), registration.hashCode());
         } finally {
@@ -225,11 +225,11 @@ final class OwnedChildSemanticsTest {
             String mountId,
             AtomicReference<ComponentHandle<NoConfig>> mounted) {
         return TestKit.factory("child-owner", new TestKit.Scripted<>(
-                ComponentDescriptor.of("child-owner"),
+                ComponentDescriptor.named("child-owner"),
                 (context, config) -> mounted.set(context.mountChild(
                         mountId,
                         TestKit.factory("grandchild", new TestKit.Scripted<>(
-                                ComponentDescriptor.of("grandchild"),
+                                ComponentDescriptor.named("grandchild"),
                                 (grandchildContext, grandchildConfig) -> { })),
                         NoConfig.INSTANCE))));
     }
@@ -250,12 +250,12 @@ final class OwnedChildSemanticsTest {
         }
 
         @Override
-        public ContextInfo contextInfo() {
+        public ContextInfo info() {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public RuntimeContext context() {
+        public ContextView view() {
             throw new UnsupportedOperationException();
         }
 
@@ -265,7 +265,7 @@ final class OwnedChildSemanticsTest {
         }
 
         @Override
-        public CompletionStage<Void> disposeAsync() {
+        public CompletionStage<ContextState> disposeAsync() {
             throw new UnsupportedOperationException();
         }
     }
@@ -323,21 +323,20 @@ final class OwnedChildSemanticsTest {
         }
 
         @Override
-        public CompletionStage<ComponentState> reconfigure(NoConfig config) {
+        public CompletionStage<ComponentState> reconfigureAsync(NoConfig config) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public CompletionStage<ComponentState> retry() {
+        public CompletionStage<ComponentState> retryAsync() {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public CompletionStage<ComponentState> dispose() {
+        public CompletionStage<ComponentState> disposeAsync() {
             throw new UnsupportedOperationException();
         }
     }
-
     private record ExternalRegistration(String registrationId) implements RegistrationHandle {
     }
 }

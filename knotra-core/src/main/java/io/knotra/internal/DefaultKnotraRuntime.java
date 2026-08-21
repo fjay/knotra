@@ -9,7 +9,6 @@ import io.knotra.ComponentHandle;
 import io.knotra.ComponentFactory;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
-import io.knotra.ConfigSchema;
 import io.knotra.ContextHandle;
 import io.knotra.ContextInfo;
 import io.knotra.ContextState;
@@ -18,10 +17,11 @@ import io.knotra.KnotraConfig;
 import io.knotra.KnotraRuntime;
 import io.knotra.LifecycleState;
 import io.knotra.MountOptions;
-import io.knotra.MutationResult;
+import io.knotra.TransactionReceipt;
+import io.knotra.TransactionRejectedException;
 import io.knotra.RegistrationHandle;
 import io.knotra.RuntimeDiagnostic;
-import io.knotra.RuntimeMutation;
+import io.knotra.RuntimeTransaction;
 import io.knotra.RuntimeSnapshot;
 
 import java.util.ArrayList;
@@ -49,7 +49,7 @@ import java.util.stream.Collectors;
  * Runtime 内核的默认实现，拥有宿主事务、Activation 状态机和组件过渡调度。
  *
  * <p>已提交结构保存在 volatile 的 {@link RuntimeView} 中；所有草稿校验、代际发布和可执行索引同步
- * 都在 {@code coordinator} 临界区内完成。工厂、schema 和用户 {@code start()} 不持有协调器锁，因此
+ * 都在 {@code coordinator} 临界区内完成。Factory、normalizer 和用户 {@code start()} 不持有协调器锁，因此
  * 慢用户代码只能阻塞自身 Activation，不能阻塞其他宿主事务或 Snapshot。Activation 提交前把注册和
  * 子挂载留在 {@link ActivationRuntime}，验证成功后随同一代际发布；stale 候选则回滚其 LifecycleScope，
  * 并按最新 BindingSet 重新调度。</p>
@@ -97,13 +97,8 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     @Override
-    public ContextHandle rootContext() {
+    public ContextHandle root() {
         return contextHandles.get("ctx-root");
-    }
-
-    @Override
-    public RuntimeContextImpl context() {
-        return new RuntimeContextImpl(this, "ctx-root");
     }
 
     @Override
@@ -132,62 +127,61 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     @Override
-    public <R> MutationResult<R> mutate(Function<RuntimeMutation, R> action) {
+    public <R> TransactionReceipt<R> transact(Function<RuntimeTransaction, R> action) {
         Objects.requireNonNull(action, "action");
         MutationRecorder recorder = new MutationRecorder();
-        // 宿主回调和工厂/schema 用户代码在协调器锁外执行；此阶段只记录意图，失败不会产生代际。
         R callbackValue;
         try {
             callbackValue = action.apply(recorder);
+        } catch (TransactionRejectedException rejection) {
+            throw rejection;
         } catch (Reject rejection) {
-            return MutationResult.rejected(List.of(rejection.diagnostic()));
+            throw new TransactionRejectedException(List.of(rejection.diagnostic()));
+        } catch (PreparedComponent.InvalidConfigException error) {
+            throw new TransactionRejectedException(List.of(new RuntimeDiagnostic(
+                    DiagnosticCode.INVALID_CONFIG,
+                    configuration.runtimeId(),
+                    LifecycleScopeImpl.safeError(error))));
         } catch (RuntimeException error) {
-            return MutationResult.rejected(List.of(new RuntimeDiagnostic(
+            throw new TransactionRejectedException(List.of(new RuntimeDiagnostic(
                     DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
                     configuration.runtimeId(),
                     LifecycleScopeImpl.safeError(error))));
         }
 
-        long committedGeneration = -1;
+        long committedGeneration;
         Set<String> postCommitDirty = new LinkedHashSet<>();
         Set<String> contextDisposals = new LinkedHashSet<>();
-        // 临界区只做确定性校验和发布；任何 Reject 都丢弃草稿，不能留下部分结构或可执行索引。
         synchronized (coordinator) {
             if (closing.get()) {
-                return MutationResult.rejected(List.of(new RuntimeDiagnostic(
+                throw new TransactionRejectedException(List.of(new RuntimeDiagnostic(
                         DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
                         configuration.runtimeId(),
                         "runtime is closing")));
             }
             if (recorder.intents.isEmpty()) {
-                return MutationResult.committed(
+                return new TransactionReceipt<>(
                         callbackValue,
                         view.generation,
                         CompletableFuture.completedFuture(null));
             }
 
-            // 先在草稿中应用全部意图并计算绑定影响，再决定是否发布，保证多操作事务是原子的。
             RuntimeView.Draft draft = new RuntimeView.Draft(view);
             ExecutableCommitPlan executable = new ExecutableCommitPlan();
             Set<String> dirty = new LinkedHashSet<>();
             boolean viewChanged = false;
             try {
                 for (Intent intent : recorder.intents) {
-                    viewChanged |= applyIntent(
-                            draft,
-                            intent,
-                            dirty,
-                            executable);
+                    viewChanged |= applyIntent(draft, intent, dirty, executable);
                 }
                 markBindingImpacts(draft, dirty, executable);
                 refreshDiagnostics(draft);
                 if (!viewChanged) {
-                    return MutationResult.committed(
+                    return new TransactionReceipt<>(
                             callbackValue,
                             view.generation,
                             CompletableFuture.completedFuture(null));
                 }
-                // 视图替换和可执行索引同步留在同一临界区，外部观察只能看到提交前或提交后的组合。
                 RuntimeView next = draft.publishOnce();
                 view = next;
                 commitExecutable(next, recorder.intents, executable);
@@ -195,28 +189,23 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 postCommitDirty.addAll(dirty);
                 contextDisposals.addAll(executable.contextDisposals);
             } catch (Reject rejection) {
-                return MutationResult.rejected(List.of(rejection.diagnostic()));
+                throw new TransactionRejectedException(List.of(rejection.diagnostic()));
             }
         }
 
-        // 过渡调度和用户 start() 必须离开协调器，事务 settlement 只聚合这些异步结果。
         List<CompletableFuture<?>> componentSettlements =
                 new ArrayList<>(schedule(postCommitDirty));
         CompletableFuture<Void> componentSettlement = componentSettlements.isEmpty()
                 ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.allOf(componentSettlements.toArray(
-                        new CompletableFuture[0]));
+                : CompletableFuture.allOf(componentSettlements.toArray(CompletableFuture[]::new));
         List<CompletableFuture<?>> settlements = new ArrayList<>(componentSettlements);
         for (String contextId : outermostContextDisposals(contextDisposals)) {
             settlements.add(settleContextDisposal(contextId, componentSettlement));
         }
         CompletableFuture<Void> settlement = settlements.isEmpty()
                 ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.allOf(settlements.toArray(new CompletableFuture[0]));
-        return MutationResult.committed(
-                callbackValue,
-                committedGeneration,
-                settlement);
+                : CompletableFuture.allOf(settlements.toArray(CompletableFuture[]::new));
+        return new TransactionReceipt<>(callbackValue, committedGeneration, settlement);
     }
 
     @Override
@@ -329,17 +318,15 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     <C> CompletionStage<ComponentState> reconfigure(
             ComponentHandleImpl<C> handle,
             C config) {
-        MutationResult<Void> result = mutate(mutation -> {
-            mutation.reconfigure(handle, config);
-            return null;
-        });
-        if (!result.committed()) {
-            CompletableFuture<ComponentState> rejected = new CompletableFuture<>();
-            rejected.completeExceptionally(new IllegalStateException(
-                    result.diagnostics().getFirst().message()));
-            return rejected;
+        try {
+            transact(transaction -> {
+                transaction.reconfigure(handle, config);
+                return null;
+            });
+            return whenSettled(handle.handleId());
+        } catch (TransactionRejectedException rejection) {
+            return CompletableFuture.failedFuture(rejection);
         }
-        return whenSettled(handle.handleId());
     }
 
     <C> CompletionStage<ComponentState> retry(ComponentHandleImpl<C> handle) {
@@ -371,14 +358,14 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             CompletableFuture<ComponentState> request = new CompletableFuture<>();
             disposeRequests.put(handle.handleId(), request);
-            MutationResult<Void> result = mutate(mutation -> {
-                mutation.dispose(handle);
-                return null;
-            });
-            if (!result.committed()) {
+            try {
+                transact(transaction -> {
+                    transaction.dispose(handle);
+                    return null;
+                });
+            } catch (TransactionRejectedException rejection) {
                 disposeRequests.remove(handle.handleId(), request);
-                request.completeExceptionally(new IllegalStateException(
-                        result.diagnostics().getFirst().message()));
+                request.completeExceptionally(rejection);
                 return request;
             }
             settleDisposeRequest(handle.handleId(), request);
@@ -2400,7 +2387,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     // 宿主事务回调的私有记录器：只积累 Intent，不直接修改视图，失败事务中的临时句柄随之失效。
-    private final class MutationRecorder implements RuntimeMutation {
+    private final class MutationRecorder implements RuntimeTransaction {
         private final List<Intent> intents = new ArrayList<>();
         private final Map<String, ProvisionalConfig> provisionalConfigs = new HashMap<>();
         @Override
@@ -2485,6 +2472,23 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
 
         @Override
+        public ComponentHandle<io.knotra.NoConfig> mount(
+                ContextHandle context,
+                String mountId,
+                ComponentFactory<io.knotra.NoConfig> factory) {
+            return mount(context, mountId, factory, io.knotra.NoConfig.INSTANCE, MountOptions.DEFAULT);
+        }
+
+        @Override
+        public ComponentHandle<io.knotra.NoConfig> mount(
+                ContextHandle context,
+                String mountId,
+                ComponentFactory<io.knotra.NoConfig> factory,
+                MountOptions options) {
+            return mount(context, mountId, factory, io.knotra.NoConfig.INSTANCE, options);
+        }
+
+        @Override
         public <C> ComponentHandle<C> reconfigure(
                 ComponentHandle<C> handle,
                 C config) {
@@ -2500,9 +2504,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             PreparedComponent<?> prepared = preparedFor(typed);
             ProvisionalConfig current = provisionalConfigFor(typed, prepared);
-            Object normalized = Objects.requireNonNull(
-                    normalizeFor(prepared, config),
-                    "config schema returned null");
+            Object normalized = normalizeFor(prepared, config);
             long expectedRevision = current.revision();
             boolean equivalent = Objects.equals(normalized, current.config());
             if (!equivalent) {
@@ -2582,11 +2584,11 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
 
         private Object normalizeFor(PreparedComponent<?> prepared, Object rawConfig) {
             try {
-                return prepared.normalize(rawConfig);
-            } catch (RuntimeException error) {
-                throw error;
+                return Objects.requireNonNull(
+                        prepared.normalize(rawConfig),
+                        "config normalizer returned null");
             } catch (Exception error) {
-                throw new IllegalArgumentException(
+                throw new PreparedComponent.InvalidConfigException(
                         LifecycleScopeImpl.safeError(error),
                         error);
             }

@@ -42,20 +42,36 @@ final class StructuralMutationTest {
 
     @Test
     void noConfigIsExplicitAndNonNull() throws Exception {
-        var handle = TestKit.mount(runtime, runtime.rootContext(), "empty",
+        var handle = TestKit.mount(runtime, runtime.root(), "empty",
                 (context, config) -> assertEquals(NoConfig.INSTANCE, config));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
     }
 
     @Test
+    void defaultIdsAndRootNoConfigMountRemoveCommonBoilerplate() throws Exception {
+        ComponentFactory<NoConfig> factory = new ComponentFactory<>() {
+            @Override
+            public Component<NoConfig> create() {
+                return new TestKit.Scripted<>(
+                        ComponentDescriptor.of(),
+                        (context, config) -> assertSame(NoConfig.INSTANCE, config));
+            }
+        };
+
+        ComponentHandle<NoConfig> handle = runtime.mount("defaults", factory);
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
+        assertEquals(factory.getClass().getName(), handle.factoryId());
+        assertEquals(factory.getClass().getName(), handle.componentId());
+    }
+
+    @Test
     void nullConfigIsRejectedInsteadOfNormalizedToNoConfig() {
-        var result = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(),
+        TestKit.assertRejected(() -> runtime.transact(mutation -> mutation.mount(
+                runtime.root(),
                 "bad-null",
                 TestKit.factory("bad-null", new TestKit.Scripted<>(
-                        ComponentDescriptor.of("bad-null"), (context, config) -> {})),
-                null));
-        TestKit.assertRejected(result, DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
+                        ComponentDescriptor.named("bad-null"), (context, config) -> {})),
+                (NoConfig) null)), DiagnosticCode.INVALID_CONFIG);
         assertTrue(runtime.snapshot().components().isEmpty());
     }
 
@@ -71,31 +87,29 @@ final class StructuralMutationTest {
             @Override
             public Component<String> create() {
                 return new TestKit.Scripted<>(
-                        ComponentDescriptor.of("configured"),
+                        ComponentDescriptor.named("configured"),
                         (context, config) -> assertEquals("value", config));
             }
 
             @Override
-            public Optional<ConfigSchema<String>> configSchema() {
-                return Optional.of(raw -> {
-                    validations.incrementAndGet();
-                    if (String.valueOf(raw).isBlank()) {
-                        throw new IllegalArgumentException("blank");
-                    }
-                    return String.valueOf(raw).trim();
-                });
+            public String normalizeConfig(String config) {
+                validations.incrementAndGet();
+                if (config.isBlank()) {
+                    throw new IllegalArgumentException("blank");
+                }
+                return config.trim();
             }
         };
-        var good = runtime.mutate(mutation ->
-                mutation.mount(runtime.rootContext(), "configured", factory, " value "));
+        var good = runtime.transact(mutation ->
+                mutation.mount(runtime.root(), "configured", factory, " value "));
         TestKit.assertCommitted(good);
         assertEquals(ComponentState.ACTIVE, TestKit.settle(good.value()).call());
         assertEquals(1, validations.get());
         assertEquals(1, good.value().configRevision());
 
-        var bad = runtime.mutate(mutation ->
-                mutation.mount(runtime.rootContext(), "other", factory, " "));
-        TestKit.assertRejected(bad, DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
+        TestKit.assertRejected(() -> runtime.transact(mutation ->
+                mutation.mount(runtime.root(), "other", factory, " ")),
+                DiagnosticCode.INVALID_CONFIG);
     }
 
     @Test
@@ -105,7 +119,7 @@ final class StructuralMutationTest {
             @Override
             public ComponentDescriptor descriptor() {
                 descriptorCalls.incrementAndGet();
-                return ComponentDescriptor.of("frozen", CapabilityRequirement.required(TEXT));
+                return ComponentDescriptor.named("frozen", CapabilityRequirement.required(TEXT));
             }
 
             @Override
@@ -113,8 +127,8 @@ final class StructuralMutationTest {
                 assertNotNull(context.find(TEXT));
             }
         };
-        var handle = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "frozen", TestKit.factory("frozen", component),
+        var handle = runtime.transact(mutation -> mutation.mount(
+                runtime.root(), "frozen", TestKit.factory("frozen", component),
                 NoConfig.INSTANCE)).value();
         assertEquals(1, descriptorCalls.get());
         assertEquals(ComponentState.WAITING, handle.state());
@@ -122,35 +136,35 @@ final class StructuralMutationTest {
 
     @Test
     void hostCapabilityIsVisibleAndTyped() {
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "root");
-        assertEquals("root", runtime.context().require(TEXT));
-        assertEquals(Optional.of("root"), runtime.context().find(TEXT));
+        TestKit.provide(runtime, runtime.root(), TEXT, "root");
+        assertEquals("root", runtime.root().view().require(TEXT));
+        assertEquals(Optional.of("root"), runtime.root().view().find(TEXT));
     }
 
     @Test
     void capabilityNameHasOneExactJavaType() {
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "value");
-        var conflicting = runtime.mutate(mutation ->
-                mutation.provide(runtime.rootContext(), TEXT_LIST, List.of("value")));
-        TestKit.assertRejected(conflicting, DiagnosticCode.CAPABILITY_TYPE_CONFLICT);
+        TestKit.provide(runtime, runtime.root(), TEXT, "value");
+        TestKit.assertRejected(() -> runtime.transact(mutation ->
+                mutation.provide(runtime.root(), TEXT_LIST, List.of("value"))),
+                DiagnosticCode.CAPABILITY_TYPE_CONFLICT);
     }
 
     @Test
     void valueMustMatchCapabilityKeyType() {
-        var result = provideWrongValueType();
-        TestKit.assertRejected(result, DiagnosticCode.CAPABILITY_TYPE_CONFLICT);
+        TestKit.assertRejected(() -> provideWrongValueType(),
+                DiagnosticCode.CAPABILITY_TYPE_CONFLICT);
     }
 
-    private MutationResult<RegistrationHandle> provideWrongValueType() {
-        return runtime.mutate(action -> {
+    private TransactionReceipt<RegistrationHandle> provideWrongValueType() {
+        return runtime.transact(action -> {
             try {
-                var provide = RuntimeMutation.class.getMethod(
+                var provide = RuntimeTransaction.class.getMethod(
                         "provide",
                         ContextHandle.class,
                         CapabilityKey.class,
                         Object.class);
                 provide.setAccessible(true);
-                provide.invoke(action, runtime.rootContext(), NUMBER, "bad");
+                provide.invoke(action, runtime.root(), NUMBER, "bad");
             } catch (ReflectiveOperationException error) {
                 throw new AssertionError(error);
             }
@@ -160,63 +174,60 @@ final class StructuralMutationTest {
 
     @Test
     void childShadowsParentAndFallsBackAfterRevoke() {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "workspace");
-        var rootRegistration = TestKit.provide(runtime, runtime.rootContext(), TEXT, "root");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "workspace");
+        var rootRegistration = TestKit.provide(runtime, runtime.root(), TEXT, "root");
         TestKit.provide(runtime, child, TEXT, "child");
-        assertEquals("child", child.context().require(TEXT));
-        TestKit.assertCommitted(runtime.mutate(mutation -> {
+        assertEquals("child", child.view().require(TEXT));
+        TestKit.assertCommitted(runtime.transact(mutation -> {
             mutation.revoke(rootRegistration);
             return null;
         }));
-        assertEquals("child", child.context().require(TEXT));
+        assertEquals("child", child.view().require(TEXT));
     }
 
     @Test
     void contextSlotCannotBeOccupiedTwice() {
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "first");
-        var second = runtime.mutate(mutation ->
-                mutation.provide(runtime.rootContext(), TEXT, "second"));
-        TestKit.assertRejected(second, DiagnosticCode.CAPABILITY_SLOT_OCCUPIED);
-        assertEquals("first", runtime.context().require(TEXT));
+        TestKit.provide(runtime, runtime.root(), TEXT, "first");
+        TestKit.assertRejected(() -> runtime.transact(mutation ->
+                mutation.provide(runtime.root(), TEXT, "second")),
+                DiagnosticCode.CAPABILITY_SLOT_OCCUPIED);
+        assertEquals("first", runtime.root().view().require(TEXT));
     }
 
     @Test
     void siblingContextNamesAreUnique() {
-        TestKit.child(runtime, runtime.rootContext(), "workspace");
-        var duplicate = runtime.mutate(mutation ->
-                mutation.childContext(runtime.rootContext(), "workspace"));
-        TestKit.assertRejected(duplicate, DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
+        TestKit.child(runtime, runtime.root(), "workspace");
+        TestKit.assertRejected(() -> runtime.transact(mutation ->
+                mutation.childContext(runtime.root(), "workspace")),
+                DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
     }
 
     @Test
     void failedMultiOperationTransactionHasNoPartialCommit() {
         long generation = runtime.snapshot().generation();
-        var result = runtime.mutate(mutation -> {
-            mutation.childContext(runtime.rootContext(), "new-child");
-            mutation.provide(runtime.rootContext(), TEXT, "value");
-            mutation.mount(runtime.rootContext(), "duplicate",
+        TestKit.assertRejected(() -> runtime.transact(mutation -> {
+            mutation.childContext(runtime.root(), "new-child");
+            mutation.provide(runtime.root(), TEXT, "value");
+            mutation.mount(runtime.root(), "duplicate",
                     TestKit.factory("duplicate", new TestKit.Scripted<>(
-                            ComponentDescriptor.of("duplicate"), (context, config) -> {})),
-                    NoConfig.INSTANCE);
-            mutation.mount(runtime.rootContext(), "duplicate",
+                            ComponentDescriptor.named("duplicate"), (context, config) -> {})));
+            mutation.mount(runtime.root(), "duplicate",
                     TestKit.factory("duplicate", new TestKit.Scripted<>(
-                            ComponentDescriptor.of("duplicate"), (context, config) -> {})),
-                    NoConfig.INSTANCE);
+                            ComponentDescriptor.named("duplicate"), (context, config) -> {})));
             return "unused";
-        });
-        TestKit.assertRejected(result, DiagnosticCode.INVALID_MOUNT_ID);
+        }), DiagnosticCode.INVALID_MOUNT_ID);
         assertEquals(generation, runtime.snapshot().generation());
-        assertTrue(runtime.context().find(TEXT).isEmpty());
+        assertTrue(runtime.root().view().find(TEXT).isEmpty());
         assertTrue(runtime.snapshot().contexts().stream()
                 .noneMatch(context -> context.name().equals("new-child")));
     }
 
     @Test
     void provisionalHandlesCanSupportLaterIntentsInSameTransaction() throws Exception {
-        var result = runtime.mutate(mutation -> {
-            var handle = mutation.mount(runtime.rootContext(), "first",
+        var result = runtime.transact(mutation -> {
+            var handle = mutation.mount(runtime.root(), "first",
                     TestKit.factory("first", new TestKit.Scripted<>(
-                            ComponentDescriptor.of("first"), (context, config) -> {})),
+                            ComponentDescriptor.named("first"), (context, config) -> {})),
                     "one");
             mutation.reconfigure(handle, "two");
             return handle;
@@ -238,27 +249,25 @@ final class StructuralMutationTest {
             @Override
             public Component<String> create() {
                 return new TestKit.Scripted<>(
-                        ComponentDescriptor.of("null-schema"),
+                        ComponentDescriptor.named("null-schema"),
                         (context, config) -> lastConfig.set(config));
             }
 
             @Override
-            public Optional<ConfigSchema<String>> configSchema() {
-                return Optional.of(raw -> "one".equals(raw) ? (String) raw : null);
+            public String normalizeConfig(String config) {
+                return "one".equals(config) ? config : null;
             }
         };
-        MutationResult<ComponentHandle<String>> mounted = runtime.mutate(mutation ->
-                mutation.mount(runtime.rootContext(), "null-schema", schemaFactory, "one"));
+        TransactionReceipt<ComponentHandle<String>> mounted = runtime.transact(mutation ->
+                mutation.mount(runtime.root(), "null-schema", schemaFactory, "one"));
         TestKit.assertCommitted(mounted);
         ComponentHandle<String> handle = mounted.value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("one", lastConfig.get());
 
-        MutationResult<ComponentHandle<String>> rejected = runtime.mutate(mutation ->
-                mutation.reconfigure(handle, "two"));
-        assertFalse(rejected.committed());
-        assertEquals(DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
-                rejected.diagnostics().getFirst().code());
+        TestKit.assertRejected(() -> runtime.transact(mutation ->
+                mutation.reconfigure(handle, "two")),
+                DiagnosticCode.INVALID_CONFIG);
         assertEquals(1, handle.configRevision());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("one", lastConfig.get());
@@ -266,17 +275,17 @@ final class StructuralMutationTest {
 
     @Test
     void failedTransactionDoesNotLeakUsableProvisionalHandles() throws Exception {
-        var result = runtime.mutate(mutation -> {
-            var handle = mutation.mount(runtime.rootContext(), "leak",
+        AtomicReference<ComponentHandle<NoConfig>> provisional = new AtomicReference<>();
+        TestKit.assertRejected(() -> runtime.transact(mutation -> {
+            var handle = mutation.mount(runtime.root(), "leak",
                     TestKit.factory("leak", new TestKit.Scripted<>(
-                            ComponentDescriptor.of("leak"), (context, config) -> {})),
-                    NoConfig.INSTANCE);
-            mutation.provide(runtime.rootContext(), TEXT, "occupied");
-            mutation.provide(runtime.rootContext(), TEXT, "occupied-again");
+                            ComponentDescriptor.named("leak"), (context, config) -> {})));
+            provisional.set(handle);
+            mutation.provide(runtime.root(), TEXT, "occupied");
+            mutation.provide(runtime.root(), TEXT, "occupied-again");
             return handle;
-        });
-        TestKit.assertRejected(result, DiagnosticCode.CAPABILITY_SLOT_OCCUPIED);
-        assertThrows(IllegalStateException.class, result::value);
+        }), DiagnosticCode.CAPABILITY_SLOT_OCCUPIED);
+        assertEquals(ComponentState.DISPOSED, provisional.get().state());
         assertTrue(runtime.snapshot().components().stream()
                 .noneMatch(component -> component.mountId().equals("leak")));
     }
@@ -288,8 +297,8 @@ final class StructuralMutationTest {
         CompletableFuture<Void> gate = new CompletableFuture<>();
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         try {
-            var mountFuture = executor.submit(() -> runtime.mutate(mutation -> mutation.mount(
-                    runtime.rootContext(),
+            var mountFuture = executor.submit(() -> runtime.transact(mutation -> mutation.mount(
+                    runtime.root(),
                     "blocked",
                     new ComponentFactory<NoConfig>() {
                         @Override
@@ -302,13 +311,13 @@ final class StructuralMutationTest {
                             entered.countDown();
                             gate.join();
                             return new TestKit.Scripted<>(
-                                    ComponentDescriptor.of("blocked"),
+                                    ComponentDescriptor.named("blocked"),
                                     (context, config) -> {});
                         }
                     },
                     NoConfig.INSTANCE)));
             assertTrue(entered.await(10, TimeUnit.SECONDS));
-            TestKit.provide(runtime, runtime.rootContext(), TEXT, "independent");
+            TestKit.provide(runtime, runtime.root(), TEXT, "independent");
             gate.complete(null);
             TestKit.assertCommitted(mountFuture.get(10, TimeUnit.SECONDS));
         } finally {
@@ -319,17 +328,16 @@ final class StructuralMutationTest {
 
     @Test
     void mountIdsAreUniqueWithinContextButReusableAfterDisposal() throws Exception {
-        var first = TestKit.mount(runtime, runtime.rootContext(), "same",
+        var first = TestKit.mount(runtime, runtime.root(), "same",
                 (context, config) -> {});
         assertEquals(ComponentState.ACTIVE, TestKit.settle(first).call());
-        var conflict = runtime.mutate(mutation -> mutation.mount(
-                runtime.rootContext(), "same",
+        TestKit.assertRejected(() -> runtime.transact(mutation -> mutation.mount(
+                runtime.root(), "same",
                 TestKit.factory("other", new TestKit.Scripted<>(
-                        ComponentDescriptor.of("other"), (context, config) -> {})),
-                NoConfig.INSTANCE));
-        TestKit.assertRejected(conflict, DiagnosticCode.INVALID_MOUNT_ID);
-        assertEquals(ComponentState.DISPOSED, first.dispose().toCompletableFuture().get(10, TimeUnit.SECONDS));
-        var replacement = TestKit.mount(runtime, runtime.rootContext(), "same",
+                        ComponentDescriptor.named("other"), (context, config) -> {})))),
+                DiagnosticCode.INVALID_MOUNT_ID);
+        assertEquals(ComponentState.DISPOSED, first.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
+        var replacement = TestKit.mount(runtime, runtime.root(), "same",
                 (context, config) -> {});
         assertEquals(ComponentState.ACTIVE, TestKit.settle(replacement).call());
         assertEquals(ComponentOrigin.Kind.HOST, TestKit.component(runtime, replacement).origin().kind());
@@ -337,8 +345,8 @@ final class StructuralMutationTest {
 
     @Test
     void mountIdCanRepeatAcrossDifferentContexts() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "other-context");
-        var rootHandle = TestKit.mount(runtime, runtime.rootContext(), "same",
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "other-context");
+        var rootHandle = TestKit.mount(runtime, runtime.root(), "same",
                 (context, config) -> {});
         var childHandle = TestKit.mount(runtime, child, "same",
                 (context, config) -> {});
@@ -349,10 +357,10 @@ final class StructuralMutationTest {
 
     @Test
     void repeatedSnapshotsAreStable() throws Exception {
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "value");
-        TestKit.child(runtime, runtime.rootContext(), "z");
-        TestKit.child(runtime, runtime.rootContext(), "a");
-        var handle = TestKit.mount(runtime, runtime.rootContext(), "component",
+        TestKit.provide(runtime, runtime.root(), TEXT, "value");
+        TestKit.child(runtime, runtime.root(), "z");
+        TestKit.child(runtime, runtime.root(), "a");
+        var handle = TestKit.mount(runtime, runtime.root(), "component",
                 (context, config) -> context.provide(NUMBER, (Number) 1));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(runtime.snapshot(), runtime.snapshot());
@@ -360,22 +368,22 @@ final class StructuralMutationTest {
 
     @Test
     void disposedContextRejectsStructuralMutation() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "closed");
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "closed");
         child.close();
-        var result = runtime.mutate(mutation -> mutation.provide(
-                child, NUMBER, (Number) 2));
-        TestKit.assertRejected(result, DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
+        TestKit.assertRejected(() -> runtime.transact(mutation -> mutation.provide(
+                child, NUMBER, (Number) 2)),
+                DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
     }
 
     @Test
     void contextDisposeRemovesHostRegistrationsFromSubtree() throws Exception {
-        ContextHandle child = TestKit.child(runtime, runtime.rootContext(), "child");
-        TestKit.provide(runtime, runtime.rootContext(), TEXT, "root");
-        TestKit.assertCommitted(runtime.mutate(mutation ->
+        ContextHandle child = TestKit.child(runtime, runtime.root(), "child");
+        TestKit.provide(runtime, runtime.root(), TEXT, "root");
+        TestKit.assertCommitted(runtime.transact(mutation ->
                 mutation.provide(child, NUMBER, (Number) 7)));
         child.close();
-        assertTrue(runtime.context().find(NUMBER).isEmpty());
-        assertTrue(runtime.context().find(TEXT).isPresent());
+        assertTrue(runtime.root().view().find(NUMBER).isEmpty());
+        assertTrue(runtime.root().view().find(TEXT).isPresent());
         assertEquals(ContextState.DISPOSED, child.state());
     }
 }

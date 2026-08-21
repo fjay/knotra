@@ -42,6 +42,11 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>io.knotra</groupId>
+            <artifactId>knotra-pf4j-loader</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>

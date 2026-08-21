@@ -7,13 +7,7 @@ import io.knotra.ComponentState;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
-
-/**
- * ComponentHandle 的内核实现，是跨多次 Activation 保持稳定的逻辑挂载点。
- *
- * <p>句柄本身不保存组件实例或资源，全部状态读取和生命周期操作都委托给创建它的
- * {@link DefaultKnotraRuntime}。身份只由 Runtime 实例和 handle ID 组成；同一挂载点重新激活不会更换句柄。</p>
- */
+/** ComponentHandle 的内核实现。 */
 final class ComponentHandleImpl<C> implements ComponentHandle<C> {
     final DefaultKnotraRuntime runtime;
     final String id;
@@ -69,36 +63,28 @@ final class ComponentHandleImpl<C> implements ComponentHandle<C> {
     }
 
     @Override
-    public CompletionStage<ComponentState> reconfigure(C config) {
+    public CompletionStage<ComponentState> reconfigureAsync(C config) {
         return runtime.reconfigure(this, config);
     }
 
     @Override
-    public CompletionStage<ComponentState> retry() {
+    public CompletionStage<ComponentState> retryAsync() {
         return runtime.retry(this);
     }
 
     @Override
-    public CompletionStage<ComponentState> dispose() {
+    public CompletionStage<ComponentState> disposeAsync() {
         return runtime.dispose(this);
     }
 
     CompletionStage<ComponentState> rejected(String message) {
-        CompletableFuture<ComponentState> future = new CompletableFuture<>();
-        future.completeExceptionally(new IllegalStateException(message));
-        return future;
+        return CompletableFuture.failedFuture(new IllegalStateException(message));
     }
 
     @Override
     public boolean equals(Object other) {
-        if (this == other) {
-            return true;
-        }
-        if (other == null || other.getClass() != getClass()) {
-            return false;
-        }
-        ComponentHandleImpl<?> handle = (ComponentHandleImpl<?>) other;
-        return runtime == handle.runtime && id.equals(handle.id);
+        return this == other || other instanceof ComponentHandleImpl<?> handle
+                && runtime == handle.runtime && id.equals(handle.id);
     }
 
     @Override
