@@ -8,7 +8,8 @@ import io.knotra.CapabilityKey;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
+import io.knotra.ConfiguredMountHandle;
+import io.knotra.MountHandle;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
@@ -67,7 +68,7 @@ final class Pf4jArtifactAdapterTest {
             assertEquals(ARTIFACT_ID, snapshot.artifactId());
             assertEquals(ArtifactState.ACTIVE, snapshot.state());
             assertEquals("STARTED", snapshot.pf4jState());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertEquals(
                     List.of("alpha", "beta", "async-cleanup", "in-flight",
                             "lost-race",
@@ -78,7 +79,7 @@ final class Pf4jArtifactAdapterTest {
             ArtifactFactoryCatalogEntry metadata = adapter.factories().find("alpha").orElseThrow();
             assertEquals(String.class.getName(), metadata.configTypeName());
             assertEquals(fixture.toString(), metadata.artifactPath());
-            assertFalse(metadata instanceof ArtifactFactoryHandle<?>);
+            assertFalse(metadata instanceof ArtifactFactoryHandle);
             assertInstanceOf(ArtifactFactoryHandle.class,
                     adapter.factories().resolve("alpha").orElseThrow());
             assertFalse(snapshot.classLoaderDescription().isBlank());
@@ -86,43 +87,29 @@ final class Pf4jArtifactAdapterTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
-    void typedAndRawNullConfigAreRejectedBeforeCreate(@TempDir Path pluginsRoot) throws Exception {
+    void factorySurfaceSplitsNoConfigFromConfiguredMount(@TempDir Path pluginsRoot) throws Exception {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ArtifactFactoryHandle<NoConfig> parent = adapter.factories()
-                    .resolve("parent", NoConfig.class).orElseThrow();
 
+            assertTrue(java.util.Arrays.stream(ArtifactFactoryHandle.class.getMethods())
+                    .noneMatch(method -> method.getName().equals("mount")
+                            || method.getName().equals("decodeConfig")));
+            assertTrue(adapter.factories().resolveNoConfig("alpha").isEmpty());
+            ArtifactFactoryHandle.NoConfig parent = adapter.factories()
+                    .resolveNoConfig("parent").orElseThrow();
+            assertEquals(2, parent.getClass().getMethod(
+                    "mount", io.knotra.ContextHandle.class, String.class).getParameterCount());
+
+            ArtifactFactoryHandle.Configured<String> alpha = adapter.factories()
+                    .resolve("alpha", String.class).orElseThrow();
             ArtifactOperationException typedNull = assertThrows(
                     ArtifactOperationException.class,
-                    () -> parent.mount(runtime.root(), "typed-null", null));
+                    () -> alpha.mount(runtime.root(), "typed-null", null));
             assertEquals("mount", typedNull.phase());
-            assertTrue(typedNull.getMessage().contains(NoConfig.class.getName()),
+            assertTrue(typedNull.getMessage().contains(String.class.getName()),
                     typedNull::getMessage);
-            assertTrue(typedNull.getMessage().contains("mount(context, mountId)"),
-                    typedNull::getMessage);
-            assertTrue(runtime.snapshot().components().isEmpty());
-
-            ArtifactFactoryHandle raw = parent;
-            ArtifactOperationException rawNull = assertThrows(
-                    ArtifactOperationException.class,
-                    () -> raw.mount(runtime.root(), "raw-null", null));
-            assertEquals("mount", rawNull.phase());
-            assertTrue(rawNull.getMessage().contains("mount(context, mountId)"),
-                    rawNull::getMessage);
-            assertTrue(runtime.snapshot().components().isEmpty());
-
-            ArtifactOperationException wrongType = assertThrows(
-                    ArtifactOperationException.class,
-                    () -> raw.mount(runtime.root(), "raw-cast", Integer.valueOf(7)));
-            assertEquals("mount", wrongType.phase());
-            assertTrue(wrongType.getMessage().contains(NoConfig.class.getName()),
-                    wrongType::getMessage);
-            assertTrue(wrongType.getMessage().contains(Integer.class.getName()),
-                    wrongType::getMessage);
-
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertTrue(adapter.ownership(ARTIFACT_ID).isEmpty());
             assertTrue(adapter.diagnostic(ARTIFACT_ID).orElseThrow().lastError().isEmpty());
         }
@@ -139,7 +126,7 @@ final class Pf4jArtifactAdapterTest {
             assertTrue(failure.getCause().getMessage().contains(
                     "plugin-private contract type rejected"), failure::toString);
             assertTrue(adapter.factories().list().isEmpty());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         } finally {
             System.clearProperty("knotra.pf4j.test.exportPrivateConfig");
         }
@@ -159,7 +146,7 @@ final class Pf4jArtifactAdapterTest {
             assertEquals(ArtifactState.ACTIVE, adapter.artifact(ARTIFACT_ID).orElseThrow().state());
             assertTrue(adapter.factories().resolve("dependent").isPresent());
             assertTrue(adapter.factories().resolve("alpha").isPresent());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         }
     }
 
@@ -197,7 +184,7 @@ final class Pf4jArtifactAdapterTest {
             assertTrue(structured.getMessage().contains(ARTIFACT_ID), structured::getMessage);
             assertTrue(adapter.artifacts().isEmpty());
             assertTrue(adapter.factories().list().isEmpty());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         }
     }
 
@@ -231,7 +218,7 @@ final class Pf4jArtifactAdapterTest {
                     "intentional PF4J start failure"), failure::toString);
             assertTrue(adapter.artifacts().isEmpty(), () -> adapter.artifacts().toString());
             assertTrue(adapter.factories().list().isEmpty());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             ArtifactDiagnostic diagnostic = adapter.diagnostic(
                     "knotra-start-failure-plugin").orElseThrow();
             assertEquals(ArtifactState.FAILED, diagnostic.state());
@@ -290,15 +277,15 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ArtifactFactoryHandle<String> alpha = adapter.factories()
+            ArtifactFactoryHandle.Configured<String> alpha = adapter.factories()
                     .resolve("alpha", String.class).orElseThrow();
-            io.knotra.ContextHandle firstContext = runtime.transact(mutation ->
+            io.knotra.ContextHandle firstContext = runtime.advanced().transact(mutation ->
                     mutation.childContext(runtime.root(), "first")).value();
-            io.knotra.ContextHandle secondContext = runtime.transact(mutation ->
+            io.knotra.ContextHandle secondContext = runtime.advanced().transact(mutation ->
                     mutation.childContext(runtime.root(), "second")).value();
 
-            ComponentHandle<String> first = alpha.mount(firstContext, "one", " one ");
-            ComponentHandle<String> second = alpha.mount(secondContext, "two", "two");
+            ConfiguredMountHandle<String> first = alpha.mount(firstContext, "one", " one ");
+            ConfiguredMountHandle<String> second = alpha.mount(secondContext, "two", "two");
 
             assertNotEquals(first.handleId(), second.handleId());
             assertEquals(ComponentState.ACTIVE, settle(first));
@@ -317,7 +304,7 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<String> handle = adapter.factories()
+            ConfiguredMountHandle<String> handle = adapter.factories()
                     .resolve("alpha", String.class).orElseThrow()
                     .mount(runtime.root(), "configured", " one ");
 
@@ -335,7 +322,7 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<String> handle = adapter.factories()
+            ConfiguredMountHandle<String> handle = adapter.factories()
                     .resolve("alpha", String.class).orElseThrow()
                     .mount(runtime.root(), "configured", "one");
             assertEquals(ComponentState.ACTIVE, settle(handle));
@@ -352,23 +339,23 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ArtifactFactoryHandle<String> alpha = adapter.factories()
+            ArtifactFactoryHandle.Configured<String> alpha = adapter.factories()
                     .resolve("alpha", String.class).orElseThrow();
-            ArtifactFactoryHandle<NoConfig> parent = adapter.factories()
-                    .resolve("parent", NoConfig.class).orElseThrow();
+            ArtifactFactoryHandle.NoConfig parent = adapter.factories()
+                    .resolveNoConfig("parent").orElseThrow();
 
             String decoded = alpha.decodeConfig(java.util.Map.of("value", " one "));
             assertEquals(" one ", decoded);
             assertEquals(String.class, decoded.getClass());
-            assertEquals(NoConfig.INSTANCE, parent.decodeConfig(null));
+            assertTrue(parent.noConfig());
             assertEquals(String.class, alpha.configType());
 
-            ArtifactFactoryHandle<?> wildcard = adapter.factories()
+            ArtifactFactoryHandle wildcard = adapter.factories()
                     .resolve("alpha").orElseThrow();
-            assertTrue(wildcard instanceof ArtifactFactoryHandle<?>);
+            assertTrue(wildcard instanceof ArtifactFactoryHandle);
             ArtifactFactoryCatalogEntry metadata = adapter.factories()
                     .find("alpha").orElseThrow();
-            assertFalse(metadata instanceof ArtifactFactoryHandle<?>);
+            assertFalse(metadata instanceof ArtifactFactoryHandle);
             assertThrows(IllegalArgumentException.class, () ->
                     adapter.factories().resolve("alpha", NoConfig.class));
             assertThrows(ArtifactOperationException.class, () ->
@@ -385,12 +372,12 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<NoConfig> parent = adapter.factories()
-                    .resolve("parent", NoConfig.class).orElseThrow()
+            MountHandle parent = adapter.factories()
+                    .resolveNoConfig("parent").orElseThrow()
                     .mount(runtime.root(), "parent");
             assertEquals(ComponentState.ACTIVE, settle(parent));
 
-            RuntimeSnapshot.ComponentSnapshot child = runtime.snapshot().components().stream()
+            RuntimeSnapshot.MountSnapshot child = runtime.advanced().snapshot().mounts().stream()
                     .filter(item -> item.mountId().equals("artifact-child"))
                     .findFirst().orElseThrow();
             assertEquals(ComponentOrigin.Kind.ARTIFACT, child.origin().kind());
@@ -399,7 +386,7 @@ final class Pf4jArtifactAdapterTest {
             assertEquals(2, adapter.ownership(ARTIFACT_ID).size());
 
             adapter.unloadArtifactAsync(ARTIFACT_ID).toCompletableFuture().join();
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertTrue(adapter.ownership(ARTIFACT_ID).isEmpty());
         }
     }
@@ -411,11 +398,11 @@ final class Pf4jArtifactAdapterTest {
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime);
              ExecutorService executor = Executors.newSingleThreadExecutor()) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ArtifactFactoryHandle<NoConfig> inFlight = adapter.factories()
-                    .resolve("in-flight", NoConfig.class).orElseThrow();
+            ArtifactFactoryHandle.NoConfig inFlight = adapter.factories()
+                    .resolveNoConfig("in-flight").orElseThrow();
 
-            CompletableFuture<ComponentHandle<NoConfig>> mount = CompletableFuture.supplyAsync(
-                    () -> inFlight.mount(runtime.root(), "late", NoConfig.INSTANCE),
+            CompletableFuture<MountHandle> mount = CompletableFuture.supplyAsync(
+                    () -> inFlight.mount(runtime.root(), "late"),
                     executor);
             MountCoordinator.entered().get(10, TimeUnit.SECONDS);
             CompletableFuture<Void> unload = adapter.unloadArtifactAsync(ARTIFACT_ID).toCompletableFuture();
@@ -428,7 +415,7 @@ final class Pf4jArtifactAdapterTest {
             unload.toCompletableFuture().join();
             assertEquals(ArtifactState.UNLOADED,
                     adapter.artifact(ARTIFACT_ID).orElseThrow().state());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         }
     }
 
@@ -444,15 +431,13 @@ final class Pf4jArtifactAdapterTest {
                      Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime);
                      ExecutorService executor = Executors.newSingleThreadExecutor()) {
                     adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-                    ArtifactFactoryHandle<NoConfig> factory = adapter.factories()
-                            .resolve("lost-race", NoConfig.class).orElseThrow();
+                    ArtifactFactoryHandle.NoConfig factory = adapter.factories()
+                            .resolveNoConfig("lost-race").orElseThrow();
 
                     int attempt = iteration;
-                    CompletableFuture<ComponentHandle<NoConfig>> mount =
+                    CompletableFuture<MountHandle> mount =
                             CompletableFuture.supplyAsync(() ->
-                                    factory.mount(runtime.root(),
-                                            "lost-" + attempt,
-                                            NoConfig.INSTANCE),
+                                    factory.mount(runtime.root(), "lost-" + attempt),
                                     executor);
                     MountCoordinator.entered().get(10, TimeUnit.SECONDS);
                     CompletableFuture<Void> unload = adapter.unloadArtifactAsync(ARTIFACT_ID).toCompletableFuture();
@@ -460,7 +445,7 @@ final class Pf4jArtifactAdapterTest {
                             adapter.artifact(ARTIFACT_ID).orElseThrow().state());
 
                     MountCoordinator.releaseCreate();
-                    ComponentHandle<NoConfig> accepted = null;
+                    MountHandle accepted = null;
                     try {
                         accepted = mount.toCompletableFuture().join();
                     } catch (CompletionException expected) {
@@ -481,7 +466,7 @@ final class Pf4jArtifactAdapterTest {
                     if (accepted != null) {
                         assertEquals(ComponentState.DISPOSED, accepted.state());
                     }
-                    assertTrue(runtime.snapshot().components().isEmpty());
+                    assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
                 }
             }
             assertCollectorsReachZero();
@@ -495,9 +480,9 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<NoConfig> handle = adapter.factories()
-                    .resolve("async-cleanup", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "async", NoConfig.INSTANCE);
+            MountHandle handle = adapter.factories()
+                    .resolveNoConfig("async-cleanup").orElseThrow()
+                    .mount(runtime.root(), "async");
             assertEquals(ComponentState.ACTIVE, settle(handle));
             ControlledGate gate = runtime.root().view().require(GATE);
             assertFalse(gate.disposed());
@@ -521,9 +506,9 @@ final class Pf4jArtifactAdapterTest {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
             CleanupCoordinator.reset();
             CleanupCoordinator.failNextCleanup();
-            ComponentHandle<NoConfig> handle = adapter.factories()
-                    .resolve("failing-cleanup", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "retry-cleanup", NoConfig.INSTANCE);
+            MountHandle handle = adapter.factories()
+                    .resolveNoConfig("failing-cleanup").orElseThrow()
+                    .mount(runtime.root(), "retry-cleanup");
             assertEquals(ComponentState.ACTIVE, settle(handle));
 
             CompletableFuture<Void> unload = adapter.unloadArtifactAsync(ARTIFACT_ID).toCompletableFuture();
@@ -580,7 +565,7 @@ final class Pf4jArtifactAdapterTest {
                     adapter.artifact(DEPENDENT_ID).orElseThrow().state());
             assertEquals(ArtifactState.UNLOADED,
                     adapter.artifact(ARTIFACT_ID).orElseThrow().state());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         }
     }
 
@@ -589,11 +574,10 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<NoConfig> external = runtime.transact(transaction -> transaction.mount(
+            MountHandle external = runtime.advanced().transact(transaction -> transaction.mount(
                     runtime.root(),
                     "snapshot-only-root",
                     hostFactory(),
-                    NoConfig.INSTANCE,
                     new MountOptions(ComponentOrigin.artifact(
                             ARTIFACT_ID, "1.0.0", "host-mounted artifact root")))).value();
             assertEquals(ComponentState.ACTIVE, settle(external));
@@ -622,7 +606,7 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ArtifactFactoryHandle<String> stale = adapter.factories()
+            ArtifactFactoryHandle.Configured<String> stale = adapter.factories()
                     .resolve("alpha", String.class).orElseThrow();
             adapter.unloadArtifactAsync(ARTIFACT_ID).toCompletableFuture().join();
 
@@ -630,7 +614,7 @@ final class Pf4jArtifactAdapterTest {
                     ArtifactOperationException.class,
                     () -> stale.mount(runtime.root(), "stale", "value"));
             assertEquals("mount", failure.phase());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         }
     }
 
@@ -639,16 +623,16 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ArtifactFactoryHandle<NoConfig> handle = adapter.factories()
-                    .resolve("private-descriptor", NoConfig.class).orElseThrow();
+            ArtifactFactoryHandle.NoConfig handle = adapter.factories()
+                    .resolveNoConfig("private-descriptor").orElseThrow();
 
             ArtifactOperationException failure = assertThrows(
                     ArtifactOperationException.class,
-                    () -> handle.mount(runtime.root(), "private", NoConfig.INSTANCE));
+                    () -> handle.mount(runtime.root(), "private"));
             assertTrue(failure.getMessage().contains("plugin-private"), failure::getMessage);
-            assertTrue(runtime.snapshot().components().stream()
+            assertTrue(runtime.advanced().snapshot().mounts().stream()
                     .noneMatch(item -> item.mountId().equals("private")));
-            runtime.transact(transaction -> transaction.provide(
+            runtime.advanced().transact(transaction -> transaction.provide(
                     runtime.root(),
                     CapabilityKey.of("plugin-private-contract", String.class),
                     "host-owned"));
@@ -660,12 +644,12 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<NoConfig> handle = adapter.factories()
-                    .resolve("private-provide", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "private-provide", NoConfig.INSTANCE);
+            MountHandle handle = adapter.factories()
+                    .resolveNoConfig("private-provide").orElseThrow()
+                    .mount(runtime.root(), "private-provide");
 
             assertEquals(ComponentState.FAILED, settle(handle));
-            assertTrue(runtime.snapshot().registrations().isEmpty());
+            assertTrue(runtime.advanced().snapshot().registrations().isEmpty());
             assertTrue(runtime.root().view().find(
                     CapabilityKey.of("plugin-private-contract", String.class)).isEmpty());
         }
@@ -676,12 +660,12 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<NoConfig> parent = adapter.factories()
-                    .resolve("private-child", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "private-parent", NoConfig.INSTANCE);
+            MountHandle parent = adapter.factories()
+                    .resolveNoConfig("private-child").orElseThrow()
+                    .mount(runtime.root(), "private-parent");
 
             assertEquals(ComponentState.FAILED, settle(parent));
-            assertTrue(runtime.snapshot().components().stream()
+            assertTrue(runtime.advanced().snapshot().mounts().stream()
                     .noneMatch(item -> item.mountId().equals("private-child")));
         }
     }
@@ -691,12 +675,12 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<String> stable = adapter.factories()
+            ConfiguredMountHandle<String> stable = adapter.factories()
                     .resolve("alpha", String.class).orElseThrow()
                     .mount(runtime.root(), "stable", "value");
-            ComponentHandle<NoConfig> parent = adapter.factories()
-                    .resolve("parent", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "stable-parent", NoConfig.INSTANCE);
+            MountHandle parent = adapter.factories()
+                    .resolveNoConfig("parent").orElseThrow()
+                    .mount(runtime.root(), "stable-parent");
             assertEquals(ComponentState.ACTIVE, settle(stable));
             assertEquals(ComponentState.ACTIVE, settle(parent));
             ArtifactSnapshot first = adapter.artifact(ARTIFACT_ID).orElseThrow();
@@ -740,7 +724,7 @@ final class Pf4jArtifactAdapterTest {
                     () -> adapter.closeAsync().toCompletableFuture().join(), executor);
             CompletableFuture.allOf(first, second).get(20, TimeUnit.SECONDS);
 
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertEquals(ArtifactState.UNLOADED,
                     adapter.artifact(ARTIFACT_ID).orElseThrow().state());
         }
@@ -756,11 +740,9 @@ final class Pf4jArtifactAdapterTest {
                 try (KnotraRuntime runtime = KnotraRuntime.create();
                      Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
                     adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-                    ComponentHandle<NoConfig> handle = adapter.factories()
-                            .resolve("failing-cleanup", NoConfig.class).orElseThrow()
-                            .mount(runtime.root(),
-                                    "close-retry-" + iteration,
-                                    NoConfig.INSTANCE);
+                    MountHandle handle = adapter.factories()
+                            .resolveNoConfig("failing-cleanup").orElseThrow()
+                            .mount(runtime.root(), "close-retry-" + iteration);
                     assertEquals(ComponentState.ACTIVE, settle(handle));
 
                     CompletableFuture<Void> firstClose = adapter.closeAsync().toCompletableFuture();
@@ -776,7 +758,7 @@ final class Pf4jArtifactAdapterTest {
                     assertEquals(ArtifactState.UNLOADED,
                             adapter.artifact(ARTIFACT_ID).orElseThrow().state());
                     assertEquals(ComponentState.DISPOSED, handle.state());
-                    assertTrue(runtime.snapshot().components().isEmpty());
+                    assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
                 }
             }
             assertCollectorsReachZero();
@@ -831,7 +813,7 @@ final class Pf4jArtifactAdapterTest {
             assertEquals(ArtifactState.UNLOADED,
                     adapter.artifact(ARTIFACT_ID).orElseThrow().state());
             assertEquals("UNLOADED", adapter.artifact(ARTIFACT_ID).orElseThrow().pf4jState());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertTrue(adapter.ownership(ARTIFACT_ID).isEmpty());
         }
     }
@@ -885,9 +867,9 @@ final class Pf4jArtifactAdapterTest {
         try (KnotraRuntime runtime = KnotraRuntime.create();
              Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
-            ComponentHandle<NoConfig> handle = adapter.factories()
-                    .resolve("async-cleanup", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "runtime-owned", NoConfig.INSTANCE);
+            MountHandle handle = adapter.factories()
+                    .resolveNoConfig("async-cleanup").orElseThrow()
+                    .mount(runtime.root(), "runtime-owned");
             assertEquals(ComponentState.ACTIVE, settle(handle));
             ControlledGate gate = runtime.root().view().require(GATE);
 
@@ -943,7 +925,7 @@ final class Pf4jArtifactAdapterTest {
                 Set.of("com.example.knotra.contract"));
     }
 
-    private static ComponentState settle(ComponentHandle<?> handle) throws Exception {
+    private static ComponentState settle(MountHandle handle) throws Exception {
         return handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 

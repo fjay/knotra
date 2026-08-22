@@ -20,13 +20,15 @@ public enum LoaderDiagnosticCode {
     CONTEXT_CONFLICT,
     /** 运行时结构事务被拒绝（受控挂载、Context 创建、分配槽位校验失败等）。 */
     STRUCTURE_REJECTED,
-    /** 组件或 Context 清理未收敛到 DISPOSED，条目保持可重试。 */
+    /** 挂载或 Context 清理未收敛到 DISPOSED，条目保持可重试。 */
     TEARDOWN_FAILED,
     /** 工厂替换被拒绝，旧实现已做补偿性恢复。 */
     REPLACEMENT_BLOCKED,
     /** 替换或新增的回滚（补偿）自身失败，可能存在残余资源。 */
     COMPENSATION_FAILED,
-    /** 组件 Activation 失败或重配置后处于 FAILED，需要显式 retry。 */
+    /** 已提交挂载的 settlement 未在时限内收敛；句柄保留在 Loader 记账中等待恢复。 */
+    SETTLEMENT_UNSETTLED,
+    /** 挂载 Activation 失败或重配置后处于 FAILED，需要显式 retry。 */
     ACTIVATION_FAILED,
     /** Loader 已关闭，操作被快速拒绝。 */
     CLOSED

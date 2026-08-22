@@ -13,7 +13,7 @@ import java.util.List;
 public record RuntimeSnapshot(
         long generation,
         List<ContextSnapshot> contexts,
-        List<ComponentSnapshot> components,
+        List<MountSnapshot> mounts,
         List<ActivationSnapshot> activations,
         List<RegistrationSnapshot> registrations,
         List<LifecycleScopeSnapshot> lifecycleScopes,
@@ -21,7 +21,7 @@ public record RuntimeSnapshot(
 
     public RuntimeSnapshot {
         contexts = List.copyOf(contexts);
-        components = List.copyOf(components);
+        mounts = List.copyOf(mounts);
         activations = List.copyOf(activations);
         registrations = sorted(registrations);
         lifecycleScopes = List.copyOf(lifecycleScopes);
@@ -38,7 +38,7 @@ public record RuntimeSnapshot(
     }
 
     /** 组件挂载点的快照，含目标、当前激活与配置代际。 */
-    public record ComponentSnapshot(
+    public record MountSnapshot(
             String handleId,
             String contextId,
             String mountId,

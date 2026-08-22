@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.pf4j.PluginWrapper;
-import io.knotra.ComponentHandle;
+import io.knotra.MountHandle;
 
 /**
  * 适配器内部的单个受管 artifact 状态机与所有权记录。
@@ -33,9 +33,9 @@ final class ManagedArtifact {
     volatile WeakReference<ClassLoader> classLoader;
     volatile boolean acceptingMounts = true;
 
-    final List<ManagedFactory<?>> factories = new ArrayList<>();
-    final Map<String, ComponentHandle<?>> directHandles = new LinkedHashMap<>();
-    final Map<String, ManagedFactory<?>> factoriesById = new LinkedHashMap<>();
+    final List<ManagedFactory> factories = new ArrayList<>();
+    final Map<String, MountHandle> directHandles = new LinkedHashMap<>();
+    final Map<String, ManagedFactory> factoriesById = new LinkedHashMap<>();
     final Set<String> factoryIdHistory = new LinkedHashSet<>();
     int mountsInFlight;
     java.util.concurrent.CompletableFuture<Void> mountsInFlightFuture;
@@ -83,7 +83,7 @@ final class ManagedArtifact {
                 loader == null ? List.of() : List.of(KnotraClassLoaderPolicy.describe(loader)));
     }
 
-    List<ComponentHandle<?>> rootHandles() {
+    List<MountHandle> rootHandles() {
         return List.copyOf(directHandles.values());
     }
 
@@ -97,7 +97,7 @@ final class ManagedArtifact {
 
     void invalidateFactories() {
         acceptingMounts = false;
-        for (ManagedFactory<?> factory : factories) {
+        for (ManagedFactory factory : factories) {
             factory.factory = null;
             factory.decoder = null;
         }

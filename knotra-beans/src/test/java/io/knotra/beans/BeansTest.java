@@ -2,31 +2,38 @@ package io.knotra.beans;
 
 import io.knotra.AsyncCloseable;
 import io.knotra.CapabilityKey;
-import io.knotra.DynamicCapability;
 import io.knotra.CapabilityRequirement.CapabilityBinding;
 import io.knotra.CapabilityRequirement.Mode;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentFactory;
 import io.knotra.ComponentState;
+import io.knotra.ConfiguredMountHandle;
 import io.knotra.DiagnosticCode;
+import io.knotra.DynamicCapability;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
-import io.knotra.RegistrationHandle;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
+import io.knotra.Registration;
 import io.knotra.TransactionRejectedException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
-import java.util.function.Supplier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -42,6 +49,7 @@ final class BeansTest {
     static final CapabilityKey<String> D3 = CapabilityKey.of("beans-d3", String.class);
     static final CapabilityKey<String> D4 = CapabilityKey.of("beans-d4", String.class);
     static final CapabilityKey<String> OPT = CapabilityKey.of("beans-opt", String.class);
+    static final Duration WAIT = Duration.ofSeconds(10);
 
     KnotraRuntime runtime = KnotraRuntime.create();
 
@@ -54,10 +62,10 @@ final class BeansTest {
     void providerRebindCreatesFreshBeanAndClosesOldBean() throws Exception {
         CapabilityKey<String> dep = CapabilityKey.of("rebind-dep", String.class);
         CapabilityKey<Service> out = CapabilityKey.of("rebind-service", Service.class);
-        RegistrationHandle first = runtime.provide(dep, "one");
+        Registration<String> first = runtime.advanced().register(dep, "one");
         List<Service> beans = new CopyOnWriteArrayList<>();
 
-        BeanDefinition<NoConfig, Service> definition = Beans.component("rebind-consumer")
+        BeanDefinition<Service> definition = Beans.component("rebind-consumer")
                 .with(Beans.required(dep))
                 .create(value -> {
                     Service bean = new Service(value);
@@ -66,12 +74,12 @@ final class BeansTest {
                 })
                 .provide(out)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("rebind-consumer", definition);
+        MountHandle handle = definition.mount(runtime);
 
         assertEquals(ComponentState.ACTIVE, settle(handle));
-        runtime.revoke(first);
+        first.revoke().awaitSettled(WAIT);
         assertEquals(ComponentState.WAITING, settle(handle));
-        runtime.provide(dep, "two");
+        runtime.advanced().register(dep, "two").awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         assertEquals(2, beans.size());
@@ -84,7 +92,7 @@ final class BeansTest {
     @Test
     void optionalDependencyAppearanceAndDisappearanceReactivateBean() throws Exception {
         List<String> observed = new CopyOnWriteArrayList<>();
-        BeanDefinition<NoConfig, String> definition = Beans.component("opt-consumer")
+        BeanDefinition<String> definition = Beans.component("opt-consumer")
                 .with(Beans.optional(OPT))
                 .create(value -> {
                     String result = value.map(item -> "present:" + item).orElse("empty");
@@ -92,15 +100,17 @@ final class BeansTest {
                     return result;
                 })
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("opt-consumer", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("empty"), observed);
 
-        RegistrationHandle registration = runtime.provide(OPT, "x");
+        Registration<String> registration =
+                runtime.advanced().register(OPT, "x");
+        registration.awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("empty", "present:x"), observed);
 
-        runtime.revoke(registration);
+        registration.revoke().awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("empty", "present:x", "empty"), observed);
     }
@@ -109,16 +119,17 @@ final class BeansTest {
     void configReconfigureCreatesFreshBeanWithNewConfig() throws Exception {
         CapabilityKey<Service> out = CapabilityKey.of("cfg-service", Service.class);
         List<Service> beans = new CopyOnWriteArrayList<>();
-        BeanDefinition<Prefix, Service> definition = Beans.component("cfg-bean", Prefix.class)
-                .create(config -> {
-                    Service bean = new Service(config.value());
-                    beans.add(bean);
-                    return bean;
-                })
-                .provide(out)
-                .build();
+        ConfiguredBeanDefinition<Prefix, Service> definition =
+                Beans.component("cfg-bean", Prefix.class)
+                        .create(config -> {
+                            Service bean = new Service(config.value());
+                            beans.add(bean);
+                            return bean;
+                        })
+                        .provide(out)
+                        .build();
 
-        ComponentHandle<Prefix> handle = runtime.mount("cfg-bean", definition, new Prefix("one"));
+        ConfiguredMountHandle<Prefix> handle = definition.mount(runtime, new Prefix("one"));
         assertEquals(ComponentState.ACTIVE, settle(handle));
         long oldRevision = handle.configRevision();
 
@@ -136,10 +147,10 @@ final class BeansTest {
     @Test
     void autoLifecyclePrefersAsyncCloseableOverAutoCloseable() throws Exception {
         AsyncBean bean = new AsyncBean();
-        BeanDefinition<NoConfig, AsyncBean> definition = Beans.component("async-auto")
+        BeanDefinition<AsyncBean> definition = Beans.component("async-auto")
                 .create(() -> bean)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("async-auto", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         assertEquals(ComponentState.DISPOSED, handle.disposeAsync()
@@ -151,10 +162,10 @@ final class BeansTest {
     @Test
     void autoLifecycleManagesPlainAutoCloseable() throws Exception {
         Service bean = new Service("x");
-        BeanDefinition<NoConfig, Service> definition = Beans.component("sync-auto")
+        BeanDefinition<Service> definition = Beans.component("sync-auto")
                 .create(() -> bean)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("sync-auto", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         assertEquals(ComponentState.DISPOSED, handle.disposeAsync()
@@ -165,11 +176,11 @@ final class BeansTest {
     @Test
     void unmanagedBeanIsNotClosed() throws Exception {
         Service bean = new Service("x");
-        BeanDefinition<NoConfig, Service> definition = Beans.component("unmanaged-bean")
+        BeanDefinition<Service> definition = Beans.component("unmanaged-bean")
                 .create(() -> bean)
                 .unmanaged()
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("unmanaged-bean", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         assertEquals(ComponentState.DISPOSED, handle.disposeAsync()
@@ -183,7 +194,7 @@ final class BeansTest {
         CountDownLatch entered = new CountDownLatch(1);
         CompletableFuture<Void> gate = new CompletableFuture<>();
         AtomicInteger calls = new AtomicInteger();
-        BeanDefinition<NoConfig, Service> definition = Beans.component("gated-dispose")
+        BeanDefinition<Service> definition = Beans.component("gated-dispose")
                 .create(() -> bean)
                 .destroyAsyncWith(item -> {
                     calls.incrementAndGet();
@@ -191,7 +202,7 @@ final class BeansTest {
                     return gate;
                 })
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("gated-dispose", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         var disposing = handle.disposeAsync().toCompletableFuture();
@@ -207,7 +218,7 @@ final class BeansTest {
     @Test
     void failedCleanupCanBeRetried() throws Exception {
         AtomicInteger attempts = new AtomicInteger();
-        BeanDefinition<NoConfig, Service> definition = Beans.component("retry-cleanup")
+        BeanDefinition<Service> definition = Beans.component("retry-cleanup")
                 .create(() -> new Service("x"))
                 .destroyWith(bean -> {
                     if (attempts.incrementAndGet() == 1) {
@@ -215,7 +226,7 @@ final class BeansTest {
                     }
                 })
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("retry-cleanup", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         assertEquals(ComponentState.FAILED, handle.disposeAsync()
@@ -229,32 +240,32 @@ final class BeansTest {
     void startFailureRollsBackBeanAndStagedOutputs() throws Exception {
         CapabilityKey<Service> out = CapabilityKey.of("rollback-out", Service.class);
         List<String> readerValues = new CopyOnWriteArrayList<>();
-        BeanDefinition<NoConfig, String> reader = Beans.component("rollback-reader")
+        BeanDefinition<String> reader = Beans.component("rollback-reader")
                 .with(Beans.required(out))
                 .create(value -> {
                     readerValues.add(value.value);
                     return value.value;
                 })
                 .build();
-        ComponentHandle<NoConfig> readerHandle = runtime.mount("rollback-reader", reader);
+        MountHandle readerHandle = Beans.mount(runtime, reader);
         assertEquals(ComponentState.WAITING, settle(readerHandle));
 
         Service[] created = new Service[1];
-        BeanDefinition<NoConfig, Service> definition = Beans.component("rollback-provider")
+        BeanDefinition<Service> definition = Beans.component("rollback-provider")
                 .create(() -> created[0] = new Service("x"))
                 .initializer(bean -> {
                     throw new IllegalStateException("init failed");
                 })
                 .provide(out)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("rollback-provider", definition);
+        MountHandle handle = Beans.mount(runtime, definition);
 
         assertEquals(ComponentState.FAILED, settle(handle));
         assertNotNull(created[0]);
         assertTrue(created[0].closed, "cleanup must be registered before initializer runs");
         assertEquals(ComponentState.WAITING, settle(readerHandle));
         assertTrue(readerValues.isEmpty());
-        assertTrue(runtime.snapshot().diagnostics().stream().anyMatch(diagnostic ->
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().anyMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.message().contains("init failed")));
     }
@@ -264,34 +275,34 @@ final class BeansTest {
         CapabilityKey<Service> primary = CapabilityKey.of("atomic-primary", Service.class);
         CapabilityKey<Integer> derived = CapabilityKey.of("atomic-derived", Integer.class);
         List<String> readerValues = new CopyOnWriteArrayList<>();
-        BeanDefinition<NoConfig, String> reader = Beans.component("atomic-reader")
+        BeanDefinition<String> reader = Beans.component("atomic-reader")
                 .with(Beans.required(primary))
                 .create(value -> {
                     readerValues.add(value.value);
                     return value.value;
                 })
                 .build();
-        ComponentHandle<NoConfig> readerHandle = runtime.mount("atomic-reader", reader);
+        MountHandle readerHandle = Beans.mount(runtime, reader);
         assertEquals(ComponentState.WAITING, settle(readerHandle));
 
         Service[] created = new Service[1];
-        BeanDefinition<NoConfig, Service> broken = Beans.component("broken-outputs")
+        BeanDefinition<Service> broken = Beans.component("broken-outputs")
                 .create(() -> created[0] = new Service("x"))
                 .provide(primary)
                 .provideAs(derived, bean -> null)
                 .build();
-        ComponentHandle<NoConfig> brokenHandle = runtime.mount("broken-outputs", broken);
+        MountHandle brokenHandle = Beans.mount(runtime, broken);
         assertEquals(ComponentState.FAILED, settle(brokenHandle));
         assertTrue(created[0].closed);
         assertEquals(ComponentState.WAITING, settle(readerHandle));
         assertTrue(readerValues.isEmpty(), "no output may be visible when another output fails");
 
-        BeanDefinition<NoConfig, Service> good = Beans.component("good-outputs")
+        BeanDefinition<Service> good = Beans.component("good-outputs")
                 .create(() -> new Service("ok"))
                 .provide(primary)
                 .provideAs(derived, bean -> bean.value.length())
                 .build();
-        ComponentHandle<NoConfig> goodHandle = runtime.mount("good-outputs", good);
+        MountHandle goodHandle = Beans.mount(runtime, good);
         assertEquals(ComponentState.ACTIVE, settle(goodHandle));
         assertEquals(ComponentState.ACTIVE, settle(readerHandle));
         assertEquals(List.of("ok"), readerValues);
@@ -301,7 +312,7 @@ final class BeansTest {
     void duplicateOutputNameIsRejected() {
         CapabilityKey<String> first = CapabilityKey.of("dup-out", String.class);
         CapabilityKey<Integer> second = CapabilityKey.of("dup-out", Integer.class);
-        BeanOutputStage<NoConfig, String> stage = Beans.component("dup-component")
+        Beans.OutputStage<String> stage = Beans.component("dup-component")
                 .create(() -> "x")
                 .provide(first);
 
@@ -313,43 +324,46 @@ final class BeansTest {
 
     @Test
     void factoryAndComponentIdsAreExplicitAndStable() {
-        BeanDefinition<NoConfig, String> first = Beans.component("stable-id")
+        BeanDefinition<String> first = Beans.component("stable-id")
                 .create(() -> "x")
                 .build();
-        BeanDefinition<NoConfig, String> second = Beans.component("stable-id")
+        BeanDefinition<String> second = Beans.component("stable-id")
                 .create(() -> "y")
                 .build();
 
         assertEquals("stable-id", first.factoryId());
         assertEquals("stable-id", first.componentId());
         assertEquals("stable-id", first.descriptor().componentId());
-        assertEquals("stable-id", first.create().descriptor().componentId());
-        assertEquals("stable-id", second.create().descriptor().componentId());
+        MountFactory factory = first.asFactory();
+        assertEquals("stable-id", factory.factoryId());
+        assertEquals("stable-id", factory.create().descriptor().componentId());
+        assertEquals("stable-id", second.asFactory().create().descriptor().componentId());
     }
 
     @Test
     void mountConveniencesDefaultToComponentIdAndSupportExplicitMountId() throws Exception {
-        BeanDefinition<NoConfig, Service> noConfig = Beans.component("mount-default")
+        BeanDefinition<Service> noConfig = Beans.component("mount-default")
                 .create(() -> new Service("x"))
                 .build();
-        ComponentHandle<NoConfig> defaultNoConfig = Beans.mount(runtime, noConfig);
+        MountHandle defaultNoConfig = noConfig.mount(runtime);
         assertEquals("mount-default", defaultNoConfig.mountId());
+        assertFalse(defaultNoConfig instanceof ConfiguredMountHandle<?>);
         assertEquals(ComponentState.ACTIVE, settle(defaultNoConfig));
 
-        ComponentHandle<NoConfig> explicitNoConfig =
-                Beans.mount(runtime, noConfig, "mount-explicit");
+        MountHandle explicitNoConfig = Beans.mount(runtime, noConfig, "mount-explicit");
         assertEquals("mount-explicit", explicitNoConfig.mountId());
         assertEquals(ComponentState.ACTIVE, settle(explicitNoConfig));
 
-        BeanDefinition<Prefix, Service> configured = Beans.component("mount-configured", Prefix.class)
-                .create(config -> new Service(config.value()))
-                .build();
-        ComponentHandle<Prefix> defaultConfigured =
-                Beans.mount(runtime, configured, new Prefix("one"));
+        ConfiguredBeanDefinition<Prefix, Service> configured =
+                Beans.component("mount-configured", Prefix.class)
+                        .create(config -> new Service(config.value()))
+                        .build();
+        ConfiguredMountHandle<Prefix> defaultConfigured =
+                configured.mount(runtime, new Prefix("one"));
         assertEquals("mount-configured", defaultConfigured.mountId());
         assertEquals(ComponentState.ACTIVE, settle(defaultConfigured));
 
-        ComponentHandle<Prefix> explicitConfigured =
+        ConfiguredMountHandle<Prefix> explicitConfigured =
                 Beans.mount(runtime, configured, "mount-configured-explicit", new Prefix("two"));
         assertEquals("mount-configured-explicit", explicitConfigured.mountId());
         assertEquals(ComponentState.ACTIVE, settle(explicitConfigured));
@@ -357,27 +371,29 @@ final class BeansTest {
 
     @Test
     void noConfigCreatorAritiesShapesResolveDependenciesInOrder() throws Exception {
-        runtime.provide(D0, "0");
-        runtime.provide(D1, "1");
-        runtime.provide(D2, "2");
-        runtime.provide(D3, "3");
-        runtime.provide(D4, "4");
+        register(D0, "0");
+        register(D1, "1");
+        register(D2, "2");
+        register(D3, "3");
+        register(D4, "4");
         List<String> joined = new CopyOnWriteArrayList<>();
 
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("arity-0", Beans.component("arity-0")
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-0")
                 .create(() -> {
                     joined.add("");
                     return "";
                 })
                 .build())));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("arity-1", Beans.component("arity-1")
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-1")
                 .with(Beans.required(D0))
                 .create(v1 -> {
                     joined.add(v1);
                     return v1;
                 })
                 .build())));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("arity-2", Beans.component("arity-2")
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-2")
                 .with(Beans.required(D0), Beans.required(D1))
                 .create((v1, v2) -> {
                     String value = v1 + v2;
@@ -385,7 +401,8 @@ final class BeansTest {
                     return value;
                 })
                 .build())));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("arity-3", Beans.component("arity-3")
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-3")
                 .with(Beans.required(D0))
                 .with(Beans.required(D1), Beans.required(D2))
                 .create((v1, v2, v3) -> {
@@ -394,7 +411,8 @@ final class BeansTest {
                     return value;
                 })
                 .build())));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("arity-4", Beans.component("arity-4")
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-4")
                 .with(Beans.required(D0), Beans.required(D1))
                 .with(Beans.required(D2), Beans.required(D3))
                 .create((v1, v2, v3, v4) -> {
@@ -403,7 +421,8 @@ final class BeansTest {
                     return value;
                 })
                 .build())));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("arity-5", Beans.component("arity-5")
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-5")
                 .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
                 .with(Beans.required(D3), Beans.required(D4))
                 .create((v1, v2, v3, v4, v5) -> {
@@ -417,23 +436,23 @@ final class BeansTest {
     }
 
     @Test
-    void configuredCreatorAritityShapesReceiveConfigFirst() throws Exception {
-        runtime.provide(D0, "0");
-        runtime.provide(D1, "1");
-        runtime.provide(D2, "2");
-        runtime.provide(D3, "3");
-        runtime.provide(D4, "4");
+    void configuredCreatorAritiesShapesReceiveConfigFirst() throws Exception {
+        register(D0, "0");
+        register(D1, "1");
+        register(D2, "2");
+        register(D3, "3");
+        register(D4, "4");
         List<String> joined = new CopyOnWriteArrayList<>();
 
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("cfg-arity-0",
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-0", Prefix.class)
                         .create(config -> {
                             joined.add(config.value());
                             return config.value();
                         })
-                        .build(),
-                new Prefix("C"))));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("cfg-arity-1",
+                        .build(), new Prefix("C"))));
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-1", Prefix.class)
                         .with(Beans.required(D0))
                         .create((config, v1) -> {
@@ -441,9 +460,9 @@ final class BeansTest {
                             joined.add(value);
                             return value;
                         })
-                        .build(),
-                new Prefix("C"))));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("cfg-arity-2",
+                        .build(), new Prefix("C"))));
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-2", Prefix.class)
                         .with(Beans.required(D0), Beans.required(D1))
                         .create((config, v1, v2) -> {
@@ -451,9 +470,9 @@ final class BeansTest {
                             joined.add(value);
                             return value;
                         })
-                        .build(),
-                new Prefix("C"))));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("cfg-arity-3",
+                        .build(), new Prefix("C"))));
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-3", Prefix.class)
                         .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
                         .create((config, v1, v2, v3) -> {
@@ -461,9 +480,9 @@ final class BeansTest {
                             joined.add(value);
                             return value;
                         })
-                        .build(),
-                new Prefix("C"))));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("cfg-arity-4",
+                        .build(), new Prefix("C"))));
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-4", Prefix.class)
                         .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
                         .with(Beans.required(D3))
@@ -472,9 +491,9 @@ final class BeansTest {
                             joined.add(value);
                             return value;
                         })
-                        .build(),
-                new Prefix("C"))));
-        assertEquals(ComponentState.ACTIVE, settle(runtime.mount("cfg-arity-5",
+                        .build(), new Prefix("C"))));
+
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-5", Prefix.class)
                         .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
                         .with(Beans.required(D3), Beans.required(D4))
@@ -483,24 +502,22 @@ final class BeansTest {
                             joined.add(value);
                             return value;
                         })
-                        .build(),
-                new Prefix("C"))));
+                        .build(), new Prefix("C"))));
 
         assertEquals(List.of("C", "C0", "C01", "C012", "C0123", "C01234"), joined);
     }
 
     @Test
     void expertApiUsesDependencyListAndActivationContextCreator() throws Exception {
-        runtime.provide(D0, "0");
+        register(D0, "0");
         List<String> observed = new CopyOnWriteArrayList<>();
         List<BeanDependency<?>> dependencies = List.of(
                 Beans.required(D0),
                 Beans.optional(OPT));
-        BeanDefinition<NoConfig, String> definition = BeanDefinition.<NoConfig, String>expert(
+        BeanDefinition<String> definition = Beans.expert(
                         "expert-bean",
-                        NoConfig.class,
                         dependencies,
-                        (context, config) -> {
+                        context -> {
                             String value = context.require(D0)
                                     + context.find(OPT).map(item -> "+" + item).orElse("");
                             observed.add(value);
@@ -516,9 +533,9 @@ final class BeansTest {
         assertEquals(Mode.OPTIONAL,
                 definition.descriptor().requirement(OPT).orElseThrow().mode());
 
-        ComponentHandle<NoConfig> handle = runtime.mount("expert-bean", definition);
+        MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.ACTIVE, settle(handle));
-        runtime.provide(OPT, "x");
+        runtime.advanced().register(OPT, "x").awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("0", "0+x"), observed);
     }
@@ -526,96 +543,101 @@ final class BeansTest {
     @Test
     void configNormalizerRunsBeforeCreatorAndRejectsNull() throws Exception {
         List<String> observed = new CopyOnWriteArrayList<>();
-        BeanDefinition<Prefix, String> definition = Beans.component("normalized", Prefix.class)
-                .create(config -> {
-                    observed.add(config.value());
-                    return config.value();
-                })
-                .normalizeConfig(config -> new Prefix(config.value().trim()))
-                .build();
-        ComponentHandle<Prefix> handle = runtime.mount("normalized", definition, new Prefix("  padded  "));
+        ConfiguredBeanDefinition<Prefix, String> definition =
+                Beans.component("normalized", Prefix.class)
+                        .create(config -> {
+                            observed.add(config.value());
+                            return config.value();
+                        })
+                        .normalizeConfig(config -> new Prefix(config.value().trim()))
+                        .build();
+        ConfiguredMountHandle<Prefix> handle =
+                definition.mount(runtime, new Prefix("  padded  "));
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("padded"), observed);
 
-        BeanDefinition<Prefix, String> invalid = Beans.component("invalid-normalizer", Prefix.class)
-                .create(config -> config.value())
-                .normalizeConfig(config -> null)
-                .build();
+        ConfiguredBeanDefinition<Prefix, String> invalid =
+                Beans.component("invalid-normalizer", Prefix.class)
+                        .create(config -> config.value())
+                        .normalizeConfig(config -> null)
+                        .build();
         TransactionRejectedException rejected = assertRejected(DiagnosticCode.INVALID_CONFIG,
-                () -> runtime.mount("invalid-normalizer", invalid, new Prefix("x")));
+                () -> invalid.mount(runtime, new Prefix("x")));
         assertTrue(rejected.diagnostics().stream().anyMatch(diagnostic ->
-                diagnostic.code() == DiagnosticCode.INVALID_CONFIG
-                        && diagnostic.message().contains("config normalizer returned null")),
+                        diagnostic.code() == DiagnosticCode.INVALID_CONFIG
+                                && diagnostic.message().contains("config normalizer returned null")),
                 () -> rejected.diagnostics().toString());
     }
 
     @Test
     void nullBeanFailsActivationWithClearDiagnostic() throws Exception {
-        BeanDefinition<NoConfig, String> definition = Beans.component("null-bean")
+        BeanDefinition<String> definition = Beans.component("null-bean")
                 .<String>create(() -> null)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("null-bean", definition);
+        MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.FAILED, settle(handle));
-        assertTrue(runtime.snapshot().diagnostics().stream().anyMatch(diagnostic ->
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().anyMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.message().contains("bean creator returned null")));
     }
 
     @Test
     void checkedCreatorExceptionFailsActivation() throws Exception {
-        BeanDefinition<NoConfig, String> definition = Beans.component("checked-creator")
+        BeanDefinition<String> definition = Beans.component("checked-creator")
                 .<String>create(() -> {
                     throw new IOException("creator failed");
                 })
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("checked-creator", definition);
+        MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.FAILED, settle(handle));
-        assertTrue(runtime.snapshot().diagnostics().stream().anyMatch(diagnostic ->
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().anyMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.message().contains("creator failed")));
     }
 
     @Test
-    void configTypeIsCarriedAsImmutableSpec() {
-        BeanDefinition<Prefix, String> configured = Beans.component("cfg-spec", Prefix.class)
-                .create(config -> config.value())
-                .build();
+    void configTypeIsCarriedOnlyByConfiguredDefinition() {
+        ConfiguredBeanDefinition<Prefix, String> configured =
+                Beans.component("cfg-spec", Prefix.class)
+                        .create(config -> config.value())
+                        .build();
         assertEquals(Prefix.class, configured.configType());
 
-        BeanDefinition<NoConfig, String> noConfig = Beans.component("no-config-spec")
+        BeanDefinition<String> noConfig = Beans.component("no-config-spec")
                 .create(() -> "x")
                 .build();
-        assertEquals(NoConfig.class, noConfig.configType());
+        assertEquals(BeanDefinition.class, noConfig.getClass());
     }
 
     @Test
     @SuppressWarnings({"rawtypes", "unchecked"})
     void rawFactoryCallWithWrongConfigTypeIsRejectedAsInvalidConfig() {
-        BeanDefinition<Prefix, String> definition = Beans.component("raw-factory", Prefix.class)
-                .create(config -> config.value())
-                .build();
-        ComponentFactory raw = (ComponentFactory) definition;
+        ConfiguredBeanDefinition<Prefix, String> definition =
+                Beans.component("raw-factory", Prefix.class)
+                        .create(config -> config.value())
+                        .build();
+        ComponentFactory raw = (ComponentFactory) definition.asFactory();
 
         TransactionRejectedException rejected = assertRejected(DiagnosticCode.INVALID_CONFIG,
                 () -> runtime.mount("raw-factory", raw, new Object()));
         assertTrue(rejected.diagnostics().stream().anyMatch(diagnostic ->
-                diagnostic.code() == DiagnosticCode.INVALID_CONFIG
-                        && diagnostic.message().contains("config type mismatch")
-                        && diagnostic.message().contains("expected " + Prefix.class.getName())
-                        && diagnostic.message().contains("got java.lang.Object")),
+                        diagnostic.code() == DiagnosticCode.INVALID_CONFIG
+                                && diagnostic.message().contains("config type mismatch")
+                                && diagnostic.message().contains("expected " + Prefix.class.getName())
+                                && diagnostic.message().contains("got java.lang.Object")),
                 () -> rejected.diagnostics().toString());
     }
 
     @Test
     @SuppressWarnings("unchecked")
-    void dynamicProxyRequiredInjectsLeaseProxyAndDoesNotRestartOnProviderChange() throws Exception {
+    void dynamicInjectsLeaseProxyAndDoesNotRestartOnProviderChange() throws Exception {
         CapabilityKey<Api> api = CapabilityKey.of("beans-dynamic-api", Api.class);
         CapabilityKey<Supplier<String>> output = CapabilityKey.of(
                 "beans-dynamic-output", (Class<Supplier<String>>) (Class<?>) Supplier.class);
         AtomicInteger starts = new AtomicInteger();
 
-        BeanDefinition<NoConfig, Supplier<String>> definition = Beans.component("beans-dynamic-consumer")
-                .with(Beans.dynamicProxyRequired(api))
+        BeanDefinition<Supplier<String>> definition = Beans.component("beans-dynamic-consumer")
+                .with(Beans.dynamic(api))
                 .<Supplier<String>>create(proxy -> {
                     starts.incrementAndGet();
                     return () -> proxy.value();
@@ -623,73 +645,73 @@ final class BeansTest {
                 .provide(output)
                 .build();
 
-        ComponentHandle<NoConfig> handle = runtime.mount("beans-dynamic-consumer", definition);
+        MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.WAITING, settle(handle));
-        RegistrationHandle first = runtime.provide(api, new ApiValue("v1"));
+        Registration<Api> first = runtime.advanced().register(api, new ApiValue("v1"));
+        first.awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals("v1", runtime.root().view().require(output).get());
 
-        runtime.revoke(first);
-        runtime.provide(api, new ApiValue("v2"));
+        first.revoke().awaitSettled(WAIT);
+        runtime.advanced().register(api, new ApiValue("v2")).awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(1, starts.get(), "dynamic provider replacement must not recreate the bean");
         assertEquals("v2", runtime.root().view().require(output).get());
     }
 
     @Test
-    void dynamicProxyDeclarationsAcceptInterfaceCapabilities() {
+    void dynamicDeclarationsExposeRequiredAndOptionalProxyModes() {
         CapabilityKey<Api> required = CapabilityKey.of("beans-proxy-required", Api.class);
         CapabilityKey<Api> optional = CapabilityKey.of("beans-proxy-optional", Api.class);
 
-        BeanDependency<Api> requiredDependency = Beans.dynamicProxyRequired(required);
+        BeanDependency<Api> requiredDependency = Beans.dynamic(required);
         assertEquals(CapabilityBinding.DYNAMIC, requiredDependency.requirement().binding());
         assertEquals(Mode.REQUIRED, requiredDependency.requirement().mode());
 
-        BeanDependency<Api> optionalDependency = Beans.dynamicProxyOptional(optional);
+        BeanDependency<Api> optionalDependency = Beans.dynamicOptional(optional);
         assertEquals(CapabilityBinding.DYNAMIC, optionalDependency.requirement().binding());
         assertEquals(Mode.OPTIONAL, optionalDependency.requirement().mode());
     }
 
     @Test
-    void dynamicProxyRequiredRejectsNonInterfaceCapabilityAtDeclaration() {
+    void dynamicRejectsNonInterfaceCapabilityAtDeclaration() {
         CapabilityKey<ApiValue> key = CapabilityKey.of("beans-proxy-class-required", ApiValue.class);
-
         IllegalArgumentException rejected = assertThrows(
-                IllegalArgumentException.class, () -> Beans.dynamicProxyRequired(key));
+                IllegalArgumentException.class, () -> Beans.dynamic(key));
         assertTrue(rejected.getMessage().contains("must be an interface"));
         assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
     }
 
     @Test
-    void dynamicProxyOptionalRejectsNonInterfaceCapabilityAtDeclaration() {
+    void dynamicOptionalRejectsNonInterfaceCapabilityAtDeclaration() {
         CapabilityKey<ApiValue> key = CapabilityKey.of("beans-proxy-class-optional", ApiValue.class);
-
         IllegalArgumentException rejected = assertThrows(
-                IllegalArgumentException.class, () -> Beans.dynamicProxyOptional(key));
+                IllegalArgumentException.class, () -> Beans.dynamicOptional(key));
         assertTrue(rejected.getMessage().contains("must be an interface"));
         assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
     }
 
     @Test
-    void dynamicFactoriesExposeExplicitLeasedCallEntrypoint() throws Exception {
+    void dynamicCapabilityFactoriesExposeExplicitLeasedCallEntrypoint() throws Exception {
         CapabilityKey<Api> api = CapabilityKey.of("beans-explicit-dynamic", Api.class);
         AtomicReference<DynamicCapability<Api>> dynamic = new AtomicReference<>();
 
-        BeanDependency<DynamicCapability<Api>> dependency = Beans.dynamicOptional(api);
+        BeanDependency<DynamicCapability<Api>> dependency = Beans.dynamicCapabilityOptional(api);
         assertEquals(CapabilityBinding.DYNAMIC, dependency.requirement().binding());
+        assertEquals(Mode.OPTIONAL, dependency.requirement().mode());
 
-        BeanDefinition<NoConfig, Boolean> definition = Beans.component("beans-explicit-consumer")
+        BeanDefinition<Boolean> definition = Beans.component("beans-explicit-consumer")
                 .with(dependency)
                 .<Boolean>create(capability -> {
                     dynamic.set(capability);
                     return capability.available();
                 })
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("beans-explicit-consumer", definition);
+        MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertFalse(dynamic.get().available());
 
-        runtime.provide(api, new ApiValue("v1"));
+        runtime.advanced().register(api, new ApiValue("v1")).awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertTrue(dynamic.get().available());
         assertEquals("v1", dynamic.get().call(Api::value));
@@ -699,7 +721,7 @@ final class BeansTest {
     void outputKeysAreReadOnlyAndPreserveDeclarationOrder() {
         CapabilityKey<String> first = CapabilityKey.of("beans-key-first", String.class);
         CapabilityKey<Object> second = CapabilityKey.of("beans-key-second", Object.class);
-        BeanDefinition<NoConfig, Service> definition = Beans.component("beans-keys")
+        BeanDefinition<Service> definition = Beans.component("beans-keys")
                 .create(() -> new Service("x"))
                 .provideAs(first, bean -> bean.value)
                 .provideAs(second, bean -> bean.value)
@@ -712,20 +734,77 @@ final class BeansTest {
     @Test
     @SuppressWarnings({"rawtypes", "unchecked"})
     void normalizerReturningWrongTypeIsRejectedAsInvalidConfig() {
-        ConfigNormalizer invalid = config -> new Object();
-        BeanDefinition<Prefix, String> definition =
-                (BeanDefinition) Beans.component("beans-bad-normalizer", Prefix.class)
+        Beans.Normalizer invalid = config -> new Object();
+        ConfiguredBeanDefinition<Prefix, String> definition =
+                (ConfiguredBeanDefinition) Beans.component("beans-bad-normalizer", Prefix.class)
                         .create(config -> config.value())
-                        .normalizeConfig((ConfigNormalizer<Prefix>) invalid)
+                        .normalizeConfig(invalid)
                         .build();
 
         TransactionRejectedException rejected = assertRejected(DiagnosticCode.INVALID_CONFIG,
-                () -> runtime.mount("beans-bad-normalizer", definition, new Prefix("x")));
+                () -> definition.mount(runtime, new Prefix("x")));
         assertTrue(rejected.diagnostics().stream().anyMatch(diagnostic ->
                         diagnostic.message().contains("invalid config type")),
                 () -> rejected.diagnostics().toString());
     }
-    private ComponentState settle(ComponentHandle<?> handle) throws Exception {
+
+    @Test
+    void classShortcutsUseContractBinaryNameForDependenciesAndOutputs() throws Exception {
+        BeanDefinition<String> definition = Beans.component("class-shortcuts")
+                .with(Beans.optional(Api.class))
+                .create(optional -> optional.map(Api::value).orElse("none"))
+                .provide(String.class)
+                .build();
+        assertEquals(String.class.getName(), definition.outputKeys().getFirst().name());
+
+        MountHandle handle = definition.mount(runtime);
+        assertEquals(ComponentState.ACTIVE, settle(handle));
+        runtime.advanced().register(Api.class, new ApiValue("x")).awaitSettled(WAIT);
+        assertEquals(ComponentState.ACTIVE, settle(handle));
+    }
+
+    @Test
+    void publicSurfaceHasNoTopLevelArityFamilyAndHidesNoConfigFromSimplePath() throws Exception {
+        Path sourceRoot = Path.of("src/main/java/io/knotra/beans");
+        Pattern publicType = Pattern.compile(
+                "^public\\s+(?:final\\s+)?(?:class|interface|record|enum)\\s+(\\w+)");
+        List<String> publicTypes;
+        try (Stream<Path> files = Files.walk(sourceRoot)) {
+            publicTypes = files
+                    .filter(path -> path.toString().endsWith(".java"))
+                    .flatMap(path -> {
+                        try {
+                            return Files.readAllLines(path).stream()
+                                    .map(publicType::matcher)
+                                    .filter(Matcher::find)
+                                    .map(matcher -> matcher.group(1));
+                        } catch (IOException error) {
+                            throw new RuntimeException(error);
+                        }
+                    })
+                    .toList();
+        }
+        assertEquals(List.of("ConfiguredBeanDefinition", "BeanDefinition", "Beans", "BeanDependency"),
+                publicTypes);
+        assertEquals(MountFactory.class,
+                BeanDefinition.class.getDeclaredMethod("asFactory").getReturnType());
+        assertEquals(ComponentFactory.class,
+                ConfiguredBeanDefinition.class.getDeclaredMethod("asFactory").getReturnType());
+
+        String quickStart = """
+                package demo;
+                import io.knotra.KnotraRuntime;
+                import io.knotra.beans.Beans;
+                class QuickStart {
+                    static void run(KnotraRuntime runtime) {
+                        Beans.component("quick-start").create(() -> "ok").build().mount(runtime);
+                    }
+                }
+                """;
+        assertFalse(quickStart.contains("NoConfig"));
+    }
+
+    private ComponentState settle(MountHandle handle) throws Exception {
         return handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
@@ -739,6 +818,10 @@ final class BeansTest {
         return rejected;
     }
 
+    private void register(CapabilityKey<String> key, String value) {
+        runtime.advanced().register(key, value).awaitSettled(WAIT);
+    }
+
     record Prefix(String value) {
     }
 
@@ -748,6 +831,7 @@ final class BeansTest {
 
     record ApiValue(String value) implements Api {
     }
+
     static final class Service implements AutoCloseable {
         final String value;
         volatile boolean closed;
@@ -760,6 +844,9 @@ final class BeansTest {
         public void close() {
             closed = true;
         }
+    }
+
+    record OptionalService(java.util.Optional<Service> service) {
     }
 
     static final class AsyncBean implements AsyncCloseable {

@@ -3,52 +3,62 @@ package io.knotra;
 import java.util.function.Function;
 import java.util.concurrent.CompletionStage;
 
-/** Knotra 运行时入口。 */
+/** Simple Knotra runtime facade for publication, root mounting, and shutdown. */
 public interface KnotraRuntime extends AutoCloseable {
     String runtimeId();
 
-    /** 返回根 Context 的稳定结构句柄。 */
     ContextHandle root();
 
-    /** 返回运行时的不可变观测快照。 */
-    RuntimeSnapshot snapshot();
+    AdvancedRuntime advanced();
 
-    /**
-     * 原子执行结构事务。拒绝时抛出 TransactionRejectedException，绝不返回可忽略的失败值。
-     */
-    <R> TransactionReceipt<R> transact(Function<RuntimeTransaction, R> transaction);
-
-    /** 在根 Context 发布单个宿主 Capability，并返回携带类型与 settlement 的句柄。 */
-    <T> Provided<T> provide(CapabilityKey<T> key, T value);
-
-    /** 撤销单个宿主注册。多操作原子变更应使用 transact。 */
-    default void revoke(RegistrationHandle registration) {
-        transact(tx -> {
-            tx.revoke(registration);
-            return null;
-        });
+    default <T> PublicationChange<T> publish(CapabilityKey<T> key, T value) {
+        return publish(root(), key, value);
     }
 
-    /** 在根 Context 挂载配置型组件。 */
-    default <C> ComponentHandle<C> mount(
+    default <T> PublicationChange<T> publish(ContextHandle context, CapabilityKey<T> key, T value) {
+        return advanced().publication(context, key, value);
+    }
+
+    default <T> PublicationChange<T> publish(Class<T> type, T value) {
+        return publish(CapabilityKey.of(type), value);
+    }
+
+    default <T> PublicationChange<T> publish(ContextHandle context, Class<T> type, T value) {
+        return publish(context, CapabilityKey.of(type), value);
+    }
+
+    default MountHandle mount(
+            String mountId,
+            MountFactory factory) {
+        return advanced().transact(tx -> tx.mount(root(), mountId, factory)).value();
+    }
+
+    default MountHandle mount(
+            String mountId,
+            MountFactory factory,
+            MountOptions options) {
+        return advanced().transact(tx -> tx.mount(root(), mountId, factory, options)).value();
+    }
+
+    default <C> ConfiguredMountHandle<C> mount(
             String mountId,
             ComponentFactory<C> factory,
             C config) {
-        return transact(tx -> tx.mount(root(), mountId, factory, config)).value();
+        return mount(mountId, factory, config, null);
     }
 
-    /** 在根 Context 挂载无配置组件。 */
-    default ComponentHandle<NoConfig> mount(
+    default <C> ConfiguredMountHandle<C> mount(
             String mountId,
-            ComponentFactory<NoConfig> factory) {
-        return transact(tx -> tx.mount(root(), mountId, factory)).value();
+            ComponentFactory<C> factory,
+            C config,
+            MountOptions options) {
+        return transactForHandle(tx -> tx.mount(root(), mountId, factory, config, options));
     }
 
-    /** 异步关闭运行时并等待根 Context 子树清理收敛。 */
     CompletionStage<Void> closeAsync();
 
     static KnotraRuntime create(KnotraConfig config) {
-        return new io.knotra.internal.DefaultKnotraRuntime(config);
+        return io.knotra.internal.RuntimeBootstrap.create(config);
     }
 
     static KnotraRuntime create() {
@@ -58,5 +68,9 @@ public interface KnotraRuntime extends AutoCloseable {
     @Override
     default void close() {
         closeAsync().toCompletableFuture().join();
+    }
+
+    private <H extends MountHandle> H transactForHandle(Function<RuntimeTransaction, H> mount) {
+        return advanced().transact(mount::apply).value();
     }
 }

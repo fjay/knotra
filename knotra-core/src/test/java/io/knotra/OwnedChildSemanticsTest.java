@@ -3,6 +3,8 @@ package io.knotra;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,20 +25,20 @@ final class OwnedChildSemanticsTest {
 
     @Test
     void reconfigureDisposesOldOwnedSubtreeAndReusesMountId() throws Exception {
-        AtomicReference<ComponentHandle<NoConfig>> firstChild = new AtomicReference<>();
-        AtomicReference<ComponentHandle<NoConfig>> firstGrandchild = new AtomicReference<>();
-        AtomicReference<ComponentHandle<NoConfig>> secondChild = new AtomicReference<>();
-        AtomicReference<ComponentHandle<NoConfig>> secondGrandchild = new AtomicReference<>();
+        AtomicReference<MountHandle> firstChild = new AtomicReference<>();
+        AtomicReference<MountHandle> firstGrandchild = new AtomicReference<>();
+        AtomicReference<MountHandle> secondChild = new AtomicReference<>();
+        AtomicReference<MountHandle> secondGrandchild = new AtomicReference<>();
         AtomicInteger starts = new AtomicInteger();
 
-        var parent = runtime.transact(mutation -> mutation.mount(
+        var parent = runtime.advanced().transact(mutation -> mutation.mount(
                 runtime.root(),
                 "parent",
                 TestKit.factory("parent", new TestKit.Scripted<>(
                         ComponentDescriptor.named("parent"),
                         (context, config) -> {
                             starts.incrementAndGet();
-                            ComponentHandle<NoConfig> child = context.mountChild(
+                            MountHandle child = context.mountChild(
                                     "child",
                                     starts.get() == 1
                                             ? childFactory("first-grandchild", firstGrandchild)
@@ -60,40 +62,40 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(secondGrandchild.get()).call());
 
         assertEquals(ComponentState.DISPOSED, firstChild.get().state(),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
         assertEquals(ComponentState.DISPOSED, firstGrandchild.get().state(),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
         assertNotEquals(firstChild.get().handleId(), secondChild.get().handleId());
         assertEquals("child", secondChild.get().mountId());
 
         String secondParentActivation = TestKit.component(runtime, parent).currentActivationId();
         assertNotEquals(firstParentActivation, secondParentActivation);
-        RuntimeSnapshot.ComponentSnapshot newChild = TestKit.component(runtime, secondChild.get());
+        RuntimeSnapshot.MountSnapshot newChild = TestKit.component(runtime, secondChild.get());
         assertEquals(secondParentActivation, newChild.ownerActivationId());
         assertEquals(parent.handleId(), newChild.parentHandleId());
-        assertTrue(runtime.snapshot().activations().stream().noneMatch(activation ->
+        assertTrue(runtime.advanced().snapshot().activations().stream().noneMatch(activation ->
                 activation.handleId().equals(firstChild.get().handleId())));
-        assertTrue(runtime.snapshot().activations().stream().noneMatch(activation ->
+        assertTrue(runtime.advanced().snapshot().activations().stream().noneMatch(activation ->
                 activation.handleId().equals(firstGrandchild.get().handleId())));
-        assertEquals(1, runtime.snapshot().components().stream()
+        assertEquals(1, runtime.advanced().snapshot().mounts().stream()
                 .filter(component -> component.mountId().equals("child"))
                 .count());
-        assertEquals(1, runtime.snapshot().components().stream()
+        assertEquals(1, runtime.advanced().snapshot().mounts().stream()
                 .filter(component -> component.mountId().contains("grandchild"))
                 .count());
     }
 
     @Test
     void providerReplacementDisposesOwnedChildrenAndClearsPublicBindings() throws Exception {
-        AtomicReference<ComponentHandle<NoConfig>> oldChild = new AtomicReference<>();
-        AtomicReference<ComponentHandle<NoConfig>> newChild = new AtomicReference<>();
+        AtomicReference<MountHandle> oldChild = new AtomicReference<>();
+        AtomicReference<MountHandle> newChild = new AtomicReference<>();
         AtomicInteger starts = new AtomicInteger();
 
         RegistrationHandle firstProvider = TestKit.provide(
                 runtime, runtime.root(), A, "one");
         var parent = TestKit.mount(runtime, runtime.root(), "parent",
                 (context, config) -> {
-                    ComponentHandle<NoConfig> child = context.mountChild(
+                    MountHandle child = context.mountChild(
                             "child", childFactory("ignored-grandchild", new AtomicReference<>()),
                             NoConfig.INSTANCE);
                     if (starts.incrementAndGet() == 1) {
@@ -105,14 +107,14 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(oldChild.get()).call());
 
-        var replacement = runtime.transact(mutation -> {
+        var replacement = runtime.advanced().transact(mutation -> {
             mutation.revoke(firstProvider);
             mutation.provide(runtime.root(), A, "two");
             return null;
         });
         TestKit.assertCommitted(replacement);
 
-        RuntimeSnapshot stopping = runtime.snapshot();
+        RuntimeSnapshot stopping = runtime.advanced().snapshot();
         RuntimeSnapshot.ActivationSnapshot oldActivation = stopping.activations().stream()
                 .filter(activation -> activation.handleId().equals(parent.handleId()))
                 .findFirst().orElseThrow();
@@ -121,12 +123,12 @@ final class OwnedChildSemanticsTest {
                 .filter(binding -> binding.capability().name().equals(A.name()))
                 .allMatch(binding -> !binding.present() && binding.registrationId() == null));
 
-        replacement.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        replacement.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call(),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
         assertEquals(ComponentState.ACTIVE, TestKit.settle(newChild.get()).call());
         assertEquals(ComponentState.DISPOSED, oldChild.get().state());
-        assertEquals(1, runtime.snapshot().components().stream()
+        assertEquals(1, runtime.advanced().snapshot().mounts().stream()
                 .filter(component -> component.mountId().equals("child"))
                 .count());
     }
@@ -135,8 +137,8 @@ final class OwnedChildSemanticsTest {
     void failedOwnedChildCleanupMustRetryBeforeReplacementOwnsMountId() throws Exception {
         AtomicBoolean failCleanup = new AtomicBoolean(true);
         AtomicInteger cleanupAttempts = new AtomicInteger();
-        AtomicReference<ComponentHandle<NoConfig>> oldChild = new AtomicReference<>();
-        AtomicReference<ComponentHandle<NoConfig>> newChild = new AtomicReference<>();
+        AtomicReference<MountHandle> oldChild = new AtomicReference<>();
+        AtomicReference<MountHandle> newChild = new AtomicReference<>();
         AtomicInteger starts = new AtomicInteger();
 
         ComponentFactory<NoConfig> failingChildFactory = TestKit.factory("child",
@@ -147,13 +149,13 @@ final class OwnedChildSemanticsTest {
                                 throw new IllegalStateException("child cleanup failed");
                             }
                         })));
-        var parent = runtime.transact(mutation -> mutation.mount(
+        var parent = runtime.advanced().transact(mutation -> mutation.mount(
                 runtime.root(),
                 "parent",
                 TestKit.factory("parent", new TestKit.Scripted<>(
                         ComponentDescriptor.named("parent"),
                         (context, config) -> {
-                            ComponentHandle<NoConfig> child = context.mountChild(
+                            MountHandle child = context.mountChild(
                                     "child", failingChildFactory, NoConfig.INSTANCE);
                             if (starts.incrementAndGet() == 1) {
                                 oldChild.set(child);
@@ -180,9 +182,9 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(newChild.get()).call());
 
         assertNotEquals(oldChild.get().handleId(), newChild.get().handleId());
-        assertTrue(runtime.snapshot().components().stream().noneMatch(component ->
+        assertTrue(runtime.advanced().snapshot().mounts().stream().noneMatch(component ->
                 component.handleId().equals(oldChild.get().handleId())));
-        assertTrue(runtime.snapshot().activations().stream().noneMatch(activation ->
+        assertTrue(runtime.advanced().snapshot().activations().stream().noneMatch(activation ->
                 activation.handleId().equals(oldChild.get().handleId())));
         assertEquals(TestKit.component(runtime, parent).currentActivationId(),
                 TestKit.component(runtime, newChild.get()).ownerActivationId());
@@ -221,9 +223,143 @@ final class OwnedChildSemanticsTest {
         }
     }
 
+
+    @Test
+    void ownedChildSettlementWaitsForChildWithoutBlockingParentVisibility() throws Exception {
+        CountDownLatch childEntered = new CountDownLatch(1);
+        CompletableFuture<Void> childGate = new CompletableFuture<>();
+        AtomicReference<MountHandle> child = new AtomicReference<>();
+
+        TransactionReceipt<ConfiguredMountHandle<Config>> receipt =
+                runtime.advanced().transact(mutation -> mutation.mount(
+                        runtime.root(),
+                        "parent",
+                        TestKit.factory("parent", new TestKit.Scripted<>(
+                                ComponentDescriptor.named("parent"),
+                                (context, config) -> {
+                                    context.provide(A, "parent-output");
+                                    child.set(context.mountChild(
+                                            "child",
+                                            TestKit.factory("child", new TestKit.Scripted<>(
+                                                    ComponentDescriptor.named(
+                                                            "child",
+                                                            CapabilityRequirement.required(A)),
+                                                    (childContext, childConfig) -> {
+                                                        childEntered.countDown();
+                                                        assertEquals("parent-output",
+                                                                childContext.require(A));
+                                                        childGate.get();
+                                                    })),
+                                            NoConfig.INSTANCE));
+                                })),
+                        new Config("one")));
+        ConfiguredMountHandle<Config> parent = receipt.value();
+
+        assertTrue(childEntered.await(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.ACTIVE, parent.whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.ACTIVE, parent.state());
+        assertEquals(ComponentState.STARTING, child.get().state());
+        assertFalse(receipt.settlement().whenSettled().toCompletableFuture().isDone());
+
+        childGate.complete(null);
+        SettlementReport report = receipt.settlement().whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS);
+        assertEquals(ComponentState.ACTIVE, report.outcome(parent.handleId())
+                .map(SettlementReport.MountOutcome::state).orElseThrow(), report::toString);
+        assertEquals(ComponentState.ACTIVE, report.outcome(child.get().handleId())
+                .map(SettlementReport.MountOutcome::state).orElseThrow(), report::toString);
+        assertTrue(report.allActive());
+    }
+
+    @Test
+    void ownedChildFailureIsIncludedInParentOperationSettlement() throws Exception {
+        AtomicReference<MountHandle> child = new AtomicReference<>();
+        ComponentFactory<NoConfig> failingChild = TestKit.factory(
+                "child",
+                new TestKit.Scripted<>(
+                        ComponentDescriptor.named("child"),
+                        (childContext, childConfig) -> {
+                            throw new IllegalStateException("child failed");
+                        }));
+        ComponentFactory<Config> parentFactory = TestKit.factory(
+                "parent",
+                new TestKit.Scripted<>(
+                        ComponentDescriptor.named("parent"),
+                        (context, config) -> child.set(context.mountChild(
+                                "child", failingChild, NoConfig.INSTANCE))));
+        TransactionReceipt<ConfiguredMountHandle<Config>> receipt =
+                runtime.advanced().transact(mutation -> mutation.mount(
+                        runtime.root(),
+                        "parent",
+                        parentFactory,
+                        new Config("one")));
+
+        SettlementReport report = receipt.settlement().whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS);
+        assertTrue(report.hasFailedMounts(), report::toString);
+        assertFalse(report.allActive());
+        assertEquals(ComponentState.ACTIVE, report.outcome(receipt.value().handleId())
+                .map(SettlementReport.MountOutcome::state).orElseThrow());
+        assertEquals(ComponentState.FAILED, report.outcome(child.get().handleId())
+                .map(SettlementReport.MountOutcome::state).orElseThrow());
+        assertTrue(report.diagnostics().stream().anyMatch(diagnostic ->
+                child.get().handleId().equals(diagnostic.targetId())
+                        && diagnostic.message().contains("child failed")));
+    }
+
+    @Test
+    void reconfigureSettlementIncludesNewOwnedChild() throws Exception {
+        AtomicReference<MountHandle> firstChild = new AtomicReference<>();
+        AtomicReference<MountHandle> secondChild = new AtomicReference<>();
+        AtomicInteger starts = new AtomicInteger();
+        ConfiguredMountHandle<Config> parent = runtime.advanced().transact(mutation -> mutation.mount(
+                runtime.root(),
+                "parent",
+                TestKit.factory("parent", new TestKit.Scripted<>(
+                        ComponentDescriptor.named("parent"),
+                        (context, config) -> {
+                            starts.incrementAndGet();
+                            MountHandle child = context.mountChild(
+                                    "child-" + starts.get(),
+                                    TestKit.factory("child", new TestKit.Scripted<>(
+                                            ComponentDescriptor.named("child"),
+                                            (childContext, childConfig) -> { })),
+                                    NoConfig.INSTANCE);
+                            if (starts.get() == 1) {
+                                firstChild.set(child);
+                            } else {
+                                secondChild.set(child);
+                            }
+                        })),
+                new Config("one"))).value();
+        assertEquals(ComponentState.ACTIVE, parent.whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(ComponentState.ACTIVE, firstChild.get().whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+
+        TransactionReceipt<Void> reconfigured = runtime.advanced().transact(mutation -> {
+            mutation.reconfigure(parent, new Config("two"));
+            return null;
+        });
+        SettlementReport report = reconfigured.settlement().whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS);
+
+        assertEquals(ComponentState.ACTIVE, report.outcome(parent.handleId())
+                .map(SettlementReport.MountOutcome::state).orElseThrow());
+        SettlementReport.MountOutcome oldOutcome = report
+                .outcome(firstChild.get().handleId()).orElseThrow();
+        assertEquals(ComponentState.DISPOSED, oldOutcome.state());
+        assertEquals("child-1", oldOutcome.mountId());
+        assertEquals(ComponentState.ACTIVE,
+                report.outcome(secondChild.get().handleId())
+                        .map(SettlementReport.MountOutcome::state).orElseThrow());
+        assertFalse(report.allActive(), report::toString);
+    }
+
     private ComponentFactory<NoConfig> childFactory(
             String mountId,
-            AtomicReference<ComponentHandle<NoConfig>> mounted) {
+            AtomicReference<MountHandle> mounted) {
         return TestKit.factory("child-owner", new TestKit.Scripted<>(
                 ComponentDescriptor.named("child-owner"),
                 (context, config) -> mounted.set(context.mountChild(
@@ -270,7 +406,7 @@ final class OwnedChildSemanticsTest {
         }
     }
 
-    private static final class ExternalComponent implements ComponentHandle<NoConfig> {
+    private static final class ExternalComponent implements MountHandle {
         private final String id;
 
         private ExternalComponent(String id) {
@@ -322,10 +458,6 @@ final class OwnedChildSemanticsTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override
-        public CompletionStage<ComponentState> reconfigureAsync(NoConfig config) {
-            throw new UnsupportedOperationException();
-        }
 
         @Override
         public CompletionStage<ComponentState> retryAsync() {

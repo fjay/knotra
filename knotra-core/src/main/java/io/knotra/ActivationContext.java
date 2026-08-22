@@ -1,36 +1,48 @@
 package io.knotra;
 
 import java.util.Optional;
-
-/** 组件 start 执行期间使用的一次性激活上下文。 */
+/** One-time activation context handed to a component's start callback. */
 public interface ActivationContext {
     <T> T require(CapabilityKey<T> key);
 
+    default <T> T require(Class<T> type) {
+        return require(CapabilityKey.of(type));
+    }
+
     <T> Optional<T> find(CapabilityKey<T> key);
 
-    /** 订阅动态绑定的 Capability；只能用于声明为 DYNAMIC 的需求。 */
+    default <T> Optional<T> find(Class<T> type) {
+        return find(CapabilityKey.of(type));
+    }
+
     <T> DynamicCapability<T> subscribe(CapabilityKey<T> key);
+
+    default <T> DynamicCapability<T> subscribe(Class<T> type) {
+        return subscribe(CapabilityKey.of(type));
+    }
 
     <T> void provide(CapabilityKey<T> key, T value);
 
-    <C> ComponentHandle<C> mountChild(
+    default <T> void provide(Class<T> type, T value) {
+        provide(CapabilityKey.of(type), value);
+    }
+
+    <C> ConfiguredMountHandle<C> mountChild(
             String mountId,
             ComponentFactory<C> factory,
             C config);
 
-    <C> ComponentHandle<C> mountChild(
+    <C> ConfiguredMountHandle<C> mountChild(
             String mountId,
             ComponentFactory<C> factory,
             C config,
             MountOptions options);
 
-    /** 挂载无配置子组件。 */
-    ComponentHandle<NoConfig> mountChild(
+    MountHandle mountChild(
             String mountId,
             ComponentFactory<NoConfig> factory);
 
-    /** 挂载无配置子组件并覆盖挂载选项。 */
-    ComponentHandle<NoConfig> mountChild(
+    MountHandle mountChild(
             String mountId,
             ComponentFactory<NoConfig> factory,
             MountOptions options);

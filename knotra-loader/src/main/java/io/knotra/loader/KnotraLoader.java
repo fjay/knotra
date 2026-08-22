@@ -10,6 +10,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.time.Duration;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -22,7 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import io.knotra.ComponentGoal;
-import io.knotra.ComponentHandle;
+import io.knotra.MountHandle;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.ContextState;
@@ -32,6 +33,7 @@ import io.knotra.TransactionReceipt;
 import io.knotra.TransactionRejectedException;
 import io.knotra.RuntimeDiagnostic;
 import io.knotra.RuntimeSnapshot;
+import io.knotra.SettlementReport;
 
 /**
  * 基于 Core 的声明式期望状态收敛器。
@@ -50,7 +52,7 @@ import io.knotra.RuntimeSnapshot;
  *
  * <p>操作在单线程协调器上串行执行，保证并发 reconcile 看到一致的树状态；
  * 协调器线程内的重入调用会被拒绝，避免受控策略回调造成自等待死锁。
- * FAILED 的组件不会被自动重试，需通过 {@link #retry(String)} 显式恢复。
+ * FAILED 的挂载不会被自动重试，需通过 {@link #retry(String)} 显式恢复。
  */
 public final class KnotraLoader implements AutoCloseable {
 
@@ -74,7 +76,10 @@ public final class KnotraLoader implements AutoCloseable {
     private volatile List<LoaderDiagnostic> latestDiagnostics = List.of();
     private volatile boolean closed;
     private CompletableFuture<Void> closeAttempt;
-
+    /** 受控挂载 commit 后的 settlement 等待；包内可注入以做确定性测试。 */
+    private volatile Duration mountSettlementTimeout = AllocatedMountContext.DEFAULT_SETTLEMENT_TIMEOUT;
+    /** settlement 未收敛时释放已提交挂载的有界等待。 */
+    private volatile Duration mountRecoveryTimeout = AllocatedMountContext.DEFAULT_RECOVERY_TIMEOUT;
     private KnotraLoader(
             KnotraRuntime runtime,
             ContextHandle baseContext,
@@ -87,7 +92,7 @@ public final class KnotraLoader implements AutoCloseable {
         if (owned) {
             TransactionReceipt<ContextHandle> receipt;
             try {
-                receipt = runtime.transact(transaction ->
+                receipt = runtime.advanced().transact(transaction ->
                         transaction.childContext(runtime.root(), loaderId));
             } catch (TransactionRejectedException rejection) {
                 throw new IllegalArgumentException(
@@ -148,6 +153,23 @@ public final class KnotraLoader implements AutoCloseable {
     }
 
     /**
+     * 包内测试注入点：缩短受控挂载 commit 后的 settlement 与释放等待，
+     * 使 commit 后超时路径可以快速、确定性地覆盖，无需等待真实 30 秒。
+     */
+    void mountTimeoutsForTesting(Duration settlementTimeout, Duration recoveryTimeout) {
+        this.mountSettlementTimeout = positiveDuration(settlementTimeout, "settlementTimeout");
+        this.mountRecoveryTimeout = positiveDuration(recoveryTimeout, "recoveryTimeout");
+    }
+
+    private static Duration positiveDuration(Duration value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.isZero() || value.isNegative()) {
+            throw new IllegalArgumentException(name + " must be positive");
+        }
+        return value;
+    }
+
+    /**
      * 异步收敛期望树。
      *
      * <p>流程分两个层次：先把期望树完全准备并校验（路径归一化、父完整性、
@@ -158,7 +180,7 @@ public final class KnotraLoader implements AutoCloseable {
      *
      * <p>契约：操作在协调器上串行执行；收敛拒绝以结构化诊断返回而不是抛出，
      * 协调器内部错误与协调器线程上的重入调用仍以异常抛出；新增批次失败时
-     * 本批已挂载的句柄与新 Context 按 LIFO 回滚；FAILED 组件不做自动重试。
+     * 本批已挂载的句柄与新 Context 按 LIFO 回滚；FAILED 挂载不做自动重试。
      * Loader 已关闭时立即完成并携带 CLOSED 诊断。
      *
      * @param desired 完整的期望组件树；每次调用都是全量状态而非增量
@@ -202,7 +224,7 @@ public final class KnotraLoader implements AutoCloseable {
     /**
      * 对指定路径执行显式恢复。
      *
-     * <p>组件处于 FAILED 时触发 ComponentHandle.retry 重新激活；条目对应的
+     * <p>挂载处于 FAILED 时触发 MountHandle.retryAsync 重新激活；条目对应的
      * Context 处于 FAILED 时释放该子树，让下一次 reconcile 重建。两者之外的
      * 请求记为 INVALID_TREE。与 reconcile 不同，retry 不重读期望树，
      * 只作用于当前记账中该路径的状态。
@@ -364,7 +386,7 @@ public final class KnotraLoader implements AutoCloseable {
                 return finish(false, changes, diagnostics);
             }
             updateConfigs(prepared, changes, diagnostics);
-            addFailedDiagnostics(prepared, diagnostics);
+            addUnconvergedDiagnostics(prepared, diagnostics);
         } catch (Throwable error) {
             proposed = false;
             diagnostics.add(LoaderDiagnostic.of(
@@ -471,7 +493,7 @@ public final class KnotraLoader implements AutoCloseable {
         if (baseState != ContextState.DISPOSING && baseState != ContextState.DISPOSED) {
             return false;
         }
-        return runtime.snapshot().contexts().stream()
+        return runtime.advanced().snapshot().contexts().stream()
                 .filter(context -> context.contextId().equals(runtime.root().contextId()))
                 .findFirst()
                 .map(context -> context.state() == ContextState.DISPOSING
@@ -487,7 +509,7 @@ public final class KnotraLoader implements AutoCloseable {
             return false;
         }
         String rootId = runtime.root().contextId();
-        return runtime.snapshot().contexts().stream()
+        return runtime.advanced().snapshot().contexts().stream()
                 .filter(context -> context.contextId().equals(rootId))
                 .findFirst()
                 .map(context -> context.state() == ContextState.DISPOSING
@@ -496,7 +518,7 @@ public final class KnotraLoader implements AutoCloseable {
     }
 
     /** 有界等待运行时接管的句柄释放完成；未在时限内到达 DISPOSED 视为失败。 */
-    private boolean awaitRuntimeOwnedHandleDisposal(ComponentHandle<?> handle) {
+    private boolean awaitRuntimeOwnedHandleDisposal(MountHandle handle) {
         try {
             ComponentState state = handle.whenSettled()
                     .toCompletableFuture().get(30, TimeUnit.SECONDS);
@@ -624,7 +646,7 @@ public final class KnotraLoader implements AutoCloseable {
     private void preflight(
             Set<String> paths,
             List<LoaderDiagnostic> diagnostics) {
-        RuntimeSnapshot snapshot = runtime.snapshot();
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         RuntimeSnapshot.ContextSnapshot base = snapshot.contexts().stream()
                 .filter(context -> context.contextId().equals(baseContext.contextId()))
                 .findFirst()
@@ -648,9 +670,9 @@ public final class KnotraLoader implements AutoCloseable {
         for (RuntimeSnapshot.ContextSnapshot context : snapshot.contexts()) {
             byPath.put(context.canonicalPath(), context);
         }
-        Map<String, RuntimeSnapshot.ComponentSnapshot> mounts = new LinkedHashMap<>();
-        for (RuntimeSnapshot.ComponentSnapshot component : snapshot.components()) {
-            mounts.put(component.contextId() + "/" + component.mountId(), component);
+        Map<String, RuntimeSnapshot.MountSnapshot> mounts = new LinkedHashMap<>();
+        for (RuntimeSnapshot.MountSnapshot mount : snapshot.mounts()) {
+            mounts.put(mount.contextId() + "/" + mount.mountId(), mount);
         }
         String baseCanonical = base.canonicalPath();
         for (String path : paths) {
@@ -673,7 +695,7 @@ public final class KnotraLoader implements AutoCloseable {
             }
 
             ManagedEntry entry = current.get(path);
-            RuntimeSnapshot.ComponentSnapshot mounted = existing == null
+            RuntimeSnapshot.MountSnapshot mounted = existing == null
                     ? null
                     : mounts.get(existing.contextId() + "/" + path);
             if (mounted != null
@@ -692,15 +714,15 @@ public final class KnotraLoader implements AutoCloseable {
      * DISPOSED 就仍需记账。
      */
     private void pruneExternallyDisposed() {
-        RuntimeSnapshot snapshot = runtime.snapshot();
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         Set<String> liveContextIds = snapshot.contexts().stream()
                 .filter(context -> context.state() == ContextState.ACTIVE
                         || context.state() == ContextState.FAILED)
                 .map(RuntimeSnapshot.ContextSnapshot::contextId)
                 .collect(LinkedHashSet::new, LinkedHashSet::add, LinkedHashSet::addAll);
-        Set<String> liveHandleIds = snapshot.components().stream()
-                .filter(component -> component.state() != ComponentState.DISPOSED)
-                .map(RuntimeSnapshot.ComponentSnapshot::handleId)
+        Set<String> liveHandleIds = snapshot.mounts().stream()
+                .filter(mount -> mount.state() != ComponentState.DISPOSED)
+                .map(RuntimeSnapshot.MountSnapshot::handleId)
                 .collect(LinkedHashSet::new, LinkedHashSet::add, LinkedHashSet::addAll);
 
         contexts.keySet().removeIf(path -> !liveContextIds.contains(contexts.get(path).contextId()));
@@ -814,16 +836,21 @@ public final class KnotraLoader implements AutoCloseable {
         }
         current.remove(old.path());
 
-        MountAttempt mounted = mountOne(next, old.context(), diagnostics);
-        if (mounted != null) {
-            register(mounted);
-            if (mounted.handle().state() == ComponentState.FAILED) {
+        MountResult mounted = mountOne(next, old.context(), diagnostics);
+        if (mounted.mounted()) {
+            register(mounted.attempt());
+            if (mounted.attempt().handle().state() == ComponentState.FAILED) {
                 diagnostics.add(LoaderDiagnostic.of(
                         LoaderDiagnosticCode.ACTIVATION_FAILED,
                         next.path(),
                         "replacement implementation failed to activate"));
             }
             return true;
+        }
+        if (mounted.committedUnsettled()) {
+            // 新挂载已提交但未收敛，句柄已进入记账且占用槽位；
+            // 此时绝不能用旧实现补偿重挂同一个 mountId。
+            return false;
         }
 
         PreparedEntry fallback = new PreparedEntry(
@@ -833,9 +860,9 @@ public final class KnotraLoader implements AutoCloseable {
                 old.definition(),
                 old.config());
         List<LoaderDiagnostic> compensation = new ArrayList<>();
-        MountAttempt restored = mountOne(fallback, old.context(), compensation);
-        if (restored != null) {
-            register(restored);
+        MountResult restored = mountOne(fallback, old.context(), compensation);
+        if (restored.mounted()) {
+            register(restored.attempt());
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.REPLACEMENT_BLOCKED,
                     old.path(),
@@ -876,12 +903,20 @@ public final class KnotraLoader implements AutoCloseable {
             for (String path : missing) {
                 PreparedEntry entry = desired.entry(path);
                 ContextHandle context = contexts.get(path);
-                MountAttempt attempt = mountOne(entry, context, diagnostics);
-                if (attempt == null) {
+                MountResult attempt = mountOne(entry, context, diagnostics);
+                if (attempt.committedUnsettled()) {
+                    // 本批存在已提交但未收敛的挂载：回滚可能无法完成，
+                    // 保留全部记账，等待后续 reconcile/close 继续收敛。
+                    changes.add(ReconcileResult.Change.of(
+                            ReconcileResult.ChangeType.BLOCKED,
+                            path));
+                    return false;
+                }
+                if (!attempt.mounted()) {
                     rollbackAdd(mounted, created, diagnostics);
                     return false;
                 }
-                ManagedEntry managed = register(attempt);
+                ManagedEntry managed = register(attempt.attempt());
                 mounted.add(managed);
                 changes.add(ReconcileResult.Change.of(
                         ReconcileResult.ChangeType.MOUNTED,
@@ -909,9 +944,10 @@ public final class KnotraLoader implements AutoCloseable {
             Map<String, ContextHandle> created,
             List<LoaderDiagnostic> diagnostics) {
         Map<String, ContextHandle> provisional = new LinkedHashMap<>();
-        TransactionReceipt<Void> receipt;
+        TransactionReceipt<ContextHandle> receipt;
         try {
-            receipt = runtime.transact(transaction -> {
+            receipt = runtime.advanced().transact(transaction -> {
+                ContextHandle lastContext = baseContext;
                 for (String path : missing) {
                     ContextHandle reusable = contexts.get(path);
                     if (reusable != null) {
@@ -919,14 +955,16 @@ public final class KnotraLoader implements AutoCloseable {
                             throw new IllegalStateException("managed context is not active: " + path);
                         }
                         provisional.put(path, reusable);
+                        lastContext = reusable;
                         continue;
                     }
                     ContextHandle parent = parentContext(path, provisional);
                     ContextHandle child = transaction.childContext(parent, lastSegment(path));
                     provisional.put(path, child);
                     created.put(path, child);
+                    lastContext = child;
                 }
-                return null;
+                return lastContext;
             });
         } catch (TransactionRejectedException rejection) {
             addCoreDiagnostics(LoaderDiagnosticCode.STRUCTURE_REJECTED, missing.getFirst(), diagnostics,
@@ -934,15 +972,24 @@ public final class KnotraLoader implements AutoCloseable {
             created.clear();
             return false;
         }
-        if (!await(receipt.settlement())) {
+        SettlementReport report;
+        try {
+            report = receipt.awaitSettled(Duration.ofSeconds(30));
+        } catch (Exception error) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     missing.getFirst(),
-                    "one or more contexts failed to settle"));
-            List<LoaderDiagnostic> compensation = new ArrayList<>();
-            rollbackContexts(created, compensation);
-            diagnostics.addAll(compensation);
-            created.clear();
+                    "context settlement failed: " + safeError(error)));
+            rollbackCreatedContexts(created, diagnostics);
+            return false;
+        }
+        if (settlementIndicatesFailure(report)) {
+            addSettlementDiagnostics(
+                    LoaderDiagnosticCode.STRUCTURE_REJECTED,
+                    missing.getFirst(),
+                    diagnostics,
+                    report);
+            rollbackCreatedContexts(created, diagnostics);
             return false;
         }
         contexts.putAll(provisional);
@@ -969,11 +1016,15 @@ public final class KnotraLoader implements AutoCloseable {
     }
 
     /**
-     * 执行一次受控挂载并等待 Activation 结算。除异常外还校验策略确实使用了
+     * 执行一次受控挂载并消费其 settlement 报告。除异常外还校验策略确实使用了
      * 分配的槽位：返回句柄必须绑定在分配的 contextId 与 mountId 上；越界
-     * 句柄立即释放并整批拒绝，防止策略把组件挂到 Loader 记账之外。
+     * 句柄立即释放并整批拒绝，防止策略把挂载放到 Loader 记账之外。
+     *
+     * <p>任何 commit 后的失败都不会遗留未跟踪挂载：settlement 未收敛且无法
+     * 有界释放的已提交句柄会进入 Loader 记账并以 SETTLEMENT_UNSETTLED 拒绝；
+     * 无法取得句柄的槽位占用也会被显式报告而不是静默吞掉。</p>
      */
-    private MountAttempt mountOne(
+    private MountResult mountOne(
             PreparedEntry entry,
             ContextHandle context,
             List<LoaderDiagnostic> diagnostics) {
@@ -982,46 +1033,25 @@ public final class KnotraLoader implements AutoCloseable {
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     entry.path(),
                     "mount context is not active"));
-            return null;
+            return MountResult.REJECTED;
         }
+        AllocatedMountContext mountContext = new AllocatedMountContext(
+                runtime, context, entry.path(), mountSettlementTimeout, mountRecoveryTimeout);
+        MountHandle handle = null;
+        boolean rejected = false;
         try {
-            ControlledMountContext mountContext = new AllocatedMountContext(
-                    runtime, context, entry.path());
-            ComponentHandle<?> handle = entry.definition()
+            handle = entry.definition()
                     .mountStrategy()
                     .mountAsync(mountContext, entry.config())
                     .toCompletableFuture()
                     .get();
-            if (handle == null) {
-                diagnostics.add(LoaderDiagnostic.of(
-                        LoaderDiagnosticCode.STRUCTURE_REJECTED,
-                        entry.path(),
-                        "controlled mount returned no component handle"));
-                return null;
-            }
-            if (!context.contextId().equals(handle.contextId())
-                    || !entry.path().equals(handle.mountId())) {
-                diagnostics.add(LoaderDiagnostic.of(
-                        LoaderDiagnosticCode.STRUCTURE_REJECTED,
-                        entry.path(),
-                        "controlled mount returned a handle outside its allocated slot"));
-                disposeHandle(entry.path(), handle, diagnostics);
-                return null;
-            }
-            handle.whenSettled().toCompletableFuture().get();
-            return new MountAttempt(
-                    entry.path(),
-                    entry.name(),
-                    context,
-                    handle,
-                    entry.definition(),
-                    entry.config());
         } catch (ControlledMountException error) {
             addCoreDiagnostics(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     entry.path(),
                     diagnostics,
                     error.diagnostics());
+            rejected = true;
         } catch (ExecutionException error) {
             if (error.getCause() instanceof ControlledMountException controlled) {
                 addCoreDiagnostics(
@@ -1035,13 +1065,95 @@ public final class KnotraLoader implements AutoCloseable {
                         entry.path(),
                         safeError(error)));
             }
+            rejected = true;
         } catch (Exception error) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     entry.path(),
                     safeError(error)));
+            rejected = true;
         }
-        return null;
+        if (!rejected) {
+            if (handle == null) {
+                diagnostics.add(LoaderDiagnostic.of(
+                        LoaderDiagnosticCode.STRUCTURE_REJECTED,
+                        entry.path(),
+                        "controlled mount returned no mount handle"));
+                return rejectedWithoutOrphan(entry, context, mountContext, diagnostics);
+            }
+            if (!context.contextId().equals(handle.contextId())
+                    || !entry.path().equals(handle.mountId())) {
+                diagnostics.add(LoaderDiagnostic.of(
+                        LoaderDiagnosticCode.STRUCTURE_REJECTED,
+                        entry.path(),
+                        "controlled mount returned a mount handle outside its allocated slot"));
+                disposeHandle(entry.path(), handle, diagnostics);
+                return rejectedWithoutOrphan(entry, context, mountContext, diagnostics);
+            }
+            SettlementReport report = mountContext.lastReport();
+            if (settlementIndicatesFailure(report)) {
+                addSettlementDiagnostics(
+                        LoaderDiagnosticCode.ACTIVATION_FAILED,
+                        entry.path(),
+                        diagnostics,
+                        report);
+            }
+            return MountResult.mounted(new MountAttempt(
+                    entry.path(),
+                    entry.name(),
+                    context,
+                    handle,
+                    entry.definition(),
+                    entry.config()));
+        }
+        return rejectedWithoutOrphan(entry, context, mountContext, diagnostics);
+    }
+
+    /**
+     * commit 后失败路径的收口：先接管 AllocatedMountContext 无法有界释放的
+     * 已提交句柄（写入记账），再确认槽位上没有无法接管的存活挂载。
+     */
+    private MountResult rejectedWithoutOrphan(
+            PreparedEntry entry,
+            ContextHandle context,
+            AllocatedMountContext mountContext,
+            List<LoaderDiagnostic> diagnostics) {
+        MountHandle committed = mountContext.committedHandle();
+        if (committed != null) {
+            register(new MountAttempt(
+                    entry.path(),
+                    entry.name(),
+                    context,
+                    committed,
+                    entry.definition(),
+                    entry.config()));
+            diagnostics.add(LoaderDiagnostic.of(
+                    LoaderDiagnosticCode.SETTLEMENT_UNSETTLED,
+                    entry.path(),
+                    "committed mount did not settle within " + mountSettlementTimeout
+                            + "; its handle is kept in loader bookkeeping for recovery"));
+            return MountResult.COMMITTED_UNSETTLED;
+        }
+        boolean untracked = runtime.advanced().snapshot().mounts().stream()
+                .anyMatch(mount -> mount.contextId().equals(context.contextId())
+                        && mount.mountId().equals(entry.path())
+                        && mount.state() != ComponentState.DISPOSED);
+        if (untracked) {
+            diagnostics.add(LoaderDiagnostic.of(
+                    LoaderDiagnosticCode.STRUCTURE_REJECTED,
+                    entry.path(),
+                    "an untracked committed mount occupies the allocated slot"
+                            + " and could not be recovered"));
+        }
+        return MountResult.REJECTED;
+    }
+
+    /**
+     * Loader 只把 FAILED 挂载视为 settlement 失败；owned child 与有意替换的旧
+     * child 会以 DISPOSED 出现在报告中，那是预期结果而不是失败。
+     */
+    static boolean settlementIndicatesFailure(SettlementReport report) {
+        return report != null && report.hasFailedMounts();
     }
 
     /**
@@ -1150,20 +1262,31 @@ public final class KnotraLoader implements AutoCloseable {
     }
 
     /**
-     * 汇总仍处于 FAILED 的期望条目。Loader 刻意不做自动重试：失败的 start()
-     * 可能是持续故障，自动重试会在每次 reconcile 中放大副作用，因此收敛语义
-     * 要求调用方显式 retry。
+     * 汇总仍未收敛的期望条目。FAILED 保持既有语义（显式 retry）；
+     * STARTING/STOPPING/DISPOSING 等过渡态说明上一次已提交变更尚未完成，
+     * 以 SETTLEMENT_UNSETTLED 报告而不是谎称收敛。WAITING 是合法稳态
+     * （等待必需能力提供方），不计入诊断。
      */
-    private void addFailedDiagnostics(
+    private void addUnconvergedDiagnostics(
             PreparedTree desired,
             List<LoaderDiagnostic> diagnostics) {
         for (String path : desired.paths()) {
             ManagedEntry entry = current.get(path);
-            if (entry != null && entry.handle().state() == ComponentState.FAILED) {
+            if (entry == null) {
+                continue;
+            }
+            ComponentState state = entry.handle().state();
+            if (state == ComponentState.FAILED) {
                 diagnostics.add(LoaderDiagnostic.of(
                         LoaderDiagnosticCode.ACTIVATION_FAILED,
                         path,
                         "desired component is FAILED; call retry(path) explicitly"));
+            } else if (state != ComponentState.ACTIVE && state != ComponentState.WAITING) {
+                diagnostics.add(LoaderDiagnostic.of(
+                        LoaderDiagnosticCode.SETTLEMENT_UNSETTLED,
+                        path,
+                        "desired component has not settled: state=" + state
+                                + ", goal=" + entry.handle().goal()));
             }
         }
     }
@@ -1174,7 +1297,7 @@ public final class KnotraLoader implements AutoCloseable {
      */
     private boolean disposeHandle(
             String path,
-            ComponentHandle<?> handle,
+            MountHandle handle,
             List<LoaderDiagnostic> diagnostics) {
         if (handle.state() == ComponentState.DISPOSED) {
             return true;
@@ -1308,12 +1431,38 @@ public final class KnotraLoader implements AutoCloseable {
         latestDiagnostics = List.copyOf(diagnostics).stream().sorted().toList();
     }
 
-    private boolean await(CompletionStage<Void> settlement) {
-        try {
-            settlement.toCompletableFuture().get();
-            return true;
-        } catch (Exception error) {
-            return false;
+    private void rollbackCreatedContexts(
+            Map<String, ContextHandle> created,
+            List<LoaderDiagnostic> diagnostics) {
+        List<LoaderDiagnostic> compensation = new ArrayList<>();
+        rollbackContexts(created, compensation);
+        diagnostics.addAll(compensation);
+        created.clear();
+    }
+
+    private void addSettlementDiagnostics(
+            LoaderDiagnosticCode fallback,
+            String path,
+            List<LoaderDiagnostic> diagnostics,
+            SettlementReport report) {
+        for (SettlementReport.MountOutcome outcome : report.failedMounts()) {
+            if (outcome.diagnostics().isEmpty()) {
+                diagnostics.add(LoaderDiagnostic.of(
+                        fallback,
+                        path,
+                        "mount " + outcome.mountId() + " settled as " + outcome.state()));
+            } else {
+                addCoreDiagnostics(fallback, path, diagnostics, outcome.diagnostics());
+            }
+        }
+        if (!report.diagnostics().isEmpty()) {
+            addCoreDiagnostics(fallback, path, diagnostics, report.diagnostics());
+        }
+        if (report.failedMounts().isEmpty() && report.diagnostics().isEmpty()) {
+            diagnostics.add(LoaderDiagnostic.of(
+                    fallback,
+                    path,
+                    "settlement completed with an unsuccessful outcome"));
         }
     }
 
@@ -1351,8 +1500,14 @@ public final class KnotraLoader implements AutoCloseable {
             diagnostics.add(LoaderDiagnostic.of(
                     mapCode(value.code(), fallback),
                     path,
-                    value.message()));
+                    diagnosticMessage(value)));
         }
+    }
+
+    private String diagnosticMessage(RuntimeDiagnostic diagnostic) {
+        RuntimeDiagnostic stable = Objects.requireNonNull(diagnostic, "diagnostic");
+        String summary = stable.failure().summary();
+        return summary.isBlank() ? stable.message() : stable.message() + " (" + summary + ")";
     }
 
     /** Core 诊断码到 Loader 诊断码的稳定映射；无法识别时回退到调用方指定的码。 */
@@ -1472,16 +1627,9 @@ public final class KnotraLoader implements AutoCloseable {
         return normalized;
     }
 
-    /** 取根因消息用于诊断，避免把包装异常的无信息消息写进结果。 */
+    /** 有界根因描述；对恶意 Throwable 的防护见 {@link LoaderErrors}。 */
     private static String safeError(Throwable error) {
-        Throwable current = error;
-        while (current.getCause() != null) {
-            current = current.getCause();
-        }
-        String message = current.getMessage();
-        return message == null || message.isBlank()
-                ? current.getClass().getName()
-                : message;
+        return LoaderErrors.safe(error);
     }
 
     /** 期望条目完成准备后的形态：归一化路径 + 解析出的定义 + 归一化配置。 */
@@ -1513,17 +1661,46 @@ public final class KnotraLoader implements AutoCloseable {
             String path,
             String name,
             ContextHandle context,
-            ComponentHandle<?> handle,
+            MountHandle handle,
             ResolvedFactory definition,
             Object config) {
     }
 
+    /**
+     * 一次受控挂载尝试的结果：MOUNTED 返回可用句柄；REJECTED 表示槽位
+     * 干净（从未提交或已可靠释放）；COMMITTED_UNSETTLED 表示已提交句柄
+     * 无法有界释放、已由 mountOne 写入 Loader 记账并占用槽位。
+     */
+    private record MountResult(Kind kind, MountAttempt attempt) {
+
+        enum Kind {
+            MOUNTED,
+            REJECTED,
+            COMMITTED_UNSETTLED
+        }
+
+        private static final MountResult REJECTED = new MountResult(Kind.REJECTED, null);
+        private static final MountResult COMMITTED_UNSETTLED =
+                new MountResult(Kind.COMMITTED_UNSETTLED, null);
+
+        private static MountResult mounted(MountAttempt value) {
+            return new MountResult(Kind.MOUNTED, value);
+        }
+
+        private boolean mounted() {
+            return kind == Kind.MOUNTED;
+        }
+
+        private boolean committedUnsettled() {
+            return kind == Kind.COMMITTED_UNSETTLED;
+        }
+    }
     /** Loader 对单个受管路径的记账：Context、句柄、当前定义与归一化配置。 */
     private static final class ManagedEntry {
         private final String path;
         private final String name;
         private final ContextHandle context;
-        private final ComponentHandle<?> handle;
+        private final MountHandle handle;
         private final ResolvedFactory definition;
         private final Object config;
 
@@ -1531,7 +1708,7 @@ public final class KnotraLoader implements AutoCloseable {
                 String path,
                 String name,
                 ContextHandle context,
-                ComponentHandle<?> handle,
+                MountHandle handle,
                 ResolvedFactory definition,
                 Object config) {
             this.path = path;
@@ -1554,7 +1731,7 @@ public final class KnotraLoader implements AutoCloseable {
             return context;
         }
 
-        private ComponentHandle<?> handle() {
+        private MountHandle handle() {
             return handle;
         }
 
@@ -1566,7 +1743,7 @@ public final class KnotraLoader implements AutoCloseable {
             return config;
         }
 
-        private ManagedEntry withHandle(ComponentHandle<?> replacement) {
+        private ManagedEntry withHandle(MountHandle replacement) {
             return new ManagedEntry(path, name, context, replacement, definition, config);
         }
 

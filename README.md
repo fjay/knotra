@@ -2,44 +2,54 @@
 
 **应用不重启，组件可替换。**
 
-Knotra 是一个面向 Java 21+ 的 JVM 动态组件运行时。应用启动后仍可以热替换业务实现、升级插件、局部重启或按上下文切换服务，同时在底层保证依赖绑定代际一致、在途请求安全排空与资源确定性释放。
+Knotra 是面向 Java 21+ 的 JVM 动态组件运行时。应用启动后仍可以热替换业务实现、升级插件、局部重启或按上下文切换服务；底层同时维护依赖绑定代际、在途调用排空和确定性资源释放。
 
 ![Java](https://img.shields.io/badge/Java-21%2B-orange)
 ![Maven](https://img.shields.io/badge/Maven-3.9%2B-blue)
 ![Version](https://img.shields.io/badge/version-0.1.0--SNAPSHOT-blue)
-![Tests](https://img.shields.io/badge/tests-336%20passing-brightgreen)
 
-> **项目状态**：`0.1.0-SNAPSHOT`。依赖 Java 21+ 与 Maven 3.9+。
+> **项目状态**：`0.1.0-SNAPSHOT`。需要 Java 21+ 与 Maven 3.9+。
+
+---
+
+## API 分层
+
+Knotra 把日常业务、结构控制和框架扩展分成三层：
+
+| 层次 | 使用者 | 典型入口 | 边界 |
+|---|---|---|---|
+| Simple API | 业务应用 | `KnotraRuntime`、`Publication`、`Beans`、`MountHandle` | 不出现事务、raw registration、配置占位类型或组件 SPI |
+| Advanced API | 平台和应用框架作者 | `runtime.advanced()` | 事务、具体代际 `Registration`、Context 变更和完整快照 |
+| SPI | Knotra 扩展与插件作者 | `Component`、`ActivationContext` | 直接实现生命周期，遵守资源与 ClassLoader 规则 |
+
+普通业务代码建议只依赖第一层。需要一次提交多个结构变更时，再进入 [API 与集成指南](<docs/Knotra API 与集成指南.md>) 的 Advanced 章节。
 
 ---
 
 ## 为什么需要动态组件运行时
 
-把一段新字节码加载进 JVM 并不难，真正的难点在于热替换发生时的运行时一致性：
+把新字节码加载进 JVM 并不难，难的是替换发生时保持一致：
 
-```mermaid
-graph LR
-    subgraph pain_points ["常见热替换方案的缺陷"]
-        A["依赖状态撕裂"] -->|"新旧依赖交替暴露<br/>数据不一致"| P1["业务逻辑出错"]
-        B["暴力销毁旧实例"] -->|"在途任务未完成<br/>直接调用 close"| P2["请求处理中断"]
-        C["类加载器泄漏"] -->|"静态引用或未停线程<br/>阻止 ClassLoader 卸载"| P3["Metaspace 内存溢出"]
-    end
-```
-
-Knotra 将组件生命周期、依赖代际和资源归属作为一等运行时对象管理，以此保障系统一致性：
-
-- **初始化隔离**：新组件在完全启动并验证通过前，对外部调用方彻底不可见；若启动异常则整批回滚。
-- **在途任务安全排空（Drain）**：旧组件被替换时，自动停止接入新流量，并等待已接受的方法调用或异步任务完成后再执行释放。
-- **依赖代际强一致（Generation Pinned）**：消费方组件在启动时绑定固定的依赖代际；当底层服务替换时，消费方自动按新依赖原子重建，杜绝跨代混合调用。
-- **确定性资源清理（LIFO）**：组件创建的连接、线程池和监听器由作用域托管，销毁时按后进先出严格逆序释放；释放失败保留现场并支持重试。
+- **初始化隔离**：新组件完全启动并验证前不可见；失败则回滚本批变更。
+- **在途调用排空**：旧组件停止承接新流量，已有调用和异步任务完成后才释放。
+- **依赖代际一致**：固定依赖的消费方绑定启动时代际；提供方替换后按原子计划重建。
+- **确定性资源清理**：Activation 登记的资源按 LIFO 释放，失败状态可重试。
 
 ---
 
 ## 极速上手
 
-### 引入依赖
+### 安装 Knotra
 
-通过 BOM 统一管理模块版本，普通应用引入 `knotra-starter`：
+当前仓库没有配置公开 SNAPSHOT 仓库。先从源码安装到本机 Maven 仓库：
+
+```bash
+git clone <repository-url>
+cd knotra
+mvn clean install
+```
+
+然后在应用 POM 中导入 BOM 并引入 Starter：
 
 ```xml
 <dependencyManagement>
@@ -62,132 +72,120 @@ Knotra 将组件生命周期、依赖代际和资源归属作为一等运行时�
 </dependencies>
 ```
 
-### 编写业务类
+贡献者验证使用完整 reactor：`mvn clean verify`。它会执行各模块测试、插件 fixture 构建和文档示例，不需要先部署任何构件。
 
-业务类保持纯粹的 POJO 结构，无需继承或实现任何 Knotra 框架类型：
+### 定义业务契约
 
 ```java
 public interface Greeting {
     String greet(String name);
 }
 
-public final class Greeter {
-    private final Greeting greeting;
+public interface RenderedGreeting {
+    String render(String name);
+}
 
-    public Greeter(Greeting greeting) {
-        this.greeting = greeting;
-    }
-
-    public String sayHello(String name) {
-        return greeting.greet(name);
+public record ConstantGreeting(String version) implements Greeting {
+    @Override
+    public String greet(String name) {
+        return version + ": Hello, " + name;
     }
 }
 ```
 
-### 装配与热替换
+`Greeting.class` 会生成默认能力名 `io.knotra.docs.QuickStartExample$Greeting`。同一类型需要多个槽位时，才显式使用 `CapabilityKey.of("payment.primary", PaymentGateway.class)`。
 
-在装配层声明服务契约并挂载组件。重点观察 `replace` 触发的原子切换与 `whenSettled` 的收敛等待：
+### 发布与装配
+
+下面是 README 的唯一 Quick Start 真源摘要；完整可执行代码见 [QuickStartExample.java](knotra-docs-examples/src/test/java/io/knotra/docs/QuickStartExample.java)。
 
 ```java
-import io.knotra.*;
-import io.knotra.beans.*;
+try (KnotraRuntime runtime = KnotraRuntime.create()) {
+    PublicationChange<Greeting> firstChange =
+            runtime.publish(Greeting.class, new ConstantGreeting("v1"));
+    Publication<Greeting> greeting = firstChange.publication();
 
-public class QuickStart {
-    static final CapabilityKey<Greeting> GREETING =
-            CapabilityKey.of("app.greeting", Greeting.class);
+    SettlementReport firstReport = firstChange.awaitSettled(Duration.ofSeconds(10));
 
-    public static void main(String[] args) {
-        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+    BeanDefinition<GreetingRenderer> definition = Beans
+            .component("greeting-renderer")
+            .with(Beans.dynamic(Greeting.class))
+            .create((Greeting current) -> new GreetingRenderer(current))
+            .provideAs(RenderedGreeting.class, renderer -> renderer)
+            .build();
 
-            // 发布初始服务提供者
-            Provided<Greeting> greeting = runtime.provide(
-                    GREETING, name -> "v1: 你好, " + name);
+    MountHandle renderer = definition.mount(runtime);
+    renderer.requireActive(Duration.ofSeconds(10));
 
-            // 装配并挂载消费方组件
-            BeanDefinition<NoConfig, Greeter> greeterDef = Beans.component("greeter")
-                    .with(Beans.required(GREETING))
-                    .create(Greeter::new)
-                    .initializer(g -> System.out.println(g.sayHello("Knotra")))
-                    .build();
+    String first = runtime.root().view()
+            .require(RenderedGreeting.class)
+            .render("Knotra");
 
-            ComponentHandle<NoConfig> greeterHandle = Beans.mount(runtime, greeterDef);
-            greeterHandle.requireActive();
+    PublicationChange<Greeting> secondChange =
+            greeting.update(new ConstantGreeting("v2"));
+    SettlementReport report = secondChange.awaitSettled(Duration.ofSeconds(10));
 
-            // 在运行时热替换底层实现
-            System.out.println(">>> 正在热替换 Greeting 实现...");
-            Provided<Greeting> v2 = greeting.replace(name -> "v2: Bonjour, " + name);
-
-            // 等待依赖传播收敛，消费方自动以新依赖重新激活
-            v2.whenSettled().toCompletableFuture().join();
-            greeterHandle.requireActive();
-        }
+    if (report.hasFailedMounts()) {
+        throw new IllegalStateException(report.failedMounts().toString());
     }
+    if (report.allActive()) {
+        // 非空影响集里的所有挂载都是 ACTIVE。
+    }
+
+    renderer.requireActive(Duration.ofSeconds(10));
+    String second = runtime.root().view()
+            .require(RenderedGreeting.class)
+            .render("Knotra");
 }
 ```
 
-执行后控制台输出：
+执行结果：
 
 ```text
-v1: 你好, Knotra
->>> 正在热替换 Greeting 实现...
-v2: Bonjour, Knotra
+v1: Hello, Knotra
+v2: Hello, Knotra
+renderer instances: 1
 ```
 
-`replace` 方法在一个原子事务内撤销旧注册并发布新值，方法同步返回新的 `Provided<T>` 句柄。下游消费方的重载由内核虚拟线程异步驱动，调用方通过 `whenSettled()` 即可精确等待依赖收敛就绪。
+这段代码的关键语义：
+
+- `runtime.publish(...)` 返回这一次发布的 `PublicationChange<T>`，不要把它当成长期句柄保存。
+- `change.publication()` 返回稳定发布槽位 `Publication<T>`，后续 `update(...)` 都从它发起。
+- `Beans.dynamic(Class<T>)` 注入动态代理。提供方从 v1 换到 v2 时，消费方 Bean 不重建，仍是同一个实例。
+- `awaitSettled(Duration)` 表示本次发布操作的传播和 drain 已收敛，并递归等待本次操作触发的 owned children；不表示所有下游一定成功。
+- `hasFailedMounts()` 为 `false` 只表示本次影响集中没有 FAILED。
+- `allActive()` 只有在影响集非空且全部 ACTIVE 时才为 `true`。空影响集返回 `false`；本例的动态代理消费方不需要重建，因此通常不在影响集中。
+- `renderer.requireActive(Duration.ofSeconds(10))` 才是在等待“这个具体挂载当前 ACTIVE”，失败会抛出含诊断的 `MountNotActiveException`。
+- 示例用 try-with-resources 保持简洁；它调用的 `close()` 会无界等待停机收敛。生产代码应等待 `runtime.closeAsync()` 并使用有界 `get(timeout)`，见[线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)。
 
 ---
 
-## 核心运行模型
+## 核心词汇
 
-```mermaid
-graph TD
-    subgraph component_model ["Knotra 核心组件模型"]
-        CH["ComponentHandle<br/>稳定挂载点 (句柄)"]
-        A1["Activation Gen1<br/>历史代际实例 (已清理)"]
-        A2["Activation Gen2<br/>当前活跃实例 (ACTIVE)"]
-        LS["LifecycleScope<br/>资源清单树 (LIFO)"]
+| 词汇 | 含义 |
+|---|---|
+| `Capability` | 类型化命名值，由 `CapabilityKey<T>` 或 `Class<T>` 默认 key 标识 |
+| `Publication<T>` | 一个 Context 内的稳定发布槽位 |
+| `Registration<T>` | 一个已提交的能力代际；替换会产生新的 Registration |
+| `MountHandle` | 稳定逻辑挂载点；生命周期方法返回 `ComponentState` |
+| `ConfiguredMountHandle<C>` | 公开配置契约的挂载点，支持 `reconfigureAsync(C)` |
+| `Activation` | 挂载点的一次启动尝试及其固定绑定集 |
+| `SettlementReport` | 单次发布、注册或事务操作的传播与排空结果 |
+| `FailureInfo` | 有界纯文本失败详情，不持有异常对象或 ClassLoader |
 
-        CH -.-> A1
-        CH --> A2
-        A2 --> LS
-    end
-```
-
-- **`CapabilityKey<T>`（能力契约）**：由唯一字符串名称与精确 Java `Class<T>` 组成的服务身份凭据。
-- **`ComponentHandle<C>`（组件挂载点）**：跨多次代际切换保持唯一的逻辑句柄，负责查询状态、重配置与发起销毁。
-- **`Activation`（运行代际）**：组件的一次物理运行实例，拥有固定的依赖绑定集和专属的资源作用域。
-- **`Context`（上下文隔离域）**：管理能力可见性的树状作用域，子上下文可遮蔽父上下文的注册，用于多租户与环境隔离。
-- **`LifecycleScope`（资源作用域）**：严格按后进先出释放资源的管理树，清理异常时保留现场供重试。
-- **`DynamicCapability<T>`（动态调用租约）**：支持无状态方法调用的动态代理，底层替换服务时调用方无需重启。
+设计决策见 [ADR 0001](docs/adr/0001-publication-registration-mount-activation.md)。
 
 ---
 
-## 技术路径选择
+## 文档导航
 
-根据技术栈与系统架构，选择最匹配的装配路径：
-
-```mermaid
-graph TD
-    start_node["选择接入模式"] --> q1{"是否需要使用 Spring？"}
-
-    q1 -->|"否 (纯 POJO)"| q2{"构造参数数量与注解偏好？"}
-    q2 -->|"0~5个参数 / 显式装配"| p1["Beans POJO DSL"]
-    q2 -->|"参数较多 / 注解驱动"| p2["Beans 编译期注解处理器"]
-
-    q1 -->|"是 (Spring 应用)"| q3{"组件在系统中的角色？"}
-    q3 -->|"独立动态子模块"| p3["SpringModules 子容器"]
-    q3 -->|"宿主单例调用动态插件"| p4["SpringDynamicBridge 动态桥"]
-```
-
-### 文档导航
-
-- [Beans 与 Spring 集成指南](<docs/Knotra Beans 与 Spring 集成指南.md>)：POJO 构造器装配、编译期注解处理器、Spring 子容器与宿主动态桥接。
-- [API 与集成指南](<docs/Knotra API 与集成指南.md>)：核心运行时、事务、依赖传播、事件总线、PF4J 插件与声明式期望树。
-- [实战案例：动态营销折扣引擎](<docs/Knotra 实战案例：动态营销折扣引擎.md>)：电商大促场景下促销折扣策略动态热替换、无感平滑切换与安全排空演练。
-- [插件工程化手册](<docs/Knotra 插件工程化手册.md>)：多模块 Maven 结构设计、Provided 依赖边界、SPI 导出与卸载防护。
-- [线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)：虚拟线程调度、阻塞边界、线程上下文类加载器（TCCL）切换与可观测性接入。
-- [测试指南](<docs/Knotra 测试指南.md>)：代际断言套路、清理失败重试测试与类加载器垃圾回收验证。
-- [FAQ 与排障指南](<docs/Knotra FAQ 与排障指南.md>)：组件状态机、诊断码全景与常见疑难场景处置。
+- [API 与集成指南](<docs/Knotra API 与集成指南.md>)：Simple/Advanced/SPI 分层、事务、上下文、事件、PF4J 与 Loader。
+- [Beans 与 Spring 集成指南](<docs/Knotra Beans 与 Spring 集成指南.md>)：POJO DSL、注解处理器、Spring 子容器与动态桥。
+- [实战案例：动态营销折扣引擎](<docs/Knotra 实战案例：动态营销折扣引擎.md>)：折扣策略热替换与平滑切换。
+- [插件工程化手册](<docs/Knotra 插件工程化手册.md>)：共享契约、PF4J 导出、Loader 声明树与卸载防护。
+- [线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)：生命周期执行边界、TCCL、优雅停机与监控。
+- [测试指南](<docs/Knotra 测试指南.md>)：异步测试、失败清理、诊断和 ClassLoader GC。
+- [FAQ 与排障指南](<docs/Knotra FAQ 与排障指南.md>)：状态机、settlement、诊断码与常见问题。
 
 ---
 
@@ -195,19 +193,21 @@ graph TD
 
 | 模块名 | 职责与定位 | 编译依赖 |
 |---|---|---|
-| `knotra-bom` | 版本统一对齐 BOM | 无 |
-| `knotra-starter` | 普通应用聚合依赖（Core + Beans） | Core、Beans |
-| `knotra-core` | 运行时内核（上下文、能力、事务、生命周期、快照） | 无外部运行时依赖 |
+| `knotra-bom` | 版本统一 BOM | 无 |
+| `knotra-starter` | 普通应用聚合依赖 | Core、Beans |
+| `knotra-core` | Publication、Registration、Mount、事务、生命周期与快照 | 无外部运行时依赖 |
 | `knotra-beans` | POJO 构造器注入与生命周期适配 DSL | Core |
-| `knotra-beans-processor` | 编译期注解处理器（SOURCE 级别零反射生成） | Core、Beans |
-| `knotra-events` | 类型化、可排空的进程内事件总线（5 种分发模式） | Core |
+| `knotra-beans-processor` | 编译期注解处理器 | Core、Beans |
+| `knotra-events` | 类型化、可排空的进程内事件总线 | Core |
 | `knotra-spring` | Spring 子容器与宿主动态代理桥 | Core、Spring Context |
 | `knotra-spring-starter` | Spring 应用聚合依赖 | Starter、Spring |
-| `knotra-pf4j-spi` | 插件导出的标准化 SPI 接口 | Core、PF4J provided |
-| `knotra-pf4j` | PF4J JAR 加载、目录管理、排空与类加载器防护 | Core、SPI、PF4J、ASM |
-| `knotra-loader` | 声明式期望树对比与原子收敛（Reconcile） | Core |
-| `knotra-pf4j-loader` | PF4J 与 Loader 的官方解析桥接 | Loader、PF4J |
+| `knotra-pf4j-spi` | 插件导出的受控工厂 SPI | Core、PF4J provided |
+| `knotra-pf4j` | PF4J artifact 加载、排空与类加载器防护 | Core、SPI、PF4J、ASM |
+| `knotra-loader` | 声明式期望树对比与收敛 | Core |
+| `knotra-pf4j-loader` | PF4J catalog 到 Loader 的解析桥 | Loader、PF4J |
 | `knotra-pf4j-starter` | 插件化应用聚合依赖 | PF4J Loader |
+| `knotra-integration-tests` | 跨模块真实链路验证 | 相关模块 |
+| `knotra-docs-examples` | test-only canonical 示例与文档守卫 | Starter、JUnit |
 
 ---
 
@@ -217,4 +217,4 @@ graph TD
 mvn clean verify
 ```
 
-全工程包含 336 项严苛测试，覆盖真实 PF4J 插件构建与卸载、Spring 动态子容器重载、并发排空竞态、动态调用租约防撕裂以及 ClassLoader GC 回收验证。
+测试覆盖真实 PF4J 插件构建与卸载、Spring 子容器重载、并发排空、动态代理租约、诊断保留和 ClassLoader 回收。测试数量随模块演进变化，以命令结果为准。

@@ -30,6 +30,8 @@ public final class ControlledMountException extends RuntimeException {
         if (diagnostics == null || diagnostics.isEmpty()) {
             return "controlled mount was rejected";
         }
-        return diagnostics.getFirst().message();
+        RuntimeDiagnostic first = diagnostics.getFirst();
+        String detail = first.failure().summary();
+        return detail.isBlank() ? first.message() : first.message() + " (" + detail + ")";
     }
 }

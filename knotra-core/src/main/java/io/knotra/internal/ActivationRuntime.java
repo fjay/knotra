@@ -35,7 +35,7 @@ final class ActivationRuntime {
     // 尚未发布的注册暂存；只有提交验证通过后才复制进 RuntimeView。
     final Map<String, RuntimeView.RegistrationData> stagedRegistrations =
             new ConcurrentHashMap<>();
-    final List<ChildMountPlan<?>> childPlans;
+    final List<ChildMountPlan> childPlans;
     // stale 是提交裁决信号：结构事务可把它从锁外的用户 start() 中召回并按最新代际重启。
     final AtomicBoolean stale = new AtomicBoolean();
     // start() 返回后置位，防止组件保存的 ActivationContext 在事务外继续暂存副作用。
@@ -47,7 +47,7 @@ final class ActivationRuntime {
             Object config,
             long configRevision,
             Map<String, RuntimeView.BindingData> bindings,
-            List<ChildMountPlan<?>> childPlans) {
+            List<ChildMountPlan> childPlans) {
         this.activationId = activationId;
         this.owner = owner;
         this.config = config;

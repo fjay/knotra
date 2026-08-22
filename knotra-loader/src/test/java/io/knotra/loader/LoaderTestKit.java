@@ -68,16 +68,12 @@ final class LoaderTestKit {
                 .build();
     }
 
-    static <C> ComponentFactoryResolver resolver(
+    static ComponentFactoryResolver resolver(
             FactoryRef ref,
-            ComponentFactory<C> factory) {
-        ConfigDecoder<C> decoder = raw -> {
-            Object value = raw == null ? NoConfig.INSTANCE : raw;
-            @SuppressWarnings("unchecked")
-            C typed = (C) value;
-            return typed;
-        };
-        return resolver(ref, factory, decoder);
+            ComponentFactory<NoConfig> factory) {
+        return ClasspathFactoryResolver.builder()
+                .add(ref, factory)
+                .build();
     }
 
     static ComponentEntry entry(String path, FactoryRef ref, Object config) {

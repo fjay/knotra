@@ -1,294 +1,327 @@
 # Knotra 插件工程化手册
 
-> 面向插件化系统架构师与开发者，介绍如何构建可加载、可挂载、可安全排空与可卸载的 PF4J 插件。
+本手册面向插件作者和宿主平台作者。目标是在热升级、局部重载和卸载时保持四条边界：
 
----
+1. 共享合约只在 contract 模块中定义。
+2. 插件只导出受控 factory，不直接把实例泄漏给宿主。
+3. 加载插件不等于挂载组件。
+4. 卸载前 drain 在途调用，卸载后插件 ClassLoader 可回收。
 
-## 插件体系三层架构设计
+## 模块结构
 
-为确保类加载器隔离与干净卸载，工程必须拆分为三个独立模块：
-
-```mermaid
-graph TD
-    subgraph contract_mod ["共享合约模块 (contract)"]
-        C["接口定义: Greeting.java<br/>配置模型: GreetingConfig.java<br/>(宿主与插件共同可见)"]
-    end
-
-    subgraph host_mod ["宿主应用工程 (host-app)"]
-        H["宿主业务 + Knotra 运行时<br/>(compile 依赖 contract)"]
-    end
-
-    subgraph plugin_mod ["插件实现工程 (greeting-plugin)"]
-        P["插件实现: GreetingImpl.java<br/>(provided 依赖 contract、Knotra Core/Beans)"]
-    end
-
-    H -->|依赖| C
-    P -.->|provided 依赖 (不打入 JAR)| C
-    H ==>|动态加载 JAR| P
-```
-
-### 推荐目录结构
+推荐三模块结构：
 
 ```text
-my-plugin-project/
-├── my-contract/             # 共享契约模块（普通 Maven JAR）
-│   ├── pom.xml
-│   └── src/main/java/com/example/contract/
-│       ├── Greeting.java
-│       └── GreetingConfig.java
-├── my-host-app/             # 宿主应用
-│   ├── pom.xml
-│   └── src/main/java/com/example/host/
-│       └── Application.java
-└── my-greeting-plugin/      # 插件工程（打包为独立 JAR）
-    ├── pom.xml
-    └── src/main/java/com/example/plugin/
-        ├── GreetingImpl.java
-        └── GreetingProvider.java
+platform-contract/
+  src/main/java/com/example/contract/
+    PaymentGateway.java
+    PaymentConfig.java
+
+payment-plugin/
+  pom.xml
+  src/main/java/com/example/payment/
+    PaymentPluginProvider.java
+    DefaultGatewayFactory.java
+    TieredGatewayFactory.java
+
+host-app/
+  pom.xml
+  src/main/java/com/example/host/
 ```
 
----
+插件依赖规则：
 
-## 插件工程构建
+- `platform-contract`、`knotra-core`、`knotra-pf4j-spi`：`provided` 或不打进插件。
+- PF4J 插件库：按插件运行方式决定，通常由宿主提供。
+- 第三方业务库：打进插件 fat JAR，或放入独立父 loader 并显式管理依赖闭包。
+- 不把 Knotra 宿主实现、Spring 宿主模块或另一个插件的内部类型打进本插件。
 
-### 定义共享合约模块
-
-合约模块仅包含共享接口与数据契约，由宿主和插件共同引用：
-
-```java
-package com.example.contract;
-
-import io.knotra.CapabilityKey;
-
-public interface Greeting {
-    String greet(String name);
-}
-```
-
-```java
-package com.example.contract;
-
-import io.knotra.CapabilityKey;
-
-public final class GreetingContracts {
-    public static final CapabilityKey<Greeting> GREETING =
-            CapabilityKey.of("plugin.greeting", Greeting.class);
-}
-```
-
----
-
-### 配置插件 POM 依赖边界
-
-宿主已有的类库（Knotra 核心、共享合约、PF4J）在插件 POM 中必须声明为 `provided`，严禁打包进插件 JAR。否则会导致同名类被多个类加载器重复加载并引发 `ClassCastException`。
+Maven 示例：
 
 ```xml
-<project xmlns="http://maven.apache.org/POM/4.0.0">
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>my-greeting-plugin</artifactId>
-  <version>1.0.0</version>
+<dependencies>
+  <dependency>
+    <groupId>com.example</groupId>
+    <artifactId>platform-contract</artifactId>
+    <version>${contract.version}</version>
+    <scope>provided</scope>
+  </dependency>
 
-  <properties>
-    <knotra.version>0.1.0-SNAPSHOT</knotra.version>
-  </properties>
+  <dependency>
+    <groupId>io.knotra</groupId>
+    <artifactId>knotra-core</artifactId>
+    <scope>provided</scope>
+  </dependency>
 
-  <!-- 导入 BOM 统一 Knotra 与 PF4J 版本，依赖本身仍按 provided 声明 -->
-  <dependencyManagement>
-    <dependencies>
-      <dependency>
-        <groupId>io.knotra</groupId>
-        <artifactId>knotra-bom</artifactId>
-        <version>${knotra.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-    </dependencies>
-  </dependencyManagement>
-
-  <dependencies>
-    <!-- 共享合约：必须 provided -->
-    <dependency>
-      <groupId>com.example</groupId>
-      <artifactId>my-contract</artifactId>
-      <version>1.0.0</version>
-      <scope>provided</scope>
-    </dependency>
-
-    <!-- Knotra Core、Beans 与 PF4J SPI：源码引用，宿主提供，必须 provided -->
-    <dependency>
-      <groupId>io.knotra</groupId>
-      <artifactId>knotra-core</artifactId>
-      <scope>provided</scope>
-    </dependency>
-    <dependency>
-      <groupId>io.knotra</groupId>
-      <artifactId>knotra-beans</artifactId>
-      <scope>provided</scope>
-    </dependency>
-    <dependency>
-      <groupId>io.knotra</groupId>
-      <artifactId>knotra-pf4j-spi</artifactId>
-      <scope>provided</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.pf4j</groupId>
-      <artifactId>pf4j</artifactId>
-      <scope>provided</scope>
-    </dependency>
-  </dependencies>
-
-  <build>
-    <plugins>
-      <!-- 打包插件 JAR 并注入 PF4J 元数据 -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-jar-plugin</artifactId>
-        <configuration>
-          <archive>
-            <manifestEntries>
-              <Plugin-Id>greeting-plugin</Plugin-Id>
-              <Plugin-Version>1.0.0</Plugin-Version>
-              <Plugin-Provider>Acme Corp</Plugin-Provider>
-              <Plugin-Class></Plugin-Class>
-            </manifestEntries>
-          </archive>
-        </configuration>
-      </plugin>
-    </plugins>
-  </build>
-</project>
+  <dependency>
+    <groupId>io.knotra</groupId>
+    <artifactId>knotra-pf4j-spi</artifactId>
+    <scope>provided</scope>
+  </dependency>
+</dependencies>
 ```
 
----
+## 共享合约
 
-### 编写插件实现与 SPI 导出
+合约接口必须由宿主和插件使用同一个 ClassLoader 加载，或由双方共同 parent 提供：
 
 ```java
-package com.example.plugin;
+package com.example.contract;
 
-import com.example.contract.Greeting;
-
-public final class GreetingImpl implements Greeting, AutoCloseable {
-    @Override
-    public String greet(String name) {
-        return "Hello from PF4J Plugin: " + name;
-    }
-
-    @Override
-    public void close() {
-        // 插件内部清理
-    }
+public interface PaymentGateway {
+    ChargeResult charge(ChargeRequest request);
 }
 ```
 
-通过实现 `RuntimeComponentProvider` 并在类上添加 PF4J 的 `@Extension` 注解向宿主导出工厂：
+配置 token 也必须是共享类型：
 
 ```java
-package com.example.plugin;
+package com.example.contract;
 
-import com.example.contract.GreetingContracts;
-import io.knotra.beans.Beans;
-import io.knotra.pf4j.spi.ExportedComponentFactory;
-import io.knotra.pf4j.spi.RuntimeComponentProvider;
-import org.pf4j.Extension;
-
-import java.util.Collection;
-import java.util.List;
-
-@Extension
-public final class GreetingProvider implements RuntimeComponentProvider {
-
-    @Override
-    public Collection<ExportedComponentFactory<?>> factories() {
-        return List.of(
-                ExportedComponentFactory.noConfig(
-                        Beans.component("greeting-component")
-                                .create(GreetingImpl::new)
-                                .provide(GreetingContracts.GREETING)
-                                .build()
-                )
-        );
-    }
-}
-```
-
----
-
-## 宿主加载与生命周期管理
-
-```java
-import io.knotra.*;
-import io.knotra.pf4j.*;
-import java.nio.file.Path;
-import java.util.Set;
-
-public class HostApplication {
-    public static void main(String[] args) throws Exception {
-        try (KnotraRuntime runtime = KnotraRuntime.create()) {
-
-            try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
-                    Path.of("plugins"),
-                    runtime,
-                    Set.of("com.example.contract"))) {
-
-                // 加载插件 JAR
-                ArtifactSnapshot artifact = adapter.loadArtifact(
-                        Path.of("plugins/my-greeting-plugin-1.0.0.jar"));
-
-                // 解析并挂载组件
-                ArtifactFactoryHandle<NoConfig> factoryHandle = adapter.factories()
-                        .resolve("greeting-component", NoConfig.class)
-                        .orElseThrow();
-
-                ComponentHandle<NoConfig> component = factoryHandle.mount(
-                        runtime.root(), "greeting-service");
-                component.requireActive();
-
-                // 消费能力
-                Greeting greeting = runtime.root().view().require(GreetingContracts.GREETING);
-                System.out.println(greeting.greet("Tom"));
-
-                // 安全排空并卸载
-                adapter.unloadArtifact(artifact.artifactId());
-            }
+public record PaymentConfig(String channel, int timeoutMillis) {
+    public PaymentConfig {
+        if (channel == null || channel.isBlank()) {
+            throw new IllegalArgumentException("channel must not be blank");
+        }
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException("timeoutMillis must be positive");
         }
     }
 }
 ```
 
----
+不要把插件私有 DTO、注解、异常或 `Optional<PluginType>` 暴露到合约上。合约方法参数和返回值应全部来自 contract 模块、JDK 或宿主共享类型。
 
-## 插件安全卸载与排空机制
+## 导出受控工厂
 
-```mermaid
-sequenceDiagram
-    participant Host as 宿主运维
-    participant Adapter as Pf4jArtifactAdapter
-    participant Component as 插件组件 (Greeting)
-    participant ClassLoader as 插件 ClassLoader
+插件实现 `RuntimeComponentProvider`，返回 `ExportedComponentFactory`：
 
-    Host->>Adapter: unloadArtifact(id)
-    Adapter->>Adapter: 进入 DRAINING 状态 (拒绝新挂载)
+```java
+@Extension
+public final class PaymentPluginProvider implements RuntimeComponentProvider {
 
-    par 等待在途请求排空
-        Adapter->>Component: 等待在途动态调用租约归零
-        Adapter->>Component: 执行 LIFO 资源清理 (close)
-    end
-
-    Component-->>Adapter: 清理完毕 (DISPOSED)
-    Adapter->>ClassLoader: 停止 PF4J 插件并释放 ClassLoader 引用
-    Adapter-->>Host: 卸载完成 (UNLOADED)
+    @Override
+    public Collection<ExportedComponentFactory<?>> factories() {
+        return List.of(
+                ExportedComponentFactory.noConfig(new ParentGatewayFactory()),
+                ExportedComponentFactory.of(
+                        PaymentConfig.class,
+                        new ConfiguredGatewayFactory()));
+    }
+}
 ```
 
----
+无公开配置的工厂：
 
-## 防类加载器泄漏工程规范
+```java
+public final class ParentGatewayFactory implements ComponentFactory<NoConfig> {
+    @Override
+    public String factoryId() {
+        return "payment.parent";
+    }
 
-在动态插件架构中，Metaspace 内存溢出通常源于未释放的类加载器引用。开发中应严格遵循以下准则：
+    @Override
+    public Component<NoConfig> create() {
+        return new ParentGatewayComponent();
+    }
+}
+```
 
-- **共享契约全量 `provided`**：插件内部不得包含共享契约包中的任何 Class。
-- **杜绝静态集合缓存插件对象**：宿主应用禁止通过静态 Map 或 List 长期持有由插件类加载器生成的对象或 Class 引用。
-- **线程资源登记释放**：插件内创建的任何工作线程或线程池必须在 `LifecycleScope` 中登记 `close()` 并在销毁时 `shutdown()`。未停止的线程会导致类加载器无法卸载。
-- **及时清理 ThreadLocal**：插件处理线程任务如使用 `ThreadLocal`，在调用结束后必须调用 `remove()`。
-- **CI 引入 GC 弱引用回收断言**：在集成测试中通过弱引用监听类加载器并触发 `System.gc()` 断言其能被正常回收。
+类型化配置工厂：
+
+```java
+public final class ConfiguredGatewayFactory
+        implements ComponentFactory<PaymentConfig> {
+
+    @Override
+    public String factoryId() {
+        return "payment.configured";
+    }
+
+    @Override
+    public PaymentConfig normalizeConfig(PaymentConfig config) {
+        return new PaymentConfig(
+                config.channel().trim(),
+                Math.min(config.timeoutMillis(), 5_000));
+    }
+
+    @Override
+    public Component<PaymentConfig> create() {
+        return new ConfiguredGatewayComponent();
+    }
+}
+```
+
+组件 start 只在该次 Activation 中持有依赖：
+
+```java
+final class ConfiguredGatewayComponent implements Component<PaymentConfig> {
+
+    private final ComponentDescriptor descriptor = ComponentDescriptor.named(
+            "payment.configured",
+            CapabilityRequirement.dynamicOptional(PaymentRoutes.class));
+
+    @Override
+    public ComponentDescriptor descriptor() {
+        return descriptor;
+    }
+
+    @Override
+    public void start(ActivationContext context, PaymentConfig config) {
+        DynamicCapability<PaymentRoutes> routes = context.subscribe(PaymentRoutes.class);
+        PaymentGateway gateway = new DynamicPaymentGateway(config, routes);
+
+        context.provide(PaymentGateway.class, gateway);
+        context.lifecycle().onClose("payment-gateway", gateway::flush);
+    }
+}
+```
+
+工厂外壳可以复用，但不能保存 `gateway`、`routes` 或 `context`。这些对象只属于一次 Activation。
+
+## 宿主加载
+
+宿主声明哪些 Java package 是共享合约：
+
+```java
+try (KnotraRuntime runtime = KnotraRuntime.create();
+     Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
+             pluginsRoot,
+             runtime,
+             Set.of("com.example.contract"))) {
+
+    ArtifactSnapshot artifact = adapter.loadArtifactAsync(pluginJar)
+            .toCompletableFuture()
+            .get(30, TimeUnit.SECONDS);
+
+    assertEquals(ArtifactState.ACTIVE, artifact.state());
+}
+```
+
+加载成功后，`adapter.factories()` 只提供稳定元数据和可执行 factory view，Runtime 中没有任何隐式挂载：
+
+```java
+assertTrue(adapter.factories().find("payment.parent").isPresent());
+assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
+```
+
+## 挂载工厂
+
+无公开配置：
+
+```java
+ArtifactFactoryHandle.NoConfig factory = adapter.factories()
+        .resolveNoConfig("payment.parent")
+        .orElseThrow();
+
+MountHandle parent = factory.mount(runtime.root(), "payment-parent");
+parent.requireActive(Duration.ofSeconds(10));
+```
+
+类型化配置：
+
+```java
+ArtifactFactoryHandle.Configured<PaymentConfig> factory = adapter.factories()
+        .resolve("payment.configured", PaymentConfig.class)
+        .orElseThrow();
+
+PaymentConfig config = factory.decodeConfig(
+        Map.of("channel", "primary", "timeoutMillis", 2000));
+
+ConfiguredMountHandle<PaymentConfig> handle =
+        factory.mount(runtime.root(), "payment-primary", config);
+handle.requireActive(Duration.ofSeconds(10));
+```
+
+根 factory view 不提供 mount 方法，避免调用方向 plain factory 传配置占位值，或向 configured factory 传错类型。同一个 factory 可以在不同 Context 下挂载多个稳定 handle。
+
+## Loader 声明树
+
+宿主可以用 Loader 管理期望树：
+
+```java
+ComponentFactoryResolver resolver = Pf4jFactoryResolver.of(adapter);
+
+try (KnotraLoader loader = KnotraLoader.owned(runtime, resolver)) {
+    ComponentTree desired = ComponentTree.of(
+            ComponentEntry.configured(
+                    "payment.primary",
+                    FactoryRef.of("payment.configured", "1.4.0"),
+                    Map.of("channel", "primary", "timeoutMillis", 2000)),
+            ComponentEntry.of(
+                    "payment.backup",
+                    FactoryRef.of("payment.parent", "1.4.0")));
+
+    ReconcileResult result = loader.reconcileAsync(desired)
+            .toCompletableFuture()
+            .get(30, TimeUnit.SECONDS);
+
+    result.requireConverged();
+}
+```
+
+`Pf4jFactoryResolver` 把 no-config factory 解析为 `FactoryKind.PLAIN`，把带共享配置 token 的 factory 解析为 `FactoryKind.CONFIGURED`。配置 raw 值在 resolver 边界 decode，之后才进入 Core 的类型化 mount。
+
+版本替换时，新的 artifact 会产生新的 factory fingerprint。Loader 对比 `FactoryIdentity` 后选择重配置或整挂载替换。
+
+## 升级与排空
+
+升级流程：
+
+1. 加载新版本 artifact，factory catalog 同时可见。
+2. 期望树把 factory ref 指向新版本。
+3. Loader 替换受影响挂载。
+4. 旧 Activation 停止承接新调用，等待在途调用和异步租约。
+5. 旧 artifact ownership 清空后卸载。
+6. 确认旧 loader 可回收。
+
+```java
+adapter.loadArtifactAsync(newPluginJar)
+        .toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+
+ReconcileResult result = loader.reconcileAsync(desiredWithNewVersion)
+        .toCompletableFuture()
+        .get(60, TimeUnit.SECONDS);
+result.requireConverged();
+
+adapter.unloadArtifactAsync(oldArtifactId)
+        .toCompletableFuture()
+        .get(60, TimeUnit.SECONDS);
+```
+
+如果 drain 失败，artifact 状态和诊断保留；调用 `retryDrainAsync(oldArtifactId)`，不要假设卸载已经完成。
+
+## 卸载与 GC
+
+安全卸载后检查：
+
+```java
+assertEquals(ArtifactState.UNLOADED,
+        adapter.artifact(artifactId).orElseThrow().state());
+assertTrue(adapter.ownership(artifactId).isEmpty());
+assertTrue(runtime.advanced().snapshot().mounts().stream()
+        .noneMatch(mount -> mount.factoryId().equals("payment.configured")));
+```
+
+插件工程禁令：
+
+- 静态字段保存合约实例、路由表、线程、连接或异常。
+- 启动未取消的周期线程。
+- 把插件 `Class`、`ClassLoader` 或异常对象写入宿主全局注册表。
+- 日志 Appender、JMX、注册中心客户端未注销。
+- 使用 `ThreadLocal` 保存插件对象且线程池复用时不清理。
+- 合约方法返回插件私有实现类型。
+
+`FailureInfo`、artifact snapshot、runtime snapshot 和 loader snapshot 都是有界纯数据，不会保存插件 loader。`PublicationChange` 可以持有共享合约 `Class`，但不得持有插件私有 `Class`。
+
+## 版本与兼容
+
+0.1.0 阶段不承诺插件二进制兼容。建议：
+
+- contract 模块独立版本，并用语义化版本约束。
+- 插件 manifest 声明精确依赖版本。
+- 宿主升级 contract 前先加载兼容插件验证。
+- factoryId 保持稳定，不把类名变化泄漏给期望树。
+- 配置 decoder 拒绝未知或非法字段，不静默忽略。
+- 升级演练必须包含在途调用、失败启动回滚和卸载 GC。

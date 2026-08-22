@@ -1,33 +1,39 @@
 package io.knotra.pf4j;
 
-import io.knotra.ComponentHandle;
 import io.knotra.ContextHandle;
 
 /**
- * 受管 artifact 中一个工厂的类型化受控挂载句柄。
+ * Read-only executable view of one factory published by an active artifact.
  *
- * <p>句柄代表活跃 artifact 视图而不是离线快照；drain 或卸载后即失效。宿主可以先
- * 通过 decoder 转换 raw 配置，再使用类型化 mount 提交组件；两条路径都会重新校验
- * 配置实例，防止 raw cast 绕过边界。</p>
+ * <p>The root type intentionally exposes identity only. Mount operations are available on the
+ * no-config and configured subtypes so callers never supply a placeholder configuration.</p>
  */
-public interface ArtifactFactoryHandle<C> extends ArtifactFactoryCatalogEntry {
+public interface ArtifactFactoryHandle extends ArtifactFactoryCatalogEntry {
 
-    /** artifact 发现时已通过共享合约校验的宿主/共享配置 token。 */
-    Class<C> configType();
+    /** Artifact discovery time configuration contract; never retained by stable snapshot views. */
+    Class<?> configType();
 
-    /**
-     * 把宿主持有的 raw 配置转换为工厂声明的配置类型。
-     *
-     * <p>decoder 输出为 null 或不是 {@link #configType()} 实例时立即失败。这个方法是
-     * 活跃 artifact 视图；artifact 卸载后必须重新解析新的类型化句柄。</p>
-     */
-    C decodeConfig(Object rawConfig);
-
-    /** 使用 decoder 的空输入挂载；无配置工厂会得到 NoConfig.INSTANCE。 */
-    default ComponentHandle<C> mount(ContextHandle context, String mountId) {
-        return mount(context, mountId, decodeConfig(null));
+    default boolean noConfig() {
+        return configType() == io.knotra.NoConfig.class;
     }
 
-    /** 挂载新的逻辑组件，并返回 Knotra 的稳定 ComponentHandle。 */
-    ComponentHandle<C> mount(ContextHandle context, String mountId, C config);
+    /** Mount a factory that declares no host-visible configuration. */
+    interface NoConfig extends ArtifactFactoryHandle {
+
+        io.knotra.MountHandle mount(ContextHandle context, String mountId);
+    }
+
+    /** Mount a factory whose configuration contract is shared with the host. */
+    interface Configured<C> extends ArtifactFactoryHandle {
+
+        /**
+         * Converts host-owned raw configuration to the factory's declared type.
+         *
+         * <p>The decoder must return a non-null instance of {@link #configType()}. This is an
+         * active artifact view and becomes unusable after drain or unload.</p>
+         */
+        C decodeConfig(Object rawConfig);
+
+        io.knotra.ConfiguredMountHandle<C> mount(ContextHandle context, String mountId, C config);
+    }
 }

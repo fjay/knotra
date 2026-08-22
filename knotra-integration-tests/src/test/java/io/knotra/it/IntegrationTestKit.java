@@ -7,12 +7,13 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
 import com.example.integration.contract.IntegrationCoordinator;
+import io.knotra.ActivationContext;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
 
 final class IntegrationTestKit {
@@ -36,39 +37,37 @@ final class IntegrationTestKit {
         return Pf4jArtifactAdapter.create(pluginsRoot, runtime, SHARED_CONTRACTS);
     }
 
-    static ComponentState settle(ComponentHandle<?> handle) throws Exception {
+    static ComponentState settle(MountHandle handle) throws Exception {
         return handle.whenSettled().toCompletableFuture().get(30, TimeUnit.SECONDS);
     }
 
-    interface Start<C> {
-        void start(io.knotra.ActivationContext context, C config) throws Exception;
+    interface Start {
+        void start(ActivationContext context) throws Exception;
     }
 
-    static <C> ComponentFactory<C> classpathFactory(
-            String id,
-            Start<C> start,
-            io.knotra.CapabilityRequirement... requirements) {
-        ComponentDescriptor descriptor = ComponentDescriptor.named(id, requirements);
-        return new ComponentFactory<>() {
+    @SuppressWarnings("rawtypes")
+    static MountFactory classpathFactory(String id, Start start) {
+        Component component = new Component() {
+            @Override
+            public ComponentDescriptor descriptor() {
+                return ComponentDescriptor.named(id);
+            }
+
+            @Override
+            public void start(ActivationContext context, Object config) throws Exception {
+                start.start(context);
+            }
+        };
+        return new MountFactory() {
             @Override
             public String factoryId() {
                 return id;
             }
 
             @Override
-            public Component<C> create() {
-                return new Component<>() {
-                    @Override
-                    public ComponentDescriptor descriptor() {
-                        return descriptor;
-                    }
-
-                    @Override
-                    public void start(io.knotra.ActivationContext context, C config)
-                            throws Exception {
-                        start.start(context, config);
-                    }
-                };
+            @SuppressWarnings("unchecked")
+            public Component create() {
+                return component;
             }
         };
     }

@@ -1,12 +1,10 @@
 package io.knotra.events;
 
-import io.knotra.ComponentFactory;
-import io.knotra.NoConfig;
-
+import io.knotra.MountFactory;
 /**
  * EventBus 组件的宿主工厂。事件模块作为普通组件挂载，不依赖内核专用通道。
  */
-public final class EventBusFactory implements ComponentFactory<NoConfig> {
+public final class EventBusFactory implements MountFactory {
     /**
      * 稳定工厂标识，用于宿主事务和 Loader 声明中的类型化挂载。
      */

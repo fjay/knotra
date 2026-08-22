@@ -38,8 +38,8 @@ final class RequireActiveTest {
                 (context, config) -> {}, CapabilityRequirement.required(DEPENDENCY));
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call());
 
-        ComponentNotActiveException error =
-                assertThrows(ComponentNotActiveException.class, handle::requireActive);
+        MountNotActiveException error =
+                assertThrows(MountNotActiveException.class, handle::requireActive);
         assertEquals(ComponentState.WAITING, error.state());
         assertEquals(handle.handleId(), error.handleId());
         assertTrue(error.diagnostics().stream().anyMatch(diagnostic ->
@@ -54,8 +54,8 @@ final class RequireActiveTest {
                 });
         assertEquals(ComponentState.FAILED, TestKit.settle(handle).call());
 
-        ComponentNotActiveException error =
-                assertThrows(ComponentNotActiveException.class, handle::requireActive);
+        MountNotActiveException error =
+                assertThrows(MountNotActiveException.class, handle::requireActive);
         assertEquals(ComponentState.FAILED, error.state());
         assertTrue(error.diagnostics().stream().anyMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED));
@@ -67,7 +67,7 @@ final class RequireActiveTest {
         ComponentFactory<NoConfig> factory = TestKit.factory("identity-factory",
                 new TestKit.Scripted<>(ComponentDescriptor.named("identity-component"),
                         (context, config) -> {}));
-        var handle = runtime.transact(transaction ->
+        var handle = runtime.advanced().transact(transaction ->
                 transaction.mount(child, "identity-mount", factory)).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(ComponentState.DISPOSED, handle.disposeAsync()
@@ -78,8 +78,8 @@ final class RequireActiveTest {
         assertEquals("identity-factory", handle.factoryId());
         assertEquals(child.contextId(), handle.contextId());
 
-        ComponentNotActiveException error =
-                assertThrows(ComponentNotActiveException.class, handle::requireActive);
+        MountNotActiveException error =
+                assertThrows(MountNotActiveException.class, handle::requireActive);
         assertEquals(ComponentState.DISPOSED, error.state());
         assertEquals(handle.handleId(), error.handleId());
         assertEquals("identity-mount", error.mountId());
@@ -104,7 +104,7 @@ final class RequireActiveTest {
                             "value-" + roundId));
             try {
                 handle.requireActive();
-            } catch (ComponentNotActiveException error) {
+            } catch (MountNotActiveException error) {
                 assertNotEquals(ComponentState.ACTIVE, error.state(),
                         () -> "round " + roundId + ": " + error);
                 assertNotEquals(ComponentState.STARTING, error.state(),
@@ -123,8 +123,8 @@ final class RequireActiveTest {
         assertEquals(ComponentState.DISPOSED, handle.disposeAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
-        ComponentNotActiveException error =
-                assertThrows(ComponentNotActiveException.class, handle::requireActive);
+        MountNotActiveException error =
+                assertThrows(MountNotActiveException.class, handle::requireActive);
         assertEquals(ComponentState.DISPOSED, error.state());
     }
 
@@ -141,7 +141,7 @@ final class RequireActiveTest {
 
         Duration timeout = Duration.ofMillis(20);
         try {
-            ComponentNotActiveException error = assertThrows(ComponentNotActiveException.class,
+            MountNotActiveException error = assertThrows(MountNotActiveException.class,
                     () -> handle.requireActive(timeout));
             assertEquals(ComponentState.STARTING, error.state());
             assertEquals(timeout, error.timeout());
@@ -195,8 +195,8 @@ final class RequireActiveTest {
             caller.interrupt();
             assertTrue(finished.await(10, TimeUnit.SECONDS));
 
-            ComponentNotActiveException error =
-                    assertInstanceOf(ComponentNotActiveException.class, failure.get());
+            MountNotActiveException error =
+                    assertInstanceOf(MountNotActiveException.class, failure.get());
             assertEquals(ComponentState.STARTING, error.state());
             assertNull(error.getCause(), "exception must not retain a Throwable");
             assertTrue(error.diagnostics().stream().anyMatch(diagnostic ->
@@ -231,13 +231,13 @@ final class RequireActiveTest {
             }
         };
 
-        ComponentNotActiveException error =
-                assertThrows(ComponentNotActiveException.class, handle::requireActive);
+        MountNotActiveException error =
+                assertThrows(MountNotActiveException.class, handle::requireActive);
         assertEquals(ComponentState.WAITING, error.state());
         assertNull(error.getCause());
     }
 
-    private static class ImmediateHandle implements ComponentHandle<Void> {
+    private static class ImmediateHandle implements ConfiguredMountHandle<Void> {
         @Override
         public String handleId() {
             return "immediate";

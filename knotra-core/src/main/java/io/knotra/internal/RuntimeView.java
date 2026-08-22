@@ -86,8 +86,8 @@ final class RuntimeView {
                 .sorted(Comparator.comparing(RuntimeSnapshot.ContextSnapshot::contextId))
                 .toList();
 
-        List<RuntimeSnapshot.ComponentSnapshot> componentSnapshots = components.values().stream()
-                .map(component -> new RuntimeSnapshot.ComponentSnapshot(
+        List<RuntimeSnapshot.MountSnapshot> mountSnapshots = components.values().stream()
+                .map(component -> new RuntimeSnapshot.MountSnapshot(
                         component.handleId(),
                         component.contextId(),
                         component.mountId(),
@@ -108,7 +108,7 @@ final class RuntimeView {
                                         requirement.mode(),
                                         requirement.binding()))
                                 .toList()))
-                .sorted(Comparator.comparing(RuntimeSnapshot.ComponentSnapshot::handleId))
+                .sorted(Comparator.comparing(RuntimeSnapshot.MountSnapshot::handleId))
                 .toList();
 
         List<RuntimeSnapshot.ActivationSnapshot> activationSnapshots = activations.values().stream()
@@ -136,7 +136,7 @@ final class RuntimeView {
         return new RuntimeSnapshot(
                 generation,
                 contextSnapshots,
-                componentSnapshots,
+                mountSnapshots,
                 activationSnapshots,
                 registrationSnapshots,
                 List.of(),

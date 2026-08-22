@@ -1,13 +1,15 @@
 package io.knotra.beans.processor;
 
 import io.knotra.CapabilityKey;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
+import io.knotra.ConfiguredMountHandle;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
-import io.knotra.RegistrationHandle;
+import io.knotra.MountHandle;
+import io.knotra.Registration;
 import io.knotra.RuntimeSnapshot;
+import io.knotra.beans.BeanDefinition;
+import io.knotra.beans.Beans;
+import io.knotra.beans.ConfiguredBeanDefinition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -59,7 +61,8 @@ final class KnotraBeanProcessorTest {
         CompilerKit.assertSuccess(first);
         String source = first.generatedSource("ValidBean_KnotraFactory.java");
         assertGeneratedInvariants(source);
-        assertTrue(source.contains("Beans.dynamicProxyRequired("));
+        assertTrue(source.contains("Beans.dynamic("));
+        assertFalse(source.contains("NoConfig"));
         assertEquals(1, countGeneratedSources(first));
 
         Path secondCompile = temporaryDirectory.resolve("second");
@@ -92,7 +95,7 @@ final class KnotraBeanProcessorTest {
             assertEquals("processor.valid", factoryId.invoke(factory));
             assertEquals(descriptor.invoke(firstDefinition), descriptor.invoke(secondDefinition));
 
-            ComponentHandle<NoConfig> handle = mountNoConfig("valid", factory);
+            MountHandle handle = mountNoConfig("valid", factory);
             assertEquals(ComponentState.ACTIVE, settle(handle));
 
             Class<?> primaryType = loader.loadClass("demo.Primary");
@@ -132,7 +135,7 @@ final class KnotraBeanProcessorTest {
             Object secondConfig = accessibleConstructor(configType, String.class)
                     .newInstance(" two ");
 
-            ComponentHandle<?> handle = mountConfigured("configured", factory, firstConfig);
+            ConfiguredMountHandle<?> handle = mountConfigured("configured", factory, firstConfig);
             assertEquals(ComponentState.ACTIVE, settle(handle));
             Object service = require("processor.config-service", serviceType);
             assertEquals("one", accessibleMethod(serviceType, "value").invoke(service));
@@ -154,7 +157,7 @@ final class KnotraBeanProcessorTest {
                     (CompletableFuture<Void>) gateField.get(null);
             CompletableFuture<Void> destroyEntered =
                     (CompletableFuture<Void>) destroyEnteredField.get(null);
-            CompletionStage<?> disposal = ((ComponentHandle<?>) handle).disposeAsync();
+            CompletionStage<?> disposal = handle.disposeAsync();
             destroyEntered.get(10, TimeUnit.SECONDS);
             assertFalse(disposal.toCompletableFuture().isDone());
             disposalGate.complete(null);
@@ -179,7 +182,7 @@ final class KnotraBeanProcessorTest {
             Object factory = loader.loadClass("demo.SixDependencyBean_KnotraFactory")
                     .getConstructor().newInstance();
             Method definition = factory.getClass().getMethod("definition");
-            ComponentHandle<NoConfig> handle =
+            MountHandle handle =
                     mountNoConfig("six-dependencies", definition.invoke(factory));
             assertEquals(ComponentState.ACTIVE, settle(handle));
 
@@ -563,7 +566,7 @@ final class KnotraBeanProcessorTest {
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     private void provide(String name, Class<?> type, Object value) {
-        runtime.provide(new CapabilityKey(name, type), value);
+        runtime.advanced().register(new CapabilityKey(name, type), value);
     }
 
     private static Constructor<?> accessibleConstructor(Class<?> type, Class<?>... parameters)
@@ -590,30 +593,62 @@ final class KnotraBeanProcessorTest {
     private Object require(String name, Class<?> type) {
         return runtime.root().view().require(new CapabilityKey(name, type));
     }
-    @SuppressWarnings({"rawtypes", "unchecked"})
-    private ComponentHandle<NoConfig> mountNoConfig(String mountId, Object factory) {
-        return runtime.mount(mountId, (ComponentFactory<NoConfig>) factory);
+
+    private Object definition(Object factoryOrDefinition) throws ReflectiveOperationException {
+        if (factoryOrDefinition instanceof BeanDefinition<?>
+                || factoryOrDefinition instanceof ConfiguredBeanDefinition<?, ?>) {
+            return factoryOrDefinition;
+        }
+        return factoryOrDefinition.getClass().getMethod("definition").invoke(factoryOrDefinition);
+    }
+
+    private MountHandle mountNoConfig(
+            String mountId,
+            Object factoryOrDefinition) throws ReflectiveOperationException {
+        Object value = definition(factoryOrDefinition);
+        if (value instanceof BeanDefinition<?> definition) {
+            return Beans.mount(runtime, definition, mountId);
+        }
+        throw new IllegalArgumentException("factory did not expose BeanDefinition");
+    }
+
+    private ConfiguredMountHandle<?> mountConfigured(
+            String mountId,
+            Object factoryOrDefinition,
+            Object config) throws ReflectiveOperationException {
+        Object value = definition(factoryOrDefinition);
+        if (value instanceof ConfiguredBeanDefinition<?, ?> definition) {
+            return mountConfiguredDefinition(definition, mountId, config);
+        }
+        throw new IllegalArgumentException("factory did not expose ConfiguredBeanDefinition");
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
-    private ComponentHandle<?> mountConfigured(String mountId, Object factory, Object config) {
-        return runtime.mount(mountId, (ComponentFactory) factory, config);
+    private ConfiguredMountHandle<?> mountConfiguredDefinition(
+            ConfiguredBeanDefinition definition,
+            String mountId,
+            Object config) {
+        return Beans.mount(runtime, definition, mountId, config);
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
-    private ComponentState reconfigure(ComponentHandle<?> handle, Object config) throws Exception {
-        Object next = ((ComponentHandle) handle).reconfigureAsync(config);
+    private ComponentState reconfigure(
+            ConfiguredMountHandle<?> handle,
+            Object config) throws Exception {
+        ConfiguredMountHandle raw = (ConfiguredMountHandle) handle;
+        Object next = raw.reconfigureAsync(config);
         return (ComponentState) ((CompletionStage<?>) next)
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
-    private ComponentState settle(ComponentHandle<?> handle) throws Exception {
+    private ComponentState settle(MountHandle handle) throws Exception {
         return handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
 
+
     private void assertRuntimeHasNoActivationOwnedOutputs() {
-        for (RuntimeSnapshot.RegistrationSnapshot registration : runtime.snapshot().registrations()) {
+        for (RuntimeSnapshot.RegistrationSnapshot registration : runtime.advanced().snapshot().registrations()) {
             if (registration.owner().kind()
                     == RuntimeSnapshot.RegistrationOwnerKind.ACTIVATION) {
                 throw new AssertionError("activation output was not revoked: " + registration);

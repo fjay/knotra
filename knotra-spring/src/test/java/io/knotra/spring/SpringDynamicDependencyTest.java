@@ -1,13 +1,12 @@
 package io.knotra.spring;
 
 import io.knotra.CapabilityKey;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
 import io.knotra.ComponentState;
 import io.knotra.DynamicCapability;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
-import io.knotra.RegistrationHandle;
+import io.knotra.Registration;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -15,6 +14,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -74,17 +74,18 @@ final class SpringDynamicDependencyTest {
     }
 
     @Test
-    void dynamicProxyProviderReplacementDoesNotRebuildSpringContext() throws Exception {
-        RegistrationHandle first = runtime.provide(API, new ApiValue("v1"));
+    void dynamicProviderReplacementDoesNotRebuildSpringContext() throws Exception {
+        Registration<Api> first = runtime.publish(API, new ApiValue("v1"))
+                .registration();
         AtomicInteger contexts = new AtomicInteger();
 
-        ComponentFactory<NoConfig> factory = SpringModules.noConfig("dynamic-proxy-child")
+        MountFactory factory = SpringModules.noConfig("dynamic-proxy-child")
                 .annotatedClasses(DynamicProxyConfig.class)
                 .customizer(context -> contexts.incrementAndGet())
-                .dynamicProxyRequired("api", API)
+                .dynamic("api", API)
                 .expose(API_SNAPSHOT)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("dynamic-proxy-child", factory);
+        MountHandle handle = runtime.mount("dynamic-proxy-child", factory);
         assertActive(handle);
         ApiSnapshot firstSnapshot = runtime.root().view().require(API_SNAPSHOT);
         assertEquals("v1", firstSnapshot.value());
@@ -102,52 +103,55 @@ final class SpringDynamicDependencyTest {
     }
 
     @Test
-    void dynamicProxyDeclarationsAcceptInterfaceCapability() {
+    void dynamicDeclarationsAcceptInterfaceCapability() {
         assertNotNull(SpringModules.noConfig("proxy-iface-required")
-                .dynamicProxyRequired("api", API));
+                .dynamic("api", API));
+        assertNotNull(SpringModules.noConfig("proxy-iface-class-required")
+                .dynamic("api", Api.class));
         assertNotNull(SpringModules.noConfig("proxy-iface-optional")
-                .dynamicProxyOptional("api", API));
+                .dynamicOptional("api", API));
     }
 
     @Test
-    void dynamicProxyRequiredRejectsNonInterfaceCapabilityAtDeclaration() {
+    void dynamicRejectsNonInterfaceCapabilityAtDeclaration() {
         CapabilityKey<ApiValue> key =
                 CapabilityKey.of("spring-dynamic.api-value-required", ApiValue.class);
 
         IllegalArgumentException rejected = assertThrows(
                 IllegalArgumentException.class,
                 () -> SpringModules.noConfig("proxy-class-required")
-                        .dynamicProxyRequired("api", key));
+                        .dynamic("api", key));
         assertTrue(rejected.getMessage().contains("must be an interface"));
         assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
     }
 
     @Test
-    void dynamicProxyOptionalRejectsNonInterfaceCapabilityAtDeclaration() {
+    void dynamicOptionalRejectsNonInterfaceCapabilityAtDeclaration() {
         CapabilityKey<ApiValue> key =
                 CapabilityKey.of("spring-dynamic.api-value-optional", ApiValue.class);
 
         IllegalArgumentException rejected = assertThrows(
                 IllegalArgumentException.class,
                 () -> SpringModules.noConfig("proxy-class-optional")
-                        .dynamicProxyOptional("api", key));
+                        .dynamicOptional("api", key));
         assertTrue(rejected.getMessage().contains("must be an interface"));
         assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
     }
 
     @Test
     void dynamicCapabilityProvidesProviderFixedCallbackAcrossReplacement() throws Exception {
-        RegistrationHandle first = runtime.provide(API, new ApiValue("v1"));
+        Registration<Api> first = runtime.publish(API, new ApiValue("v1"))
+                .registration();
         AtomicInteger contexts = new AtomicInteger();
 
-        ComponentFactory<NoConfig> factory =
+        MountFactory factory =
                 SpringModules.noConfig("dynamic-capability-child")
                         .annotatedClasses(DynamicCapabilityConfig.class)
                         .customizer(context -> contexts.incrementAndGet())
-                        .dynamicRequired("api", API)
+                        .dynamicCapability("api", API)
                         .expose(CAPABILITY_SNAPSHOT)
                         .build();
-        ComponentHandle<NoConfig> handle =
+        MountHandle handle =
                 runtime.mount("dynamic-capability-child", factory);
         assertActive(handle);
         CapabilitySnapshot snapshot =
@@ -169,33 +173,33 @@ final class SpringDynamicDependencyTest {
         AtomicInteger capabilityContexts = new AtomicInteger();
         AtomicInteger proxyContexts = new AtomicInteger();
 
-        ComponentFactory<NoConfig> capabilityFactory =
+        MountFactory capabilityFactory =
                 SpringModules.noConfig("dynamic-capability-optional-child")
                         .annotatedClasses(DynamicCapabilityConfig.class)
                         .customizer(context -> capabilityContexts.incrementAndGet())
-                        .dynamicOptional("api", API)
+                        .dynamicCapabilityOptional("api", API)
                         .expose(CAPABILITY_SNAPSHOT)
                         .build();
-        ComponentHandle<NoConfig> capabilityHandle =
+        MountHandle capabilityHandle =
                 runtime.mount("dynamic-capability-optional-child", capabilityFactory);
         assertActive(capabilityHandle);
         CapabilitySnapshot missingCapability =
                 runtime.root().view().require(CAPABILITY_SNAPSHOT);
         assertFalse(missingCapability.api().available());
 
-        ComponentFactory<NoConfig> proxyFactory =
+        MountFactory proxyFactory =
                 SpringModules.noConfig("dynamic-proxy-optional-child")
                         .annotatedClasses(DynamicProxyConfig.class)
                         .customizer(context -> proxyContexts.incrementAndGet())
-                        .dynamicProxyOptional("api", API)
+                        .dynamicOptional("api", API)
                         .expose(API_SNAPSHOT)
                         .build();
-        ComponentHandle<NoConfig> proxyHandle =
+        MountHandle proxyHandle =
                 runtime.mount("dynamic-proxy-optional-child", proxyFactory);
         assertActive(proxyHandle);
         ApiSnapshot missingProxy = runtime.root().view().require(API_SNAPSHOT);
 
-        runtime.provide(API, new ApiValue("v1"));
+        runtime.publish(API, new ApiValue("v1")).awaitSettled(Duration.ofSeconds(10));
 
         assertActive(capabilityHandle);
         assertActive(proxyHandle);
@@ -210,16 +214,11 @@ final class SpringDynamicDependencyTest {
         proxyHandle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
-    private void replaceProvider(RegistrationHandle previous, String value)
-            throws Exception {
-        runtime.transact(transaction -> {
-            transaction.revoke(previous);
-            transaction.provide(runtime.root(), API, new ApiValue(value));
-            return null;
-        }).settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+    private void replaceProvider(Registration<Api> previous, String value) {
+        previous.replace(new ApiValue(value)).awaitSettled(Duration.ofSeconds(10));
     }
 
-    private static void assertActive(ComponentHandle<?> handle) throws Exception {
+    private static void assertActive(MountHandle handle) throws Exception {
         ComponentState state = handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ComponentState.ACTIVE, state, () -> handle.componentId());

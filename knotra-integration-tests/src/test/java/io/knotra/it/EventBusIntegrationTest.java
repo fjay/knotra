@@ -12,14 +12,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import com.example.integration.contract.ContractEvent;
 import com.example.integration.contract.IntegrationCoordinator;
 import io.knotra.ActivationContext;
-import io.knotra.CapabilityRequirement;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
 import io.knotra.events.EventBus;
 import io.knotra.events.EventCapabilities;
 import io.knotra.events.EventDefinition;
@@ -56,7 +54,7 @@ final class EventBusIntegrationTest {
         runtime.close();
     }
 
-    private ComponentHandle<NoConfig> mountBus(String mountId) {
+    private MountHandle mountBus(String mountId) {
         return runtime.mount(mountId, new EventBusFactory());
     }
 
@@ -67,8 +65,8 @@ final class EventBusIntegrationTest {
         CountDownLatch listenerEntered = new CountDownLatch(1);
         CompletableFuture<Boolean> gate = new CompletableFuture<>();
 
-        ComponentHandle<NoConfig> provider = mountBus("bus");
-        ComponentHandle<NoConfig> consumer = mountGatedConsumer(
+        MountHandle provider = mountBus("bus");
+        MountHandle consumer = mountGatedConsumer(
                 observed, deliveries, listenerEntered, gate);
         assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(provider));
         assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(consumer));
@@ -80,7 +78,7 @@ final class EventBusIntegrationTest {
         CompletableFuture<ComponentState> oldDisposal = provider.disposeAsync().toCompletableFuture();
         assertFalse(oldDisposal.isDone());
 
-        ComponentHandle<NoConfig> replacement = mountBus("replacement-bus");
+        MountHandle replacement = mountBus("replacement-bus");
         assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(replacement));
         assertSame(oldBus, observed.get(), "old activation must settle before reactivation");
 
@@ -99,7 +97,7 @@ final class EventBusIntegrationTest {
         assertTrue(newBus.dispatch(CONTRACT_EVENTS, new ContractEvent("new"))
                 .toCompletableFuture().get(10, TimeUnit.SECONDS).successful());
         assertEquals(2, deliveries.get(), "exactly one delivery per accepted dispatch");
-        assertTrue(runtime.snapshot().registrations().stream()
+        assertTrue(runtime.advanced().snapshot().registrations().stream()
                 .anyMatch(item -> item.capability().name()
                         .equals(EventCapabilities.EVENT_BUS.name())));
     }
@@ -107,15 +105,15 @@ final class EventBusIntegrationTest {
     @Test
     void pluginListenerGateBlocksArtifactDrainAndPreventsDuplicateDelivery(
             @TempDir Path pluginsRoot) throws Exception {
-        ComponentHandle<NoConfig> busProvider = mountBus("bus");
+        MountHandle busProvider = mountBus("bus");
         assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(busProvider));
         EventBus bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
 
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
-            ComponentHandle<NoConfig> consumer = adapter.factories()
-                    .resolve("integration-event-consumer", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "plugin-consumer", NoConfig.INSTANCE);
+            MountHandle consumer = adapter.factories()
+                    .resolveNoConfig("integration-event-consumer").orElseThrow()
+                    .mount(runtime.root(), "plugin-consumer");
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(consumer));
 
             CompletableFuture<EventDispatch<ContractEvent>> held =
@@ -131,8 +129,7 @@ final class EventBusIntegrationTest {
             assertFalse(unload.isDone(), "drain must wait for the accepted plugin callback");
             assertEquals(0, bus.snapshot().subscriptionCount());
 
-            URL testClasses = java.nio.file.Path.of("target", "test-classes")
-                    .toUri().toURL();
+            URL testClasses = Path.of("target", "test-classes").toUri().toURL();
             try (URLClassLoader independent = new URLClassLoader(new URL[]{testClasses}, null)) {
                 Class<?> shadow = Class.forName(
                         ContractEvent.class.getName(), false, independent);
@@ -154,11 +151,10 @@ final class EventBusIntegrationTest {
             assertEquals(1, IntegrationCoordinator.eventDeliveries());
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
-            assertTrue(runtime.snapshot().components().stream()
-                    .noneMatch(component -> component.mountId().equals("plugin-consumer")));
+            assertTrue(runtime.advanced().snapshot().mounts().stream()
+                    .noneMatch(mount -> mount.mountId().equals("plugin-consumer")));
 
-            URL releasedClasses = java.nio.file.Path.of("target", "test-classes")
-                    .toUri().toURL();
+            URL releasedClasses = Path.of("target", "test-classes").toUri().toURL();
             try (URLClassLoader independent = new URLClassLoader(new URL[]{releasedClasses}, null)) {
                 Class<?> shadow = Class.forName(
                         ContractEvent.class.getName(), false, independent);
@@ -186,15 +182,16 @@ final class EventBusIntegrationTest {
     @Test
     void openHostBusReleasesPluginClassLoaderAndReloadsSameEventName(
             @TempDir Path pluginsRoot) throws Exception {
-        ComponentHandle<NoConfig> busProvider = mountBus("bus");
+        MountHandle busProvider = mountBus("bus");
         assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(busProvider));
         EventBus bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
 
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(
-                    adapter.factories().resolve("integration-event-consumer", NoConfig.class).orElseThrow()
-                            .mount(runtime.root(), "reload-consumer", NoConfig.INSTANCE)));
+                    adapter.factories()
+                            .resolveNoConfig("integration-event-consumer").orElseThrow()
+                            .mount(runtime.root(), "reload-consumer")));
             assertEquals(2, bus.snapshot().subscriptionCount());
 
             adapter.unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID).toCompletableFuture().join();
@@ -213,8 +210,9 @@ final class EventBusIntegrationTest {
 
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(
-                    adapter.factories().resolve("integration-event-consumer", NoConfig.class).orElseThrow()
-                            .mount(runtime.root(), "reloaded-consumer", NoConfig.INSTANCE)));
+                    adapter.factories()
+                            .resolveNoConfig("integration-event-consumer").orElseThrow()
+                            .mount(runtime.root(), "reloaded-consumer")));
             assertEquals(2, bus.snapshot().subscriptionCount());
 
             CompletableFuture<EventDispatch<ContractEvent>> reloaded =
@@ -228,14 +226,14 @@ final class EventBusIntegrationTest {
 
     @Test
     void eventIdentityIsTheExactJvmClassNotTheName(@TempDir Path pluginsRoot) throws Exception {
-        ComponentHandle<NoConfig> busProvider = mountBus("bus");
+        MountHandle busProvider = mountBus("bus");
         assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(busProvider));
 
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
-            ComponentHandle<NoConfig> consumer = adapter.factories()
-                    .resolve("integration-event-consumer", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "identity", NoConfig.INSTANCE);
+            MountHandle consumer = adapter.factories()
+                    .resolveNoConfig("integration-event-consumer").orElseThrow()
+                    .mount(runtime.root(), "identity");
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(consumer));
             EventBus bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
             assertTrue(bus.snapshot().subscriptions().stream()
@@ -261,21 +259,22 @@ final class EventBusIntegrationTest {
         }
     }
 
-    private ComponentHandle<NoConfig> mountGatedConsumer(
+    @SuppressWarnings("rawtypes")
+    private MountHandle mountGatedConsumer(
             AtomicReference<EventBus> observed,
             AtomicInteger deliveries,
             CountDownLatch listenerEntered,
             CompletableFuture<Boolean> gate) {
-        Component<NoConfig> component = new Component<>() {
+        Component component = new Component() {
             @Override
             public ComponentDescriptor descriptor() {
                 return ComponentDescriptor.named(
                         "gated-host-consumer",
-                        CapabilityRequirement.required(EventCapabilities.EVENT_BUS));
+                        io.knotra.CapabilityRequirement.required(EventCapabilities.EVENT_BUS));
             }
 
             @Override
-            public void start(ActivationContext context, NoConfig config) {
+            public void start(ActivationContext context, Object config) {
                 EventBus bus = context.require(EventCapabilities.EVENT_BUS);
                 observed.set(bus);
                 EventSubscription subscription = bus.subscribe(CONTRACT_EVENTS, event -> {
@@ -286,14 +285,15 @@ final class EventBusIntegrationTest {
                 context.lifecycle().manageAsync("gated-host-listener", subscription);
             }
         };
-        ComponentFactory<NoConfig> factory = new ComponentFactory<>() {
+        MountFactory factory = new MountFactory() {
             @Override
             public String factoryId() {
                 return "gated-host-consumer";
             }
 
             @Override
-            public Component<NoConfig> create() {
+            @SuppressWarnings("unchecked")
+            public Component create() {
                 return component;
             }
         };

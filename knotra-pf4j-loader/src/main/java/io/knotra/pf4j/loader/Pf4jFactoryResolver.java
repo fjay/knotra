@@ -5,8 +5,8 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
-import io.knotra.ComponentHandle;
-import io.knotra.ConfigDecoder;
+import io.knotra.ConfiguredMountHandle;
+import io.knotra.MountHandle;
 import io.knotra.loader.ComponentFactoryResolver;
 import io.knotra.loader.CompositeFactoryResolver;
 import io.knotra.loader.ControlledMountContext;
@@ -16,6 +16,8 @@ import io.knotra.loader.FactoryIdentity;
 import io.knotra.loader.FactoryRef;
 import io.knotra.loader.ReconfigureStrategy;
 import io.knotra.loader.ResolvedFactory;
+import io.knotra.loader.ResolvedFactory.FactoryKind;
+import io.knotra.pf4j.ArtifactFactoryCatalogEntry;
 import io.knotra.pf4j.ArtifactFactoryHandle;
 import io.knotra.pf4j.ArtifactOperationException;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
@@ -23,9 +25,10 @@ import io.knotra.pf4j.Pf4jArtifactAdapter;
 /**
  * 把 PF4J 的活跃 factory catalog 适配为 Knotra Loader 的受控 resolver。
  *
- * <p>桥接层拥有唯一的泛型捕获点：raw 配置先由 artifact export 的 decoder 转成 C，
- * 随后只能挂载到 Loader 分配的 Context 与 mountId。宿主不需要维护 factoryId 到 Class 的
- * 映射，也不会接触插件 ComponentFactory。</p>
+ * <p>Root factory view 只用于读取稳定元数据并选择配置路径。Plain Mount 通过
+ * no-config catalog 解析获得；类型化配置路径通过 catalog 的 typed resolution 捕获
+ * {@code C}。Loader 记账中的 Object 配置只在桥接层的一个 Mount 边界恢复类型，然后
+ * 挂载到 Loader 分配的 Context 与 mountId。</p>
  */
 public final class Pf4jFactoryResolver implements ComponentFactoryResolver {
     private final Pf4jArtifactAdapter adapter;
@@ -52,38 +55,77 @@ public final class Pf4jFactoryResolver implements ComponentFactoryResolver {
     @Override
     public Optional<ResolvedFactory> resolve(FactoryRef ref) {
         Objects.requireNonNull(ref, "ref");
-        return adapter.factories().resolve(ref.factoryId())
-                .filter(handle -> ref.version().isEmpty()
-                        || ref.version().equals(handle.artifactVersion()))
-                .map(handle -> capture(ref, handle));
+        Optional<ArtifactFactoryHandle> root =
+                adapter.factories().resolve(ref.factoryId());
+        if (root.isPresent() && !versionMatches(ref, root.orElseThrow())) {
+            return Optional.empty();
+        }
+        return root.flatMap(handle -> handle.noConfig()
+                ? resolveNoConfig(ref, handle)
+                : resolveConfigured(ref, handle));
     }
 
-    private static <C> ResolvedFactory capture(
+    private Optional<ResolvedFactory> resolveNoConfig(
             FactoryRef ref,
-            ArtifactFactoryHandle<C> handle) {
-        String fingerprint = handle.artifactId()
-                + "@" + handle.artifactVersion()
-                + ":" + handle.artifactPath()
-                + "#" + handle.factoryId()
-                + ":" + handle.configType().getName();
-        ConfigDecoder<Object> decoder = raw -> handle.decodeConfig(raw);
-        ControlledMountStrategy mount = (slot, config) -> mountCaptured(slot, handle, config);
-        return new ResolvedFactory(
-                FactoryIdentity.fromRef(ref, fingerprint),
-                decoder,
-                mount,
-                ReconfigureStrategy.direct());
+            ArtifactFactoryCatalogEntry expected) {
+        String fingerprint = fingerprint(expected);
+        return adapter.factories().resolveNoConfig(ref.factoryId())
+                .filter(handle -> versionMatches(ref, handle))
+                .filter(handle -> fingerprint(handle).equals(fingerprint))
+                .map(handle -> new ResolvedFactory(
+                        FactoryIdentity.fromRef(ref, fingerprint),
+                        FactoryKind.PLAIN,
+                        null,
+                        noConfigMount(handle),
+                        ReconfigureStrategy.unsupportedPlain()));
     }
 
-    private static <C> CompletionStage<ComponentHandle<?>> mountCaptured(
-            ControlledMountContext slot,
-            ArtifactFactoryHandle<C> handle,
-            Object config) {
+    private static ControlledMountStrategy noConfigMount(
+            ArtifactFactoryHandle.NoConfig handle) {
+        return (context, config) -> mountSafely(
+                () -> handle.mount(context.context(), context.mountId()));
+    }
+
+    private Optional<ResolvedFactory> resolveConfigured(
+            FactoryRef ref,
+            ArtifactFactoryHandle expected) {
+        return resolveConfigured(ref, expected, expected.configType());
+    }
+
+    private <C> Optional<ResolvedFactory> resolveConfigured(
+            FactoryRef ref,
+            ArtifactFactoryCatalogEntry expected,
+            Class<C> configType) {
+        String fingerprint = fingerprint(expected);
+        return adapter.factories().resolve(ref.factoryId(), configType)
+                .filter(handle -> versionMatches(ref, handle))
+                .filter(handle -> fingerprint(handle).equals(fingerprint))
+                .map(handle -> new ResolvedFactory(
+                        FactoryIdentity.fromRef(ref, fingerprint),
+                        FactoryKind.CONFIGURED,
+                        raw -> handle.decodeConfig(raw),
+                        configuredMount(handle, configType),
+                        ReconfigureStrategy.direct(FactoryKind.CONFIGURED)));
+    }
+
+    private static <C> ControlledMountStrategy configuredMount(
+            ArtifactFactoryHandle.Configured<C> handle,
+            Class<C> configType) {
+        return (context, config) -> mountSafely(() -> {
+            C typed = configType.cast(config);
+            ConfiguredMountHandle<C> mounted =
+                    handle.mount(context.context(), context.mountId(), typed);
+            return mounted;
+        });
+    }
+
+    private static CompletionStage<MountHandle> mountSafely(MountOperation operation) {
         try {
-            C typed = handle.configType().cast(config);
-            ComponentHandle<C> mounted = handle.mount(slot.context(), slot.mountId(), typed);
-            return CompletableFuture.completedFuture(mounted)
-                    .thenApply(value -> (ComponentHandle<?>) value);
+            MountHandle handle = operation.mount();
+            if (handle == null) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return handle.whenSettled().thenApply(state -> handle);
         } catch (ArtifactOperationException error) {
             if (!error.diagnostics().isEmpty()) {
                 return CompletableFuture.failedFuture(
@@ -93,5 +135,22 @@ public final class Pf4jFactoryResolver implements ComponentFactoryResolver {
         } catch (RuntimeException error) {
             return CompletableFuture.failedFuture(error);
         }
+    }
+
+    private static boolean versionMatches(FactoryRef ref, ArtifactFactoryCatalogEntry handle) {
+        return ref.version().isEmpty() || ref.version().equals(handle.artifactVersion());
+    }
+
+    private static String fingerprint(ArtifactFactoryCatalogEntry handle) {
+        return handle.artifactId()
+                + "@" + handle.artifactVersion()
+                + ":" + handle.artifactPath()
+                + "#" + handle.factoryId()
+                + ":" + handle.configTypeName();
+    }
+
+    @FunctionalInterface
+    private interface MountOperation {
+        MountHandle mount();
     }
 }

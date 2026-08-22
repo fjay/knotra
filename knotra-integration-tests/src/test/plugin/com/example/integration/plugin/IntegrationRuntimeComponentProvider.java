@@ -42,6 +42,7 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                 ExportedComponentFactory.noConfig(parent()),
                 ExportedComponentFactory.noConfig(inFlight()),
                 ExportedComponentFactory.noConfig(failingCleanup()),
+                ExportedComponentFactory.noConfig(failingStart()),
                 ExportedComponentFactory.noConfig(eventConsumer()));
     }
 
@@ -176,6 +177,31 @@ public final class IntegrationRuntimeComponentProvider implements RuntimeCompone
                                         "intentional integration cleanup failure");
                             }
                         });
+                    }
+                };
+            }
+        };
+    }
+
+    private static ComponentFactory<NoConfig> failingStart() {
+        return new ComponentFactory<>() {
+            @Override
+            public String factoryId() {
+                return "integration-failing-start";
+            }
+
+            @Override
+            public Component<NoConfig> create() {
+                return new Component<>() {
+                    @Override
+                    public ComponentDescriptor descriptor() {
+                        return ComponentDescriptor.named("integration-failing-start");
+                    }
+
+                    @Override
+                    public void start(ActivationContext context, NoConfig config) {
+                        throw new IllegalStateException(
+                                "intentional plugin activation failure");
                     }
                 };
             }

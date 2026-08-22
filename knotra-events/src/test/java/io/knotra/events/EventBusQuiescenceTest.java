@@ -1,8 +1,7 @@
 package io.knotra.events;
 
-import io.knotra.ComponentHandle;
+import io.knotra.MountHandle;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,7 +41,7 @@ final class EventBusQuiescenceTest {
     @BeforeEach
     void setUp() throws Exception {
         runtime = KnotraRuntime.create();
-        ComponentHandle<NoConfig> handle = runtime.mount("event-bus", new EventBusFactory());
+        MountHandle handle = runtime.mount("event-bus", new EventBusFactory());
         assertEquals(io.knotra.ComponentState.ACTIVE, handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);

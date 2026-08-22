@@ -4,8 +4,8 @@ import io.knotra.ActivationContext;
 import io.knotra.CapabilityRequirement;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
 import io.knotra.NoConfig;
@@ -31,11 +31,11 @@ final class EventBusLifecycleTest {
         runtime.close();
     }
 
-    private ComponentHandle<NoConfig> mountBus(String mountId) {
+    private MountHandle mountBus(String mountId) {
         return runtime.mount(mountId, new EventBusFactory());
     }
 
-    private ComponentHandle<NoConfig> mountConsumer(
+    private MountHandle mountConsumer(
             String mountId,
             AtomicReference<EventBus> observedBus,
             AtomicInteger deliveries) {
@@ -57,7 +57,7 @@ final class EventBusLifecycleTest {
                 context.lifecycle().manageAsync("listener", subscription);
             }
         };
-        ComponentFactory<NoConfig> factory = new ComponentFactory<>() {
+        MountFactory factory = new MountFactory() {
             @Override
             public String factoryId() {
                 return "event-consumer";
@@ -68,12 +68,11 @@ final class EventBusLifecycleTest {
                 return component;
             }
         };
-        return runtime.transact(mutation ->
-                mutation.mount(runtime.root(), mountId, factory)).value();
+        return runtime.mount(mountId, factory);
     }
 
-    private String currentActivation(ComponentHandle<?> handle) {
-        return runtime.snapshot().components().stream()
+    private String currentActivation(MountHandle handle) {
+        return runtime.advanced().snapshot().mounts().stream()
                 .filter(component -> component.handleId().equals(handle.handleId()))
                 .findFirst()
                 .orElseThrow()
@@ -84,8 +83,8 @@ final class EventBusLifecycleTest {
     void providerReplacementClosesOldBusAfterConsumerAndReactivatesConsumer() throws Exception {
         AtomicReference<EventBus> observedBus = new AtomicReference<>();
         AtomicInteger deliveries = new AtomicInteger();
-        ComponentHandle<NoConfig> provider = mountBus("bus");
-        ComponentHandle<NoConfig> consumer = mountConsumer("consumer", observedBus, deliveries);
+        MountHandle provider = mountBus("bus");
+        MountHandle consumer = mountConsumer("consumer", observedBus, deliveries);
 
         assertEquals(ComponentState.ACTIVE, provider.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
@@ -120,7 +119,7 @@ final class EventBusLifecycleTest {
         assertEquals(2, deliveries.get());
 
         List<io.knotra.RuntimeSnapshot.RegistrationSnapshot> registrations =
-                runtime.snapshot().registrations().stream()
+                runtime.advanced().snapshot().registrations().stream()
                         .filter(item -> item.capability().name()
                                 .equals(EventCapabilities.EVENT_BUS.name()))
                         .toList();
@@ -131,8 +130,8 @@ final class EventBusLifecycleTest {
     void providerDisposeDetachesConsumerBeforeClosingOwnedBus() throws Exception {
         AtomicReference<EventBus> observedBus = new AtomicReference<>();
         AtomicInteger deliveries = new AtomicInteger();
-        ComponentHandle<NoConfig> provider = mountBus("bus");
-        ComponentHandle<NoConfig> consumer = mountConsumer("consumer", observedBus, deliveries);
+        MountHandle provider = mountBus("bus");
+        MountHandle consumer = mountConsumer("consumer", observedBus, deliveries);
 
         assertEquals(ComponentState.ACTIVE, provider.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
@@ -146,7 +145,7 @@ final class EventBusLifecycleTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertTrue(oldBus.snapshot().closed());
         assertEquals(0, oldBus.snapshot().subscriptionCount());
-        assertTrue(runtime.snapshot().registrations().stream()
+        assertTrue(runtime.advanced().snapshot().registrations().stream()
                 .noneMatch(item -> item.capability().name()
                         .equals(EventCapabilities.EVENT_BUS.name())));
     }
@@ -156,8 +155,8 @@ final class EventBusLifecycleTest {
         AtomicReference<EventSubscription> subscription = new AtomicReference<>();
         CountDownLatch started = new CountDownLatch(1);
         CompletableFuture<Boolean> gate = new CompletableFuture<>();
-        ComponentHandle<NoConfig> provider = mountBus("bus");
-        ComponentHandle<NoConfig> consumer = mountGatedConsumer(
+        MountHandle provider = mountBus("bus");
+        MountHandle consumer = mountGatedConsumer(
                 "consumer", observedBus, subscription, started, gate);
         assertEquals(ComponentState.ACTIVE, provider.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
@@ -187,8 +186,8 @@ final class EventBusLifecycleTest {
         AtomicReference<EventSubscription> subscription = new AtomicReference<>();
         CountDownLatch started = new CountDownLatch(1);
         CompletableFuture<Boolean> gate = new CompletableFuture<>();
-        ComponentHandle<NoConfig> oldProvider = mountBus("old-bus");
-        ComponentHandle<NoConfig> consumer = mountGatedConsumer(
+        MountHandle oldProvider = mountBus("old-bus");
+        MountHandle consumer = mountGatedConsumer(
                 "consumer", observedBus, subscription, started, gate);
         assertEquals(ComponentState.ACTIVE, oldProvider.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
@@ -203,7 +202,7 @@ final class EventBusLifecycleTest {
         assertTrue(started.await(10, TimeUnit.SECONDS));
         var oldDisposal = oldProvider.disposeAsync().toCompletableFuture();
 
-        ComponentHandle<NoConfig> newProvider = mountBus("new-bus");
+        MountHandle newProvider = mountBus("new-bus");
         assertEquals(ComponentState.ACTIVE, newProvider.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertSame(oldBus, observedBus.get());
@@ -217,7 +216,7 @@ final class EventBusLifecycleTest {
         assertTrue(dispatch.get(10, TimeUnit.SECONDS).successful());
     }
 
-    private ComponentHandle<NoConfig> mountGatedConsumer(
+    private MountHandle mountGatedConsumer(
             String mountId,
             AtomicReference<EventBus> observedBus,
             AtomicReference<EventSubscription> subscription,
@@ -246,7 +245,7 @@ final class EventBusLifecycleTest {
                 context.lifecycle().manageAsync("gated-listener", subscription.get());
             }
         };
-        ComponentFactory<NoConfig> factory = new ComponentFactory<>() {
+        MountFactory factory = new MountFactory() {
             @Override
             public String factoryId() {
                 return "gated-event-consumer";
@@ -257,12 +256,11 @@ final class EventBusLifecycleTest {
                 return component;
             }
         };
-        return runtime.transact(mutation ->
-                mutation.mount(runtime.root(), mountId, factory)).value();
+        return runtime.mount(mountId, factory);
     }
 
-    private ComponentState componentState(ComponentHandle<?> handle) {
-        return runtime.snapshot().components().stream()
+    private ComponentState componentState(MountHandle handle) {
+        return runtime.advanced().snapshot().mounts().stream()
                 .filter(component -> component.handleId().equals(handle.handleId()))
                 .findFirst()
                 .orElseThrow()

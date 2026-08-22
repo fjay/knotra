@@ -60,7 +60,7 @@ final class GuardedActivationContext implements ActivationContext {
     }
 
     @Override
-    public <C> io.knotra.ComponentHandle<C> mountChild(
+    public <C> io.knotra.ConfiguredMountHandle<C> mountChild(
             String mountId,
             ComponentFactory<C> factory,
             C config) {
@@ -68,12 +68,12 @@ final class GuardedActivationContext implements ActivationContext {
     }
 
     @Override
-    public <C> io.knotra.ComponentHandle<C> mountChild(
+    public <C> io.knotra.ConfiguredMountHandle<C> mountChild(
             String mountId,
             ComponentFactory<C> factory,
             C config,
             MountOptions options) {
-        // 忽略调用方传入的 origin；artifact 来源必须被精确继承到所有子挂载。
+        // Ignore caller origin; artifact provenance is inherited by every child mount.
         ComponentFactory<C> guarded = GuardedComponentFactory.wrap(
                 factory,
                 policy,
@@ -86,27 +86,32 @@ final class GuardedActivationContext implements ActivationContext {
                         ? metadata.options().metadata()
                         : options.metadata()));
     }
+
     @Override
-    public io.knotra.ComponentHandle<io.knotra.NoConfig> mountChild(
+    public io.knotra.MountHandle mountChild(
             String mountId,
             ComponentFactory<io.knotra.NoConfig> factory) {
         return mountChild(
                 mountId,
                 factory,
-                io.knotra.NoConfig.INSTANCE,
                 io.knotra.MountOptions.DEFAULT);
     }
 
     @Override
-    public io.knotra.ComponentHandle<io.knotra.NoConfig> mountChild(
+    public io.knotra.MountHandle mountChild(
             String mountId,
             ComponentFactory<io.knotra.NoConfig> factory,
             MountOptions options) {
-        return mountChild(
-                mountId,
+        ComponentFactory<io.knotra.NoConfig> guarded = GuardedComponentFactory.wrap(
                 factory,
-                io.knotra.NoConfig.INSTANCE,
-                options);
+                policy,
+                metadata);
+        return delegate.mountChild(
+                mountId,
+                guarded,
+                new MountOptions(metadata.origin(), options == null
+                        ? metadata.options().metadata()
+                        : options.metadata()));
     }
 
     @Override

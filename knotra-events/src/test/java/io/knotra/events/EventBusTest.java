@@ -3,8 +3,8 @@ package io.knotra.events;
 import io.knotra.CapabilityRequirement;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
 import io.knotra.KnotraRuntime;
 import io.knotra.NoConfig;
 import io.knotra.RuntimeSnapshot;
@@ -40,7 +40,7 @@ final class EventBusTest {
     @BeforeEach
     void setUp() throws Exception {
         runtime = KnotraRuntime.create();
-        ComponentHandle<NoConfig> handle = mountBus();
+        MountHandle handle = mountBus();
         assertEquals(io.knotra.ComponentState.ACTIVE,
                 handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS));
         Optional<EventBus> found = runtime.root().view().find(EventCapabilities.EVENT_BUS);
@@ -52,11 +52,11 @@ final class EventBusTest {
         runtime.close();
     }
 
-    private ComponentHandle<NoConfig> mountBus() {
+    private MountHandle mountBus() {
         return runtime.mount("event-bus", new EventBusFactory());
     }
 
-    private ComponentHandle<NoConfig> mountConsumer(
+    private MountHandle mountConsumer(
             java.util.function.BiConsumer<io.knotra.ActivationContext, EventBus> start) {
         Component<NoConfig> component = new Component<>() {
             private final ComponentDescriptor descriptor = ComponentDescriptor.named(
@@ -72,7 +72,7 @@ final class EventBusTest {
                 start.accept(context, context.require(EventCapabilities.EVENT_BUS));
             }
         };
-        ComponentFactory<NoConfig> factory = new ComponentFactory<>() {
+        MountFactory factory = new MountFactory() {
             @Override
             public String factoryId() {
                 return "event-consumer";
@@ -487,7 +487,7 @@ final class EventBusTest {
     void capabilityRegistrationIsOwnedByActivation() throws Exception {
         // The setup mount is already active and owns the single capability registration.
 
-        RuntimeSnapshot snapshot = runtime.snapshot();
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         List<RuntimeSnapshot.RegistrationSnapshot> registrations = snapshot.registrations()
                 .stream()
                 .filter(item -> item.capability().name().equals(EventCapabilities.EVENT_BUS.name()))

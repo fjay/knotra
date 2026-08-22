@@ -65,7 +65,7 @@ public record LoaderSnapshot(
      * @param path 条目的归一化路径
      * @param contextId 条目专属 Context 的 ID
      * @param contextPath 该 Context 的规范路径
-     * @param handleId 组件句柄 ID
+     * @param handleId 挂载句柄 ID
      * @param mountId 挂载 ID，等于条目路径
      * @param componentId 组件 ID
      * @param factoryIdentity 当前解析到的实现身份

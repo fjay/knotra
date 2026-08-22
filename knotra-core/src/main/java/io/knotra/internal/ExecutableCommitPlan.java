@@ -13,13 +13,17 @@ import java.util.Set;
  * Activation 和 Context 处置要在同一协调器临界区内更新。事务被拒绝时对象随之废弃，不会触碰可执行状态。</p>
  */
 final class ExecutableCommitPlan {
-    final Map<String, DefaultKnotraRuntime.MountIntent<?>> mounts = new HashMap<>();
+    final Map<String, DefaultKnotraRuntime.MountIntent> mounts = new HashMap<>();
     final Map<String, ConfigUpdate> configs = new HashMap<>();
     final Set<String> staleActivations = new LinkedHashSet<>();
-    final Set<String> removedComponents = new LinkedHashSet<>();
+    final Map<String, RemovedMount> removedComponents = new java.util.LinkedHashMap<>();
+    final Map<String, RemovedMount> reportedRemovedMounts = new java.util.LinkedHashMap<>();
     final Set<String> resetAutoRestart = new LinkedHashSet<>();
     final Set<String> contextDisposals = new LinkedHashSet<>();
     final Map<String, ProviderLeaseRuntime> retiredRegistrations = new HashMap<>();
     record ConfigUpdate(Object config, long revision) {
+    }
+
+    record RemovedMount(String mountId) {
     }
 }

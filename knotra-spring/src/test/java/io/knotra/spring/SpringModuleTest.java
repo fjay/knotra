@@ -2,12 +2,13 @@ package io.knotra.spring;
 
 import io.knotra.CapabilityKey;
 import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
+import io.knotra.ConfiguredMountHandle;
+import io.knotra.MountFactory;
+import io.knotra.MountHandle;
 import io.knotra.DiagnosticCode;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
-import io.knotra.RegistrationHandle;
+import io.knotra.Registration;
 import io.knotra.TransactionRejectedException;
 
 import org.junit.jupiter.api.AfterEach;
@@ -17,6 +18,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.time.Duration;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Optional;
@@ -216,26 +218,22 @@ final class SpringModuleTest {
             throws Exception {
         ExternalProvider first = new ExternalProvider("v1");
         ExternalProvider second = new ExternalProvider("v2");
-        RegistrationHandle registration = runtime.provide(PROVIDER, first);
+        Registration<Provider> registration = runtime.publish(PROVIDER, first).registration();
 
         AtomicInteger contextCount = new AtomicInteger();
-        ComponentFactory<NoConfig> factory = SpringModules.noConfig("required-spring")
+        MountFactory factory = SpringModules.noConfig("required-spring")
                 .annotatedClasses(RequiredConfig.class)
                 .customizer(context -> contextCount.incrementAndGet())
                 .required("provider", PROVIDER)
                 .expose(SERVICE)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("required-spring", factory);
+        MountHandle handle = runtime.mount("required-spring", factory);
         ServiceAssertions.assertActive(handle);
         ServiceSnapshot firstSnapshot = runtime.root().view().require(SERVICE);
         assertSame(first, firstSnapshot.provider());
         assertEquals(1, contextCount.get());
 
-        runtime.transact(transaction -> {
-            transaction.revoke(registration);
-            transaction.provide(runtime.root(), PROVIDER, second);
-            return null;
-        }).settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        registration.replace(second).awaitSettled(Duration.ofSeconds(10));
 
         ServiceSnapshot secondSnapshot = runtime.root().view().require(SERVICE);
         assertNotSame(firstSnapshot, secondSnapshot);
@@ -251,7 +249,7 @@ final class SpringModuleTest {
 
     @Test
     void optionalValueAndOptionalWrapperFollowAppearanceAndDisappearance() throws Exception {
-        ComponentFactory<NoConfig> factory = SpringModules.noConfig("optional-spring")
+        MountFactory factory = SpringModules.noConfig("optional-spring")
                 .customizer(context -> context.registerBean(
                         "snapshot",
                         ProviderSnapshot.class,
@@ -264,7 +262,7 @@ final class SpringModuleTest {
                 .optionalAsOptional("wrappedProvider", WRAPPED_PROVIDER)
                 .expose(PROVIDER_SNAPSHOT)
                 .build();
-        ComponentHandle<NoConfig> handle =
+        MountHandle handle =
                 runtime.mount("optional-spring", factory);
         ServiceAssertions.assertActive(handle);
         ProviderSnapshot missing = runtime.root().view().require(PROVIDER_SNAPSHOT);
@@ -272,15 +270,17 @@ final class SpringModuleTest {
         assertTrue(missing.wrapped().isEmpty());
 
         ExternalProvider provider = new ExternalProvider("present");
-        RegistrationHandle wrappedRegistration = runtime.provide(WRAPPED_PROVIDER, provider);
-        RegistrationHandle registration = runtime.provide(PROVIDER, provider);
+        Registration<Provider> wrappedRegistration =
+                runtime.advanced().register(WRAPPED_PROVIDER, provider);
+        Registration<Provider> registration =
+                runtime.advanced().register(PROVIDER, provider);
         ServiceAssertions.assertActive(handle);
         ProviderSnapshot present = runtime.root().view().require(PROVIDER_SNAPSHOT);
         assertSame(provider, present.value());
         assertSame(provider, present.wrapped().orElseThrow());
 
-        runtime.revoke(wrappedRegistration);
-        runtime.revoke(registration);
+        wrappedRegistration.revoke().awaitSettled(Duration.ofSeconds(10));
+        registration.revoke().awaitSettled(Duration.ofSeconds(10));
         ServiceAssertions.assertActive(handle);
         ProviderSnapshot absentAgain = runtime.root().view().require(PROVIDER_SNAPSHOT);
         assertNull(absentAgain.value());
@@ -298,7 +298,7 @@ final class SpringModuleTest {
                                 config.value().trim().toUpperCase()))
                         .expose(CONFIGURED)
                         .build();
-        ComponentHandle<ModuleConfig> handle =
+        ConfiguredMountHandle<ModuleConfig> handle =
                 runtime.mount("typed-spring", factory, new ModuleConfig(" one "));
         ServiceAssertions.assertActive(handle);
         assertEquals("ONE", runtime.root().view().require(CONFIGURED).value());
@@ -312,7 +312,7 @@ final class SpringModuleTest {
         ComponentFactory rawFactory = factory;
         TransactionRejectedException rejected = assertThrows(
                 TransactionRejectedException.class,
-                () -> runtime.transact(transaction -> transaction.mount(
+                () -> runtime.advanced().transact(transaction -> transaction.mount(
                         runtime.root(), "typed-spring-bad", rawFactory, "wrong raw config")));
         assertEquals(DiagnosticCode.INVALID_CONFIG,
                 rejected.diagnostics().getFirst().code());
@@ -328,7 +328,7 @@ final class SpringModuleTest {
                         .annotatedClasses(DisposableTypedConfig.class)
                         .expose(CONFIGURED)
                         .build();
-        ComponentHandle<DisposableModuleConfig> handle =
+        ConfiguredMountHandle<DisposableModuleConfig> handle =
                 runtime.mount("disposable-config", factory, first);
         ServiceAssertions.assertActive(handle);
         assertEquals("one", runtime.root().view().require(CONFIGURED).value());
@@ -344,12 +344,12 @@ final class SpringModuleTest {
 
     @Test
     void refreshFailureDestroysCreatedBeansAndPublishesNoOutput() throws Exception {
-        ComponentFactory<NoConfig> factory =
+        MountFactory factory =
                 SpringModules.noConfig("refresh-failure")
                         .annotatedClasses(RefreshFailureConfig.class)
                         .expose(REFRESH_OUTPUT, "boom")
                         .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("refresh-failure", factory);
+        MountHandle handle = runtime.mount("refresh-failure", factory);
 
         ComponentState state = handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -365,7 +365,7 @@ final class SpringModuleTest {
     void customizerFailureDestroysManuallyRegisteredSingletonBeforeFailing()
             throws Exception {
         CountingDisposable disposable = new CountingDisposable();
-        ComponentFactory<NoConfig> factory =
+        MountFactory factory =
                 SpringModules.noConfig("customizer-failure")
                         .customizer(context -> {
                             org.springframework.beans.factory.support.RootBeanDefinition definition =
@@ -377,7 +377,7 @@ final class SpringModuleTest {
                             throw new IllegalStateException("customizer failed");
                         })
                         .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("customizer-failure", factory);
+        MountHandle handle = runtime.mount("customizer-failure", factory);
 
         ComponentState state = handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -390,7 +390,7 @@ final class SpringModuleTest {
             throws Exception {
         CountingDisposable disposable = new CountingDisposable();
         AtomicReference<ClassLoader> hookLoader = new AtomicReference<>();
-        ComponentFactory<NoConfig> factory =
+        MountFactory factory =
                 SpringModules.noConfig("inactive-custom-hook")
                         .customizer(context -> {
                             org.springframework.beans.factory.support.RootBeanDefinition definition =
@@ -406,7 +406,7 @@ final class SpringModuleTest {
                             return CompletableFuture.completedFuture(null);
                         })
                         .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("inactive-custom-hook", factory);
+        MountHandle handle = runtime.mount("inactive-custom-hook", factory);
 
         ComponentState state = handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -417,12 +417,12 @@ final class SpringModuleTest {
 
     @Test
     void multipleOutputsArePublishedFromNamedSpringBeans() throws Exception {
-        ComponentFactory<NoConfig> factory = SpringModules.noConfig("multi-output")
+        MountFactory factory = SpringModules.noConfig("multi-output")
                 .annotatedClasses(MultiOutputConfig.class)
                 .expose(FIRST, "first")
                 .expose(SECOND, "second")
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("multi-output", factory);
+        MountHandle handle = runtime.mount("multi-output", factory);
         ServiceAssertions.assertActive(handle);
         assertEquals("first-value", runtime.root().view().require(FIRST));
         assertEquals(42, runtime.root().view().require(SECOND));
@@ -440,11 +440,11 @@ final class SpringModuleTest {
             }
             return CompletableFuture.completedFuture(null);
         };
-        ComponentFactory<NoConfig> factory = SpringModules.noConfig("closer-retry")
+        MountFactory factory = SpringModules.noConfig("closer-retry")
                 .annotatedClasses(LoaderConfig.class)
                 .closer(closer)
                 .build();
-        ComponentHandle<NoConfig> handle = runtime.mount("closer-retry", factory);
+        MountHandle handle = runtime.mount("closer-retry", factory);
         ServiceAssertions.assertActive(handle);
 
         ComponentState failed = handle.disposeAsync()
@@ -472,7 +472,7 @@ final class SpringModuleTest {
         Thread.currentThread().setContextClassLoader(unrelatedLoader);
 
         try {
-            ComponentFactory<NoConfig> factory = SpringModules.noConfig("loader-default")
+            MountFactory factory = SpringModules.noConfig("loader-default")
                     .annotatedClasses(LoaderConfig.class, MultiOutputConfig.class)
                     .customizer(context -> customizerLoader.set(
                             Thread.currentThread().getContextClassLoader()))
@@ -482,7 +482,7 @@ final class SpringModuleTest {
                     })
                     .expose(LOADER_SNAPSHOT)
                     .build();
-            ComponentHandle<NoConfig> handle = runtime.mount("loader-default", factory);
+            MountHandle handle = runtime.mount("loader-default", factory);
             ServiceAssertions.assertActive(handle);
 
             assertEquals(expectedLoader, customizerLoader.get());
@@ -533,13 +533,13 @@ final class SpringModuleTest {
         }
     }
 
-    private static ServiceSnapshot settleActive(ComponentHandle<?> handle) throws Exception {
+    private static ServiceSnapshot settleActive(MountHandle handle) throws Exception {
         ServiceAssertions.assertActive(handle);
         return null;
     }
 
     private static final class ServiceAssertions {
-        private static void assertActive(ComponentHandle<?> handle) throws Exception {
+        private static void assertActive(MountHandle handle) throws Exception {
             ComponentState state = handle.whenSettled()
                     .toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertEquals(ComponentState.ACTIVE, state, () -> handle.componentId());

@@ -1,159 +1,218 @@
 # Knotra 线程模型与生产实践
 
-> 面向生产环境运维与高并发系统开发者，剖析 Knotra 的线程调度、虚拟线程边界、类加载器上下文切换与可观测性接入。
+Knotra 的生命周期协调和业务启动是分离的：协调器维护结构一致性，Activation 的 start、stop 和资源清理在受控执行边界上运行。使用者的核心责任是不阻塞协调边界，并把跨 Activation 资源交给 LifecycleScope。
 
----
+## 执行边界
 
-## 线程模型全景图
+| 边界 | 允许的工作 | 禁止的工作 |
+|---|---|---|
+| 事务回调 | 记录 provide / revoke / mount / dispose 意图 | I/O、等待 settlement、调用 Loader |
+| Activation start | 构建对象、验证配置、申请并登记资源 | 发布未验证输出、长时间无界等待 |
+| Lifecycle cleanup | 关闭连接、取消任务、等待有限清理 | 启动新业务请求、忽略异常 |
+| Dynamic proxy 调用 | 短期方法租约和业务计算 | 长时间占用 lease 做后台任务 |
+| 业务线程 | 调用 capability、await settlement | 直接修改内部 runtime 状态 |
 
-Knotra 基于 Java 21+ 虚拟线程与轻量守护执行器构建，不依赖庞大的全局线程池，也不存在后台定时轮询任务：
+`awaitSettled()`、`requireActive(Duration)` 和测试里的 `get(timeout)` 是阻塞便利入口。它们不改变 settlement 的异步执行模型，只等待已经返回的变更对象。
 
-```mermaid
-graph TD
-    subgraph caller_threads ["宿主调用方线程"]
-        HT["宿主业务线程"] -->|"执行事务准备 (transact)"| TR["校验与发布结构意图"]
-        HT -->|"发起动态调用 (Dynamic Proxy / call)"| DP["穿透执行 Provider 方法"]
-    end
+等待范围分两类：Publication、Registration 和事务返回的操作 settlement 会递归等待本次操作触发的 owned children；`MountHandle.whenSettled()` 只等待该挂载自身的生命周期过渡，父挂载 ACTIVE 不代表它新提交的子挂载都已收敛。
 
-    subgraph knotra_executors ["Knotra 后台执行器"]
-        VT["Core 虚拟线程池<br/>newVirtualThreadPerTaskExecutor"] -->|"执行组件 start 初始化<br/>与 LifecycleScope 清理"| ACT["各组件 Activation"]
-        LC["Loader 守护线程<br/>loader-coordinator"] -->|"单线程串行处理<br/>reconcile 期望树对比"| RE["收敛调度"]
-        PF["PF4J 守护线程<br/>artifact-coordinator"] -->|"单线程串行处理<br/>插件加载与 Drain 排空"| PL["插件状态机"]
-        EB["EventBus 缓存线程池<br/>event-bus-worker"] -->|"分发事件 (Parallel / Serial 等)"| EV["事件监听器 Listener"]
-    end
-```
+## 无界等待
 
-### 各层执行器与并发特性
-
-| 执行场景 | 执行线程类型 | 线程命名规则 | 串行 / 并发规则 |
-|---|---|---|---|
-| **宿主结构事务** (`transact`) | 宿主调用线程 | 调用方线程 | 同步执行，仅负责结构校验与意图准备。 |
-| **动态代理调用** (`call`/`proxy`) | 宿主调用线程 | 调用方线程 | 穿透调用，持有动态租约，无线程切换开销。 |
-| **组件生命周期** (`start`/`close`) | Java 21 虚拟线程 | 未命名虚拟线程 | 同一挂载点的生命周期过渡串行；不同组件可并发。 |
-| **Loader 期望树收敛** | 专属单线程守护执行器 | `loader-<id>-coordinator` | 单个 Loader 实例的收敛动作严格串行。 |
-| **PF4J 插件状态变更** | 专属单线程守护执行器 | `knotra-pf4j-artifact-coordinator` | 插件的 load、drain、unload 状态变更串行。 |
-| **EventBus 事件分发** | 专属缓存线程池 | `event-bus-<N>-worker` | `Parallel` 并发；`Serial`/`Bail`/`Waterfall` 顺序执行。 |
-
----
-
-## 组件生命周期执行边界
-
-- **`start()` 在虚拟线程执行**：网络连接建立、远程配置拉取等慢操作可安全在 `start()` 中执行，不会阻塞协调器锁，也不会卡住宿主事务。
-- **避免 Carrier 线程被 Pin 住**：避免在 `start()` 中长时间持有原生 `synchronized` 块；对于耗时锁竞争，优先使用 `ReentrantLock`。
-- **`ActivationContext` 禁止逃逸**：`ActivationContext` 仅在 `start()` 方法执行期间有效，返回后继续调用将直接报错。
-- **组件外壳必须无状态**：`ComponentFactory.create()` 创建的外壳跨多次 Activation 复用。禁止在成员变量中缓存具体的业务对象、数据库连接或依赖引用。
-
----
-
-## 线程上下文类加载器（TCCL）自动切换
-
-许多 Java 类库（如 SPI `ServiceLoader`、Jackson、Log4j 等）强依赖 `Thread.currentThread().getContextClassLoader()`。当宿主线程调用插件代码时，TCCL 默认仍为宿主类加载器，会导致插件内部资源解析失败。
-
-```mermaid
-sequenceDiagram
-    participant Host as 宿主线程 (AppClassLoader)
-    participant Knotra as Knotra 执行器
-    participant Plugin as 插件/EventBus/Spring (PluginClassLoader)
-
-    Note over Host,Knotra: 进入插件逻辑前
-    Knotra->>Knotra: 暂存原 TCCL = AppClassLoader
-    Knotra->>Knotra: 切换当前 TCCL = PluginClassLoader
-
-    Knotra->>Plugin: 执行组件 start() / 事件回调 / Spring refresh
-    Plugin-->>Knotra: 执行完毕
-
-    Note over Knotra,Host: 退出插件逻辑后
-    Knotra->>Knotra: 恢复 TCCL = AppClassLoader
-```
-
-Knotra 在执行组件 `start()`、EventBus 监听器、Spring 子容器启动及自定义清理钩子时，均会自动将 TCCL 切换为目标组件的类加载器，并在执行结束后恢复原状。
-
----
-
-## 生产环境优雅停机
-
-在应用停机或接收到终止信号时，推荐遵循标准的异步等待流程：
+生产代码不要使用：
 
 ```java
-package com.example.ops;
-
-import io.knotra.KnotraRuntime;
-import io.knotra.loader.KnotraLoader;
-import io.knotra.pf4j.Pf4jArtifactAdapter;
-import java.util.concurrent.TimeUnit;
-
-public class ProductionShutdownManager {
-
-    public static void shutdownGracefully(KnotraLoader loader, Pf4jArtifactAdapter plugins, KnotraRuntime runtime) {
-        try {
-            // 1. 关闭 Loader（停止接收新的期望配置）
-            if (loader != null) {
-                loader.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
-            }
-
-            // 2. 关闭 PF4J 插件适配器（排空在途请求并卸载插件）
-            if (plugins != null) {
-                plugins.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
-            }
-
-            // 3. 关闭 Knotra Runtime（清理核心 Context 与所有残留组件）
-            if (runtime != null) {
-                runtime.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
-            }
-
-            System.out.println("Knotra 运行时已安全退出。");
-        } catch (Exception e) {
-            System.err.println("优雅停机过程中发生异常: " + e.getMessage());
-        }
-    }
-}
+// 反例：没有预算，故障时线程可能永久停留。
+stage.toCompletableFuture().get();
 ```
 
----
-
-## 生产监控指标接入
-
-Knotra 的 `RuntimeSnapshot` 为纯数据结构，可安全集成至 Prometheus 或 Micrometer 监控体系：
+应使用：
 
 ```java
-package com.example.ops;
-
-import io.knotra.ComponentState;
-import io.knotra.KnotraRuntime;
-import io.knotra.RuntimeSnapshot;
-import io.micrometer.core.instrument.Gauge;
-import io.micrometer.core.instrument.MeterRegistry;
-
-public class KnotraMetricsCollector {
-
-    public static void bindMetrics(KnotraRuntime runtime, MeterRegistry registry) {
-        // 统计活跃组件数
-        Gauge.builder("knotra.components.active", () -> {
-            RuntimeSnapshot snapshot = runtime.snapshot();
-            return snapshot.components().stream()
-                    .filter(c -> c.state() == ComponentState.ACTIVE)
-                    .count();
-        }).register(registry);
-
-        // 统计等待中组件数
-        Gauge.builder("knotra.components.waiting", () -> {
-            RuntimeSnapshot snapshot = runtime.snapshot();
-            return snapshot.components().stream()
-                    .filter(c -> c.state() == ComponentState.WAITING)
-                    .count();
-        }).register(registry);
-
-        // 统计失败组件数
-        Gauge.builder("knotra.components.failed", () -> {
-            RuntimeSnapshot snapshot = runtime.snapshot();
-            return snapshot.components().stream()
-                    .filter(c -> c.state() == ComponentState.FAILED)
-                    .count();
-        }).register(registry);
-
-        // 统计诊断告警数
-        Gauge.builder("knotra.diagnostics.count", () -> runtime.snapshot().diagnostics().size())
-                .register(registry);
-    }
-}
+change.awaitSettled(Duration.ofSeconds(10));
 ```
+
+或：
+
+```java
+ComponentState state = handle.whenSettled()
+        .toCompletableFuture()
+        .get(10, TimeUnit.SECONDS);
+```
+
+try-with-resources 调用的 `close()` 同样是无界阻塞。入门示例为了篇幅使用它；生产停机应等待 `closeAsync()` 并施加预算：
+
+```java
+runtime.closeAsync()
+        .toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+```
+
+超时会抛出结构化异常并恢复中断标记。调用方应把它当作真实故障处理，记录诊断并决定重试或降级，不要循环 sleep。
+
+## TCCL 规则
+
+Spring、ServiceLoader、反射代理和序列化框架经常读取线程上下文类加载器（TCCL）。Knotra 集成边界负责在需要的启动和清理阶段安装正确 loader，并在 finally 中恢复原 TCCL。
+
+业务代码遵循：
+
+1. 共享合约放在宿主可见的 contract 模块。
+2. 插件私有类型不进入宿主 API、快照或诊断 DTO。
+3. 不在普通业务线程手工切换 TCCL。
+4. 自定义类加载器集成必须恢复 TCCL。
+5. 线程池中的线程不能捕获插件 loader；提交任务时显式选择宿主 loader 或插件作用域。
+
+需要多 ClassLoader Spring 配置类时显式声明：
+
+```java
+var factory = SpringModules.noConfig("plugin-spring")
+        .annotatedClasses(PluginConfig.class)
+        .classLoader(pluginClassLoader)
+        .expose(PluginOutput.class)
+        .build();
+```
+
+## 动态调用租约
+
+方法级代理适合无状态调用：
+
+```java
+PaymentGateway gateway = context.subscribe(PaymentGateway.class)
+        .proxy(PaymentGateway.class);
+ChargeResult result = gateway.charge(request);
+```
+
+每个方法在调用期间固定一个 provider，方法返回后租约释放。在代理方法里启动后台任务会让任务逃出租约边界，替换语义不再成立。
+
+多个方法必须一致时：
+
+```java
+DynamicCapability<Pricing> pricing = context.subscribe(Pricing.class);
+Quote quote = pricing.call(current -> new Quote(
+        current.price(orderId),
+        current.discount(orderId)));
+```
+
+异步操作使用 `callAsync`；返回的 CompletionStage 完成前租约保持有效，Knotra drain 会等待该 stage 收敛。
+
+## 资源管理
+
+组件和 Bean 不应实现“猜测式 close”。资源创建后立即登记：
+
+```java
+DataSource dataSource = createDataSource(config);
+context.lifecycle().manage("order-datasource", dataSource);
+```
+
+异步资源：
+
+```java
+HttpClient client = HttpClient.create(config);
+context.lifecycle().manageAsync("http-client", client);
+```
+
+清理顺序是 LIFO：
+
+```java
+context.lifecycle().onClose("cache", () -> cache.invalidateAll());
+context.lifecycle().onCloseAsync("worker", worker::shutdown);
+```
+
+后台线程必须支持取消，并在线程内捕获异常。不要使用非守护线程承载无法结束的任务。
+
+## 优雅停机
+
+外层停机流程：
+
+1. LB 或入口层停止接收新请求。
+2. 等待外层业务请求完成，超出预算则记录未完成请求。
+3. 关闭 Loader 与 PF4J adapter，先释放受管子树和 artifact。
+4. 关闭宿主动态桥和挂载。
+5. 关闭 Runtime。
+6. 对 FAILED 清理保留诊断，显式重试。
+
+示例：
+
+```java
+externalServer.stop acceptingRequests();
+externalServer.drain(Duration.ofSeconds(30));
+
+loader.closeAsync()
+        .toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+adapter.closeAsync()
+        .toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+
+runtime.closeAsync()
+        .toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+```
+
+清理失败不要被转换成“关闭成功”。保留 FAILED 状态和诊断是可恢复性的一部分。
+
+## 监控
+
+所有 Runtime snapshot 都通过 Advanced API 读取：
+
+```java
+RuntimeSnapshot snapshot = runtime.advanced().snapshot();
+```
+
+常用指标：
+
+```java
+Gauge.builder("knotra.mounts.active", () ->
+                runtime.advanced().snapshot().mounts().stream()
+                        .filter(mount -> mount.state() == ComponentState.ACTIVE)
+                        .count())
+        .register(registry);
+
+Gauge.builder("knotra.mounts.failed", () ->
+                runtime.advanced().snapshot().mounts().stream()
+                        .filter(mount -> mount.state() == ComponentState.FAILED)
+                        .count())
+        .register(registry);
+
+Gauge.builder("knotra.registrations", () ->
+                runtime.advanced().snapshot().registrations().size())
+        .register(registry);
+
+Gauge.builder("knotra.diagnostics", () ->
+                runtime.advanced().snapshot().diagnostics().size())
+        .register(registry);
+```
+
+建议告警：
+
+- FAILED 挂载数量非零，且持续超过恢复预算。
+- 结构代际长期增长但没有对应发布记录。
+- activation 重启频率异常。
+- artifact drain 或 unload 超时。
+- cleanup failure 反复重试失败。
+
+指标读取线程只持有 snapshot 纯数据，不会引用组件实例或插件 loader。
+
+## 日志
+
+日志应包含：
+
+- mountId / handleId
+- capability name 与类型名
+- contextId
+- generation
+- diagnostic code
+- FailureInfo summary
+
+不要把 `Throwable` 放进长期诊断对象。应用日志可以在异常发生现场打印堆栈，Knotra 诊断保留的是有界稳定摘要。
+
+## 容量与超时建议
+
+| 操作 | 建议预算 |
+|---|---|
+| 本地 Bean 激活 | 5-15 秒 |
+| 连接外部系统 | 外部客户端自身超时，小于 settlement 预算 |
+| 提供方替换收敛 | 按受影响挂载数量评估 |
+| artifact drain | 30-120 秒 |
+| Runtime close | 大于最慢受管清理预算 |
+
+预算应来自配置并可观测。任何等待超时都应有日志、指标和恢复动作。

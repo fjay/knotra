@@ -32,8 +32,8 @@ final class ThirdRoundArchitectureRegressionTest {
 
     @Test
     void childCapabilityTypeConflictFailsParentAndCanCloseRuntime() throws Exception {
-        AtomicReference<ComponentHandle<NoConfig>> first = new AtomicReference<>();
-        AtomicReference<ComponentHandle<NoConfig>> second = new AtomicReference<>();
+        AtomicReference<MountHandle> first = new AtomicReference<>();
+        AtomicReference<MountHandle> second = new AtomicReference<>();
         var parent = TestKit.mount(runtime, runtime.root(), "parent",
                 (context, config) -> {
                     first.set(context.mountChild("first", TestKit.factory("first",
@@ -47,7 +47,7 @@ final class ThirdRoundArchitectureRegressionTest {
                 });
 
         assertEquals(ComponentState.FAILED, TestKit.settle(parent).call());
-        assertTrue(runtime.snapshot().components().stream()
+        assertTrue(runtime.advanced().snapshot().mounts().stream()
                 .noneMatch(component -> component.mountId().equals("first")
                         || component.mountId().equals("second")));
         runtime.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -65,7 +65,7 @@ final class ThirdRoundArchitectureRegressionTest {
 
                 CompletableFuture<TransactionReceipt<RegistrationHandle>> provide =
                         CompletableFuture.supplyAsync(() ->
-                                runtime.transact(mutation ->
+                                runtime.advanced().transact(mutation ->
                                         mutation.provide(runtime.root(), A, "v")),
                                 executor);
                 CompletableFuture<ComponentState> dispose =
@@ -81,7 +81,7 @@ final class ThirdRoundArchitectureRegressionTest {
                 provide.get(10, TimeUnit.SECONDS);
                 assertEquals(ComponentState.DISPOSED, dispose.get(10, TimeUnit.SECONDS));
                 RegistrationHandle registration = provide.join().value();
-                TestKit.assertCommitted(runtime.transact(mutation -> {
+                TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
                     mutation.revoke(registration);
                     return null;
                 }));
@@ -126,7 +126,7 @@ final class ThirdRoundArchitectureRegressionTest {
         assertTrue(events.contains("parallel-good"));
         assertTrue(events.contains("sequential-later"));
         assertTrue(events.contains("root-earlier"));
-        String diagnostic = runtime.snapshot().diagnostics().stream()
+        String diagnostic = runtime.advanced().snapshot().diagnostics().stream()
                 .filter(item -> item.targetId().equals(handle.handleId()))
                 .map(RuntimeDiagnostic::message)
                 .reduce("", (left, right) -> left + right);
@@ -162,7 +162,7 @@ final class ThirdRoundArchitectureRegressionTest {
                 TestKit.component(runtime, consumer).currentActivationId());
         assertEquals("child", observed.get());
 
-        TestKit.assertCommitted(runtime.transact(mutation -> {
+        TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
             mutation.revoke(rootRegistration);
             return null;
         }));
@@ -180,31 +180,31 @@ final class ThirdRoundArchitectureRegressionTest {
                 }));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
 
-        TransactionReceipt<Void> result = runtime.transact(mutation -> {
+        TransactionReceipt<Void> result = runtime.advanced().transact(mutation -> {
             mutation.dispose(child);
             return null;
         });
         TestKit.assertCommitted(result);
         assertTrue(cleanupEntered.await(10, TimeUnit.SECONDS));
-        assertFalse(result.settlement().toCompletableFuture().isDone());
+        assertFalse(result.settlement().whenSettled().toCompletableFuture().isDone());
 
         cleanupGate.complete(null);
-        result.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        result.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ContextState.DISPOSED, child.state());
-        assertTrue(runtime.snapshot().contexts().stream()
+        assertTrue(runtime.advanced().snapshot().contexts().stream()
                 .noneMatch(context -> context.contextId().equals(child.contextId())));
-        assertTrue(runtime.snapshot().components().isEmpty());
+        assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
     }
 
     @Test
     void invalidContextNamesAndCanonicalPathsAreRejected() {
         List<String> names = List.of("a/b", "a\\b", "a\tb", ".", "..");
         for (String name : names) {
-            TestKit.assertRejected(() -> runtime.transact(mutation ->
+            TestKit.assertRejected(() -> runtime.advanced().transact(mutation ->
                     mutation.childContext(runtime.root(), name)),
                     DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
         }
-        assertTrue(runtime.snapshot().contexts().stream()
+        assertTrue(runtime.advanced().snapshot().contexts().stream()
                 .allMatch(context -> context.contextId().equals("ctx-root")));
     }
 
@@ -214,18 +214,18 @@ final class ThirdRoundArchitectureRegressionTest {
         ContextHandle child = TestKit.child(runtime, parent, "child");
         TestKit.provide(runtime, child, A, "child-value");
 
-        TransactionReceipt<Void> result = runtime.transact(mutation -> {
+        TransactionReceipt<Void> result = runtime.advanced().transact(mutation -> {
             mutation.dispose(child);
             mutation.dispose(child);
             mutation.dispose(parent);
             return null;
         });
         TestKit.assertCommitted(result);
-        result.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        result.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
         assertEquals(ContextState.DISPOSED, parent.state());
         assertEquals(ContextState.DISPOSED, child.state());
-        assertTrue(runtime.snapshot().contexts().stream().noneMatch(context ->
+        assertTrue(runtime.advanced().snapshot().contexts().stream().noneMatch(context ->
                 context.contextId().equals(parent.contextId())
                         || context.contextId().equals(child.contextId())));
     }
@@ -254,7 +254,7 @@ final class ThirdRoundArchitectureRegressionTest {
             }
         };
 
-        var result = runtime.transact(mutation -> {
+        var result = runtime.advanced().transact(mutation -> {
             var handle = mutation.mount(runtime.root(), "configured", factory, " one ");
             mutation.reconfigure(handle, " two ");
             mutation.reconfigure(handle, " three ");
@@ -266,5 +266,50 @@ final class ThirdRoundArchitectureRegressionTest {
         assertEquals(3, validations.get());
         assertEquals(3, result.value().configRevision());
         assertEquals(List.of("three"), configs);
+    }
+
+    @Test
+    void replacementDuringBlockedCleanupAggregatesIntoExistingTransition() throws Exception {
+        CountDownLatch cleanupEntered = new CountDownLatch(1);
+        CompletableFuture<Void> cleanupGate = new CompletableFuture<>();
+        AtomicInteger starts = new AtomicInteger();
+
+        TransactionReceipt<RegistrationHandle> first = runtime.advanced().transact(mutation ->
+                mutation.provide(runtime.root(), A, "one"));
+        first.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+
+        MountHandle consumer = TestKit.mount(
+                runtime,
+                runtime.root(),
+                "pinned-consumer",
+                (context, config) -> {
+                    starts.incrementAndGet();
+                    context.lifecycle().onCloseAsync("cleanup", () -> {
+                        cleanupEntered.countDown();
+                        return cleanupGate;
+                    });
+                },
+                CapabilityRequirement.required(A));
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
+
+        TransactionReceipt<Void> revoke = runtime.advanced().transact(mutation -> {
+            mutation.revoke(first.value());
+            return null;
+        });
+        assertTrue(cleanupEntered.await(10, TimeUnit.SECONDS));
+        assertFalse(revoke.settlement().whenSettled().toCompletableFuture().isDone());
+
+        TransactionReceipt<RegistrationHandle> replacement =
+                runtime.advanced().transact(mutation ->
+                        mutation.provide(runtime.root(), A, "two"));
+        assertFalse(replacement.settlement().whenSettled().toCompletableFuture().isDone(),
+                "replacement must merge into the consumer cleanup transition");
+
+        cleanupGate.complete(null);
+        SettlementReport replacementReport = replacement.settlement()
+                .whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        assertEquals(ComponentState.ACTIVE, replacementReport.outcome(consumer.handleId())
+                .map(SettlementReport.MountOutcome::state).orElseThrow());
+        assertEquals(2, starts.get());
     }
 }

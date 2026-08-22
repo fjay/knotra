@@ -664,21 +664,23 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             String generatedSimpleName) {
         TypeElement type = model.type();
         String beanName = type.getQualifiedName().toString();
-        String configName = qualifiedTypeName(model.configType());
+        boolean configured = !isNoConfig(model.configType());
+        String configName = configured ? qualifiedTypeName(model.configType()) : null;
+        String beanTypeName = qualifiedTypeName(type.asType());
         StringBuilder source = new StringBuilder();
         if (!packageName.isEmpty()) {
             source.append("package ").append(packageName).append(";\n\n");
         }
         source.append("import io.knotra.CapabilityKey;\n");
-        source.append("import io.knotra.Component;\n");
-        source.append("import io.knotra.ComponentFactory;\n");
         source.append("import io.knotra.beans.BeanDefinition;\n");
         source.append("import io.knotra.beans.BeanDependency;\n");
-        source.append("import io.knotra.beans.Beans;\n\n");
-        source.append("import java.util.List;\n\n");
+        source.append("import io.knotra.beans.Beans;\n");
+        if (configured) {
+            source.append("import io.knotra.beans.ConfiguredBeanDefinition;\n");
+        }
+        source.append("\nimport java.util.List;\n\n");
         source.append("@SuppressWarnings(\"unchecked\")\n");
-        source.append("public final class ").append(generatedSimpleName)
-                .append(" implements ComponentFactory<").append(configName).append("> {\n\n");
+        source.append("public final class ").append(generatedSimpleName).append(" {\n\n");
 
         int dependencyIndex = 0;
         for (ParameterInfo parameter : model.parameters()) {
@@ -724,33 +726,44 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
                     source.append(",\n");
                 }
                 first = false;
-                int index = dependencyIndex(parameter, model.parameters());
                 source.append("            Beans.");
                 if (parameter.kind() == ParameterKind.REQUIRED) {
                     source.append("required");
                 } else if (parameter.kind() == ParameterKind.OPTIONAL) {
                     source.append("optional");
                 } else if (parameter.required()) {
-                    source.append("dynamicProxyRequired");
+                    source.append("dynamic");
                 } else {
-                    source.append("dynamicProxyOptional");
+                    source.append("dynamicOptional");
                 }
-                source.append("(KEY_").append(index).append(')');
+                source.append("(KEY_").append(dependencyIndex(parameter, model.parameters())).append(')');
             }
             source.append(");\n");
         }
 
-        source.append("\n    private final BeanDefinition<")
-                .append(configName).append(", ").append(qualifiedTypeName(type.asType()))
-                .append("> definition;\n\n");
+        source.append("\n    private final ");
+        if (configured) {
+            source.append("ConfiguredBeanDefinition<")
+                    .append(configName).append(", ").append(beanTypeName).append(">");
+        } else {
+            source.append("BeanDefinition<").append(beanTypeName).append(">");
+        }
+        source.append(" definition;\n\n");
         source.append("    public ").append(generatedSimpleName).append("() {\n");
-        source.append("        this.definition = BeanDefinition.expert(\n");
-        source.append("                ").append(stringLiteral(model.id())).append(",\n");
-        source.append("                ").append(generatedSimpleName)
-                .append(".<").append(configName).append(">contractClass(")
-                .append(erasedClassLiteral(model.configType())).append("),\n");
-        source.append("                DEPENDENCIES,\n");
-        source.append("                (context, config) -> new ").append(beanName).append("(\n");
+        source.append("        this.definition = ");
+        if (configured) {
+            source.append("Beans.expert(\n");
+            source.append("                ").append(stringLiteral(model.id())).append(",\n");
+            source.append("                ").append(configName).append(".class,\n");
+            source.append("                DEPENDENCIES,\n");
+            source.append("                (context, config) -> new ").append(beanName).append("(\n");
+        } else {
+            source.append("Beans.expert(\n");
+            source.append("                ").append(stringLiteral(model.id())).append(",\n");
+            source.append("                DEPENDENCIES,\n");
+            source.append("                context -> new ").append(beanName).append("(\n");
+        }
+
         boolean first = true;
         int dependencyIndexForArgs = 0;
         for (ParameterInfo parameter : model.parameters()) {
@@ -802,20 +815,16 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         }
         source.append("                .build();\n");
         source.append("    }\n\n");
-        source.append("    public BeanDefinition<")
-                .append(configName).append(", ").append(qualifiedTypeName(type.asType()))
-                .append("> definition() {\n        return definition;\n    }\n\n");
-        source.append("    @Override\n    public String factoryId() {\n")
+        source.append("    public ");
+        if (configured) {
+            source.append("ConfiguredBeanDefinition<")
+                    .append(configName).append(", ").append(beanTypeName).append(">");
+        } else {
+            source.append("BeanDefinition<").append(beanTypeName).append(">");
+        }
+        source.append(" definition() {\n        return definition;\n    }\n\n");
+        source.append("    public String factoryId() {\n")
                 .append("        return definition.factoryId();\n    }\n\n");
-        source.append("    @Override\n    public Component<")
-                .append(configName)
-                .append("> create() {\n        return definition.create();\n    }\n\n");
-        source.append("    @Override\n    public ")
-                .append(configName)
-                .append(" normalizeConfig(")
-                .append(configName)
-                .append(" config) throws Exception {\n")
-                .append("        return definition.normalizeConfig(config);\n    }\n\n");
         source.append("    private static <T> Class<T> contractClass(Class<?> actual) {\n")
                 .append("        return (Class<T>) actual;\n    }\n");
         source.append("}\n");

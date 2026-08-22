@@ -1,12 +1,14 @@
 package io.knotra.internal;
 
+import io.knotra.FailureInfo;
+
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 
 
 /**
- * 单个稳定 ComponentHandle 的可执行运行时记录。
+ * 单个稳定 MountHandle 的可执行运行时记录。
  *
  * <p>一个实例只服务一个挂载点，保存期望配置、当前/待重试清理的 {@link ActivationRuntime}，
  * 以及收敛控制字段。状态迁移由 {@link DefaultKnotraRuntime#driveTransition} 驱动；
@@ -32,11 +34,12 @@ final class ComponentRuntime {
     volatile boolean blockedNonConvergent;
     volatile String lastStartError = "";
     volatile String lastCleanupError = "";
-    // 收敛指纹只包含目标、配置代际和注册身份；值相等不触发重新激活。
+    volatile FailureInfo lastStartFailure = FailureInfo.EMPTY;
+    volatile FailureInfo lastCleanupFailure = FailureInfo.EMPTY;
     volatile String reconcileFingerprint = "";
     volatile int reconcileAttempts;
 
-    // 过渡链表锁：同一 ComponentHandle 的并发 whenSettled/dispose/retry 共享一个 Future。
+    // 过渡链表锁：同一 MountHandle 的并发 whenSettled/dispose/retry 共享一个 Future。
     private final Object chainLock = new Object();
     private final AtomicReference<CompletableFuture<io.knotra.ComponentState>> transition =
             new AtomicReference<>();

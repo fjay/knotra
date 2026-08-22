@@ -141,8 +141,8 @@ public final class SpringModuleBuilder<C> {
                 SpringDependency.Binding.REQUIRED));
     }
 
-    public <T> SpringModuleBuilder<C> pinned(String beanName, CapabilityKey<T> key) {
-        return required(beanName, key);
+    public <T> SpringModuleBuilder<C> required(String beanName, Class<T> type) {
+        return required(beanName, CapabilityKey.of(type));
     }
 
     /**
@@ -155,6 +155,10 @@ public final class SpringModuleBuilder<C> {
     public <T> SpringModuleBuilder<C> optional(String beanName, CapabilityKey<T> key) {
         return dependency(new SpringDependency<>(
                 key, beanName, SpringDependency.Binding.OPTIONAL_VALUE));
+    }
+
+    public <T> SpringModuleBuilder<C> optional(String beanName, Class<T> type) {
+        return optional(beanName, CapabilityKey.of(type));
     }
 
     /**
@@ -172,63 +176,83 @@ public final class SpringModuleBuilder<C> {
                 key, beanName, SpringDependency.Binding.OPTIONAL_OPTIONAL));
     }
 
+    public <T> SpringModuleBuilder<C> optionalAsOptional(String beanName, Class<T> type) {
+        return optionalAsOptional(beanName, CapabilityKey.of(type));
+    }
+
+    /**
+     * Registers a required dynamic dependency as a {@code T} method-lease proxy.
+     *
+     * <p>The capability must be an interface. Every method invocation selects the current
+     * provider and holds its lease only for that method call.
+     */
+    public <T> SpringModuleBuilder<C> dynamic(
+            String beanName,
+            CapabilityKey<T> key) {
+        requireProxyInterface(key);
+        return dependency(new SpringDependency<>(
+                key, beanName, SpringDependency.Binding.DYNAMIC_REQUIRED));
+    }
+
+    public <T> SpringModuleBuilder<C> dynamic(String beanName, Class<T> type) {
+        return dynamic(beanName, CapabilityKey.of(type));
+    }
+
+    /**
+     * Registers an optional dynamic dependency as a {@code T} method-lease proxy.
+     *
+     * <p>The capability must be an interface. The proxy bean is always registered; method calls
+     * fail while no provider is present.
+     */
+    public <T> SpringModuleBuilder<C> dynamicOptional(
+            String beanName,
+            CapabilityKey<T> key) {
+        requireProxyInterface(key);
+        return dependency(new SpringDependency<>(
+                key, beanName, SpringDependency.Binding.DYNAMIC_OPTIONAL));
+    }
+
+    public <T> SpringModuleBuilder<C> dynamicOptional(String beanName, Class<T> type) {
+        return dynamicOptional(beanName, CapabilityKey.of(type));
+    }
+
     /**
      * Registers a required dynamic dependency as {@code DynamicCapability<T>}.
      *
-     * <p>The capability holder is stable while providers are replaced. Use it when application
-     * code needs to pin one provider explicitly for {@code call} or {@code callAsync}. Inject it
-     * by the declared bean name or through a qualifier; multiple dynamic dependencies can use
-     * the same erased {@code DynamicCapability} type.
+     * <p>Use this advanced form when application code must pin one provider explicitly for
+     * {@code call} or {@code callAsync}. Inject it by bean name or qualifier because all such
+     * beans share the erased {@code DynamicCapability} type.
      */
-    public <T> SpringModuleBuilder<C> dynamicRequired(
+    public <T> SpringModuleBuilder<C> dynamicCapability(
             String beanName,
             CapabilityKey<T> key) {
         return dependency(new SpringDependency<>(
                 key, beanName, SpringDependency.Binding.DYNAMIC_CAPABILITY_REQUIRED));
     }
 
+    public <T> SpringModuleBuilder<C> dynamicCapability(
+            String beanName,
+            Class<T> type) {
+        return dynamicCapability(beanName, CapabilityKey.of(type));
+    }
+
     /**
      * Registers an optional dynamic dependency as {@code DynamicCapability<T>}.
      *
      * <p>The bean is always registered; its capability may be unavailable while no provider is
-     * present. Inject it by the declared bean name or through a qualifier because multiple dynamic
-     * dependencies can use the same erased {@code DynamicCapability} type.
+     * present.
      */
-    public <T> SpringModuleBuilder<C> dynamicOptional(
+    public <T> SpringModuleBuilder<C> dynamicCapabilityOptional(
             String beanName,
             CapabilityKey<T> key) {
         return dependency(new SpringDependency<>(
                 key, beanName, SpringDependency.Binding.DYNAMIC_CAPABILITY_OPTIONAL));
     }
 
-    /**
-     * Registers a required dynamic dependency as a {@code T} method-lease proxy.
-     *
-     * <p>Every interface method invocation may target the current provider and holds that
-     * provider only for the duration of the method call. This is convenient for independent
-     * calls, but is not a substitute for pinning a provider across multiple calls.
-     */
-    public <T> SpringModuleBuilder<C> dynamicProxyRequired(
+    public <T> SpringModuleBuilder<C> dynamicCapabilityOptional(
             String beanName,
-            CapabilityKey<T> key) {
-        requireProxyInterface(key);
-        return dependency(new SpringDependency<>(
-                key, beanName, SpringDependency.Binding.DYNAMIC_PROXY_REQUIRED));
-    }
-
-    /**
-     * Registers an optional dynamic dependency as a {@code T} method-lease proxy.
-     *
-     * <p>The proxy bean is always registered; method calls fail while no provider is present.
-     * Every interface method invocation may target the current provider and holds that provider
-     * only for the duration of the method call.
-     */
-    public <T> SpringModuleBuilder<C> dynamicProxyOptional(
-            String beanName,
-            CapabilityKey<T> key) {
-        requireProxyInterface(key);
-        return dependency(new SpringDependency<>(
-                key, beanName, SpringDependency.Binding.DYNAMIC_PROXY_OPTIONAL));
+            Class<T> type) {
+        return dynamicCapabilityOptional(beanName, CapabilityKey.of(type));
     }
 
     /**
@@ -246,6 +270,14 @@ public final class SpringModuleBuilder<C> {
     /** Resolves the output by a stable Spring bean name and checks it against the capability type. */
     public <T> SpringModuleBuilder<C> expose(CapabilityKey<T> key, String beanName) {
         return output(SpringOutput.byName(key, beanName));
+    }
+
+    public <T> SpringModuleBuilder<C> expose(Class<T> type) {
+        return expose(CapabilityKey.of(type));
+    }
+
+    public <T> SpringModuleBuilder<C> expose(Class<T> type, String beanName) {
+        return expose(CapabilityKey.of(type), beanName);
     }
 
     public ComponentFactory<C> build() {

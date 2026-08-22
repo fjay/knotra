@@ -8,7 +8,7 @@ import java.util.Objects;
  * <p>同一个 {@link FactoryRef} 在不同时刻可能解析到不同实现（classpath 工厂
  * 实例被替换、artifact 升级等）。Loader 用身份而不是引用判断收敛方式：
  * 身份变化必须先完整释放旧挂载、再挂载新实现；身份不变时配置变化走
- * 重配置路径，复用既有 ComponentHandle。
+ * 重配置路径，复用既有 MountHandle。
  *
  * @param factoryId 工厂 ID
  * @param version 版本；null 折算为空字符串

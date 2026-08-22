@@ -25,14 +25,14 @@ final class ActivationTransactionTest {
         runtime.close();
     }
 
-    private ComponentHandle<NoConfig> mount(
+    private MountHandle mount(
             String mountId,
             TestKit.Start<NoConfig> start,
             CapabilityRequirement... requirements) {
         return TestKit.mount(runtime, runtime.root(), mountId, mountId, start, requirements);
     }
 
-    private static Optional<String> currentActivation(KnotraRuntime runtime, ComponentHandle<?> handle) {
+    private static Optional<String> currentActivation(KnotraRuntime runtime, MountHandle handle) {
         return Optional.ofNullable(TestKit.component(runtime, handle).currentActivationId());
     }
 
@@ -43,7 +43,7 @@ final class ActivationTransactionTest {
                 CapabilityRequirement.required(TEXT));
         assertEquals(ComponentState.WAITING, handle.whenSettled().toCompletableFuture().get(1, TimeUnit.SECONDS));
         assertEquals(0, starts.get());
-        assertTrue(runtime.snapshot().diagnostics().stream()
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream()
                 .anyMatch(diagnostic -> diagnostic.code() == DiagnosticCode.MISSING_CAPABILITY));
     }
 
@@ -71,14 +71,14 @@ final class ActivationTransactionTest {
         });
         assertTrue(started.await(10, TimeUnit.SECONDS));
         try {
-            long before = runtime.snapshot().generation();
+            long before = runtime.advanced().snapshot().generation();
             assertEquals(ComponentState.STARTING, handle.state());
-            assertTrue(runtime.snapshot().registrations().isEmpty());
+            assertTrue(runtime.advanced().snapshot().registrations().isEmpty());
         } finally {
             gate.complete(null);
         }
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        RuntimeSnapshot snapshot = runtime.snapshot();
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         assertEquals(2, snapshot.registrations().size());
         assertEquals(ComponentState.ACTIVE, TestKit.component(runtime, handle).state());
     }
@@ -94,8 +94,8 @@ final class ActivationTransactionTest {
         assertEquals(ComponentState.FAILED, TestKit.settle(handle).call());
         assertEquals(1, closed.get());
         assertTrue(runtime.root().view().find(TEXT).isEmpty());
-        assertTrue(runtime.snapshot().registrations().isEmpty());
-        assertTrue(runtime.snapshot().diagnostics().stream()
+        assertTrue(runtime.advanced().snapshot().registrations().isEmpty());
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream()
                 .anyMatch(diagnostic -> diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED));
     }
 
@@ -118,7 +118,7 @@ final class ActivationTransactionTest {
                 observed.set(context.find(TEXT)), CapabilityRequirement.optional(TEXT));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(Optional.empty(), observed.get());
-        var binding = runtime.snapshot().activations().getFirst().bindings().getFirst();
+        var binding = runtime.advanced().snapshot().activations().getFirst().bindings().getFirst();
         assertFalse(binding.present());
         assertEquals(CapabilityRequirement.Mode.OPTIONAL, binding.mode());
 
@@ -127,7 +127,7 @@ final class ActivationTransactionTest {
         assertEquals(Optional.of("one"), observed.get());
         String first = TestKit.component(runtime, handle).currentActivationId();
 
-        TestKit.assertCommitted(runtime.transact(mutation -> {
+        TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
             mutation.revoke(registration);
             return null;
         }));
@@ -144,7 +144,7 @@ final class ActivationTransactionTest {
         var first = TestKit.provide(runtime, runtime.root(), TEXT, "same");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         String firstActivation = TestKit.component(runtime, handle).currentActivationId();
-        TestKit.assertCommitted(runtime.transact(mutation -> {
+        TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
             mutation.revoke(first);
             return null;
         }));
@@ -167,17 +167,17 @@ final class ActivationTransactionTest {
         }, CapabilityRequirement.required(TEXT));
         var first = TestKit.provide(runtime, runtime.root(), TEXT, "one");
         assertTrue(started.await(10, TimeUnit.SECONDS));
-        TestKit.assertCommitted(runtime.transact(mutation -> {
+        TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
             mutation.revoke(first);
             return null;
         }));
         gate.complete(null);
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call(),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
         TestKit.provide(runtime, runtime.root(), TEXT, "two");
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("two", observed.get());
-        assertTrue(runtime.snapshot().diagnostics().stream().noneMatch(diagnostic ->
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().noneMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.targetId().equals(handle.handleId())));
     }
@@ -208,7 +208,7 @@ final class ActivationTransactionTest {
         Component<Object> component = new TestKit.Scripted<>(
                 ComponentDescriptor.named("configured"), (context, config) -> configs.add(config));
         ComponentFactory<Object> typedFactory = TestKit.factory("configured", component);
-        var handle = runtime.transact(mutation -> mutation.mount(
+        var handle = runtime.advanced().transact(mutation -> mutation.mount(
                 runtime.root(), "configured", typedFactory, new Object())).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         String first = TestKit.component(runtime, handle).currentActivationId();
@@ -224,7 +224,7 @@ final class ActivationTransactionTest {
     void childMountIsStagedUntilParentCommit() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CompletableFuture<Void> gate = new CompletableFuture<>();
-        AtomicReference<ComponentHandle<NoConfig>> child = new AtomicReference<>();
+        AtomicReference<MountHandle> child = new AtomicReference<>();
         var parent = mount("parent", (context, config) -> {
             child.set(context.mountChild("child",
                     TestKit.factory("child", new TestKit.Scripted<>(
@@ -234,7 +234,7 @@ final class ActivationTransactionTest {
             gate.get();
         });
         assertTrue(started.await(10, TimeUnit.SECONDS));
-        assertTrue(runtime.snapshot().components().stream()
+        assertTrue(runtime.advanced().snapshot().mounts().stream()
                 .noneMatch(component -> component.mountId().equals("child")));
         gate.complete(null);
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call());
@@ -245,9 +245,9 @@ final class ActivationTransactionTest {
 
     @Test
     void parentFailureTerminatesStagedChildAndReusesMountIdOnRetry() throws Exception {
-        AtomicReference<ComponentHandle<NoConfig>> firstChild = new AtomicReference<>();
+        AtomicReference<MountHandle> firstChild = new AtomicReference<>();
         AtomicInteger attempts = new AtomicInteger();
-        AtomicReference<ComponentHandle<NoConfig>> secondChild = new AtomicReference<>();
+        AtomicReference<MountHandle> secondChild = new AtomicReference<>();
         var parent = mount("parent", (context, config) -> {
             ComponentFactory<NoConfig> childFactory = TestKit.factory("child", new TestKit.Scripted<>(
                     ComponentDescriptor.named("child"), (childContext, childConfig) -> {}));
@@ -259,7 +259,7 @@ final class ActivationTransactionTest {
         });
         assertEquals(ComponentState.FAILED, TestKit.settle(parent).call());
         assertEquals(ComponentState.DISPOSED, firstChild.get().state());
-        assertTrue(runtime.snapshot().components().stream()
+        assertTrue(runtime.advanced().snapshot().mounts().stream()
                 .noneMatch(component -> component.mountId().equals("child")));
         assertEquals(ComponentState.ACTIVE, parent.retryAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(secondChild.get()).call());
@@ -291,7 +291,7 @@ final class ActivationTransactionTest {
                     });
                 });
         ComponentFactory<Config> typedFactory = TestKit.factory("configured", component);
-        var handle = runtime.transact(mutation -> mutation.mount(
+        var handle = runtime.advanced().transact(mutation -> mutation.mount(
                 runtime.root(), "configured", typedFactory, new Config("one"))).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(ComponentState.FAILED, handle.reconfigureAsync(new Config("two"))

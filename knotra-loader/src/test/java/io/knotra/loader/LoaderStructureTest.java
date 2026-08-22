@@ -9,6 +9,7 @@ import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import io.knotra.ComponentFactory;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.KnotraRuntime;
@@ -58,7 +59,7 @@ final class LoaderStructureTest {
                     LoaderTestKit.entry("/alpha/", ref, NoConfig.INSTANCE)));
             LoaderTestKit.assertRejected(result, LoaderDiagnosticCode.INVALID_TREE);
             assertTrue(loader.snapshot().entries().isEmpty());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         } finally {
             loader.close();
         }
@@ -67,7 +68,7 @@ final class LoaderStructureTest {
     @Test
     void sameFactoryCanBeMountedAtMultiplePaths() throws Exception {
         FactoryRef ref = FactoryRef.of("shared");
-        var factory = LoaderTestKit.factory("shared", (context, config) -> {});
+        ComponentFactory<NoConfig> factory = LoaderTestKit.factory("shared", (context, config) -> {});
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, factory));
         try {
@@ -94,8 +95,8 @@ final class LoaderStructureTest {
                     LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE))));
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.empty()));
             assertTrue(loader.snapshot().entries().isEmpty());
-            assertTrue(runtime.snapshot().components().isEmpty());
-            assertTrue(runtime.snapshot().contexts().stream()
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
+            assertTrue(runtime.advanced().snapshot().contexts().stream()
                     .noneMatch(context -> context.name().equals("alpha")));
         } finally {
             loader.close();
@@ -132,7 +133,7 @@ final class LoaderStructureTest {
             var result = loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("alpha/child", ref, NoConfig.INSTANCE)));
             LoaderTestKit.assertRejected(result, LoaderDiagnosticCode.INVALID_TREE);
-            assertTrue(runtime.snapshot().contexts().size() == 1);
+            assertTrue(runtime.advanced().snapshot().contexts().size() == 1);
         } finally {
             loader.close();
         }
@@ -141,7 +142,7 @@ final class LoaderStructureTest {
     @Test
     void foreignContextAtDesiredPathIsNotClaimed() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
-        TransactionReceipt<ContextHandle> foreign = runtime.transact(mutation ->
+        TransactionReceipt<ContextHandle> foreign = runtime.advanced().transact(mutation ->
                 mutation.childContext(runtime.root(), "alpha"));
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, LoaderTestKit.factory("alpha", (context, config) -> {})));
@@ -149,7 +150,7 @@ final class LoaderStructureTest {
             var result = loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE)));
             LoaderTestKit.assertRejected(result, LoaderDiagnosticCode.CONTEXT_CONFLICT);
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertTrue(loader.snapshot().entries().isEmpty());
         } finally {
             loader.close();
@@ -164,11 +165,11 @@ final class LoaderStructureTest {
         LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
                 LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE))));
         assertEquals(1, loader.snapshot().entries().size());
-        assertEquals(1, runtime.snapshot().components().size());
+        assertEquals(1, runtime.advanced().snapshot().mounts().size());
         assertEquals(ComponentState.ACTIVE, loader.snapshot().entry("alpha").orElseThrow().state());
         loader.close();
-        assertTrue(runtime.snapshot().components().isEmpty());
-        assertTrue(runtime.snapshot().contexts().stream()
+        assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
+        assertTrue(runtime.advanced().snapshot().contexts().stream()
                 .noneMatch(context -> context.contextId().equals(loader.baseContext().contextId())));
         assertEquals(io.knotra.ContextState.ACTIVE, runtime.root().state());
     }
@@ -181,7 +182,7 @@ final class LoaderStructureTest {
         LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
                 LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE))));
         loader.close();
-        assertTrue(runtime.snapshot().components().isEmpty());
+        assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         assertEquals(io.knotra.ContextState.ACTIVE, runtime.root().state());
     }
 

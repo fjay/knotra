@@ -5,14 +5,14 @@ import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
+import io.knotra.MountFactory;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.AsyncDynamicOperation;
 import io.knotra.DynamicCapability;
 import io.knotra.DynamicOperation;
 import io.knotra.KnotraRuntime;
+import io.knotra.MountHandle;
 import io.knotra.NoConfig;
 
 import java.util.Objects;
@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class SpringDynamicBridge<T> implements AutoCloseable {
 
     private final ContextHandle context;
-    private final ComponentHandle<NoConfig> handle;
+    private final MountHandle handle;
     private final CapabilityKey<BridgeAccess> accessKey;
     private final DynamicCapability<T> capability;
     private final T proxy;
@@ -45,7 +45,7 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
 
     private SpringDynamicBridge(
             ContextHandle context,
-            ComponentHandle<NoConfig> handle,
+            MountHandle handle,
             CapabilityKey<BridgeAccess> accessKey,
             DynamicCapability<T> capability,
             T proxy) {
@@ -86,9 +86,9 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
         CapabilityKey<BridgeAccess> accessKey = CapabilityKey.of(
                 "knotra.spring.bridge.access:" + safeMountId,
                 BridgeAccess.class);
-        ComponentFactory<NoConfig> factory = new BridgeFactory<>(
+        MountFactory factory = new BridgeFactory<>(
                 componentId, sourceKey, bridgeKey, accessKey);
-        ComponentHandle<NoConfig> handle = runtime.transact(transaction ->
+        MountHandle handle = runtime.advanced().transact(transaction ->
                 transaction.mount(context, safeMountId, factory)).value();
 
         try {
@@ -110,7 +110,7 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
     }
 
     private static RuntimeException startupFailed(
-            ComponentHandle<NoConfig> handle,
+            MountHandle handle,
             Exception error) {
         try {
             ComponentState state = handle.disposeAsync()
@@ -248,7 +248,7 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
             String componentId,
             CapabilityKey<T> sourceKey,
             CapabilityKey<T> bridgeKey,
-            CapabilityKey<BridgeAccess> accessKey) implements ComponentFactory<NoConfig> {
+            CapabilityKey<BridgeAccess> accessKey) implements MountFactory {
 
         @Override
         public String factoryId() {

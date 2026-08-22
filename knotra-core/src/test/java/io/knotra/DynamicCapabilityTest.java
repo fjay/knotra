@@ -83,7 +83,7 @@ final class DynamicCapabilityTest {
         var component = TestKit.component(runtime, handle);
         assertEquals(CapabilityRequirement.CapabilityBinding.DYNAMIC,
                 component.requirements().getFirst().binding());
-        var binding = runtime.snapshot().activations().getFirst().bindings().getFirst();
+        var binding = runtime.advanced().snapshot().activations().getFirst().bindings().getFirst();
         assertNull(binding.registrationId());
         assertFalse(binding.present());
         assertEquals(CapabilityRequirement.CapabilityBinding.DYNAMIC, binding.binding());
@@ -102,11 +102,11 @@ final class DynamicCapabilityTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertSame(runtime.root().view().require(API), captured.get());
 
-        runtime.transact(transaction -> {
+        runtime.advanced().transact(transaction -> {
             transaction.revoke(first);
             transaction.provide(runtime.root(), API, new ApiValue("v2"));
             return null;
-        }).settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }).settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
 
         assertEquals(2, starts.get());
@@ -130,7 +130,7 @@ final class DynamicCapabilityTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("v1", dynamic.get().call(Api::value));
 
-        runtime.revoke(first);
+        runtime.advanced().revoke(first);
         assertEquals(ComponentState.ACTIVE,
                 handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertFalse(dynamic.get().available());
@@ -149,7 +149,7 @@ final class DynamicCapabilityTest {
         CountDownLatch entered = new CountDownLatch(1);
         CompletableFuture<Void> release = new CompletableFuture<>();
         AtomicReference<DynamicCapability<Api>> dynamic = new AtomicReference<>();
-        ComponentHandle<NoConfig> handle = TestKit.mount(
+        MountHandle handle = TestKit.mount(
                 runtime,
                 runtime.root(),
                 "starting-dynamic-required",
@@ -162,13 +162,13 @@ final class DynamicCapabilityTest {
                 CapabilityRequirement.dynamicRequired(API));
 
         assertTrue(entered.await(10, TimeUnit.SECONDS));
-        runtime.revoke(registration);
+        runtime.advanced().revoke(registration);
         release.complete(null);
 
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call());
         assertThrows(DynamicCapabilityClosedException.class,
                 () -> dynamic.get().call(Api::value));
-        assertTrue(runtime.snapshot().diagnostics().stream().noneMatch(diagnostic ->
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().noneMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.targetId().equals(handle.handleId())));
     }
@@ -190,17 +190,17 @@ final class DynamicCapabilityTest {
                     return first + "|" + api.value();
                 }));
         assertTrue(entered.await(10, TimeUnit.SECONDS));
-        TransactionReceipt<Void> receipt = runtime.transact(transaction -> {
+        TransactionReceipt<Void> receipt = runtime.advanced().transact(transaction -> {
             transaction.revoke(old);
             transaction.provide(runtime.root(), API, new ApiValue("v2"));
             return null;
         });
-        assertFalse(receipt.settlement().toCompletableFuture().isDone());
+        assertFalse(receipt.settlement().whenSettled().toCompletableFuture().isDone());
         assertEquals("v2", dynamic.get().call(Api::value));
 
         release.complete(null);
         assertEquals("v1|v1", call.get(10, TimeUnit.SECONDS));
-        receipt.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        receipt.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals("v2", dynamic.get().call(Api::value));
     }
 
@@ -231,16 +231,16 @@ final class DynamicCapabilityTest {
 
         CompletableFuture<String> stage = new CompletableFuture<>();
         CompletionStage<String> result = dynamic.get().callAsync(api -> stage);
-        TransactionReceipt<Void> receipt = runtime.transact(transaction -> {
+        TransactionReceipt<Void> receipt = runtime.advanced().transact(transaction -> {
             transaction.revoke(registration);
             return null;
         });
         assertFalse(result.toCompletableFuture().isDone());
-        assertFalse(receipt.settlement().toCompletableFuture().isDone());
+        assertFalse(receipt.settlement().whenSettled().toCompletableFuture().isDone());
 
         stage.complete("done");
         assertEquals("done", result.toCompletableFuture().get(10, TimeUnit.SECONDS));
-        receipt.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        receipt.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
     @Test
@@ -263,18 +263,18 @@ final class DynamicCapabilityTest {
                 () -> result.toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertInstanceOf(UnsupportedOperationException.class, failure.getCause());
 
-        TransactionReceipt<Void> receipt = runtime.transact(transaction -> {
+        TransactionReceipt<Void> receipt = runtime.advanced().transact(transaction -> {
             transaction.revoke(registration);
             return null;
         });
-        receipt.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        receipt.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
     @Test
     void dynamicEdgesParticipateInCycleDetection() throws Exception {
         CapabilityKey<String> a = CapabilityKey.of("dynamic-cycle-a", String.class);
         CapabilityKey<String> b = CapabilityKey.of("dynamic-cycle-b", String.class);
-        ComponentHandle<NoConfig> first = TestKit.mount(
+        MountHandle first = TestKit.mount(
                 runtime,
                 runtime.root(),
                 "dynamic-cycle-first",
@@ -286,7 +286,7 @@ final class DynamicCapabilityTest {
                 CapabilityRequirement.dynamicOptional(b));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(first).call());
 
-        ComponentHandle<NoConfig> second = TestKit.mount(
+        MountHandle second = TestKit.mount(
                 runtime,
                 runtime.root(),
                 "dynamic-cycle-second",
@@ -298,8 +298,8 @@ final class DynamicCapabilityTest {
                 CapabilityRequirement.required(a));
 
         assertEquals(ComponentState.WAITING, TestKit.settle(second).call(),
-                () -> runtime.snapshot().toString());
-        assertTrue(runtime.snapshot().diagnostics().stream().anyMatch(diagnostic ->
+                () -> runtime.advanced().snapshot().toString());
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().anyMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.BINDING_CYCLE
                         && diagnostic.targetId().equals(second.handleId())));
     }
@@ -314,15 +314,15 @@ final class DynamicCapabilityTest {
         Api proxy = dynamic.get().proxy(Api.class);
         CompletableFuture<String> stage = proxy.valueAsync().toCompletableFuture();
         var providerValue = runtime.root().view().require(API);
-        TransactionReceipt<Void> receipt = runtime.transact(transaction -> {
+        TransactionReceipt<Void> receipt = runtime.advanced().transact(transaction -> {
             transaction.revoke(registration);
             return null;
         });
-        assertFalse(receipt.settlement().toCompletableFuture().isDone());
+        assertFalse(receipt.settlement().whenSettled().toCompletableFuture().isDone());
         assertInstanceOf(CompletionStageApi.class, providerValue);
         ((CompletionStageApi) providerValue).release.complete(null);
         assertEquals("v1", stage.get(10, TimeUnit.SECONDS));
-        receipt.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        receipt.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
     @Test
@@ -357,10 +357,10 @@ final class DynamicCapabilityTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("parent", dynamic.get().call(Api::value));
 
-        var shadow = runtime.transact(transaction ->
+        var shadow = runtime.advanced().transact(transaction ->
                 transaction.provide(child, API, new ApiValue("child"))).value();
         assertEquals("child", dynamic.get().call(Api::value));
-        runtime.revoke(shadow);
+        runtime.advanced().revoke(shadow);
         assertEquals("parent", dynamic.get().call(Api::value));
         assertEquals(1, starts.get());
     }
@@ -456,11 +456,11 @@ final class DynamicCapabilityTest {
     }
 
     private RegistrationHandle provide(Api value) {
-        return runtime.transact(transaction ->
+        return runtime.advanced().transact(transaction ->
                 transaction.provide(runtime.root(), API, value)).value();
     }
 
-    private ComponentHandle<NoConfig> mount(
+    private MountHandle mount(
             String mountId,
             TestKit.Start<NoConfig> start,
             CapabilityRequirement... requirements) throws Exception {
@@ -469,7 +469,7 @@ final class DynamicCapabilityTest {
         return handle;
     }
 
-    private ComponentHandle<ProviderConfig> mountProvider(
+    private ConfiguredMountHandle<ProviderConfig> mountProvider(
             String mountId,
             ProviderConfig config,
             CountDownLatch staged,
@@ -488,11 +488,11 @@ final class DynamicCapabilityTest {
             }
         };
         ComponentFactory<ProviderConfig> factory = TestKit.factory(mountId, component);
-        return runtime.transact(transaction ->
+        return runtime.advanced().transact(transaction ->
                 transaction.mount(runtime.root(), mountId, factory, config)).value();
     }
 
-    private ComponentHandle<ProviderConfig> mountTrackedProvider(
+    private ConfiguredMountHandle<ProviderConfig> mountTrackedProvider(
             String mountId,
             String value,
             CountDownLatch staged,
@@ -514,7 +514,7 @@ final class DynamicCapabilityTest {
             }
         };
         ComponentFactory<ProviderConfig> factory = TestKit.factory(mountId, component);
-        return runtime.transact(transaction ->
+        return runtime.advanced().transact(transaction ->
                 transaction.mount(runtime.root(), mountId, factory,
                         new ProviderConfig(value))).value();
     }

@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>每个 {@link ActivationRuntime} 持有一个根作用域，子作用域和受管条目作为树中的
  * {@link Node} 记录。所有节点使用同一个全局序列，释放时按序列倒序执行，形成跨嵌套层的 LIFO 顺序；
  * 显式 parallelChild 只并行其直接条目，不把并行性扩展到后续兄弟节点。释放是异步聚合的，失败条目
- * 保持 {@code FAILED} 并保留释放器，供 ComponentHandle.retryAsync() 只重试失败部分。</p>
+ * 保持 {@code FAILED} 并保留释放器，供 MountHandle.retryAsync() 只重试失败部分。</p>
  *
  * <p>锁约定：新增子节点时先锁父再锁子，保证父状态检查与树插入有序；释放器本身在作用域锁外执行。
  * {@link DefaultKnotraRuntime} 先完成依赖方清理，再触发提供方 {@code teardown()}。</p>
@@ -44,8 +44,9 @@ final class LifecycleScopeImpl implements LifecycleScope {
     private final List<Node> nodes = new ArrayList<>();
 
     private LifecycleState state = LifecycleState.OPEN;
-    // 错误只保留文本，不保存 Throwable，避免诊断路径延长用户对象生命周期。
+    // 只保存稳定文本，不保存 Throwable，避免清理诊断延长资源或 ClassLoader 生命周期。
     private final List<String> cleanupErrors = new ArrayList<>();
+    private String lastCleanupExceptionType = "";
     private LifecycleScopeImpl(
             String id,
             LifecycleScopeImpl parent,
@@ -181,6 +182,12 @@ final class LifecycleScopeImpl implements LifecycleScope {
         return String.join("; ", errors.stream().distinct().toList());
     }
 
+    String lastCleanupExceptionType() {
+        synchronized (lock) {
+            return lastCleanupExceptionType;
+        }
+    }
+
     private void collectCleanupErrors(List<String> result) {
         synchronized (lock) {
             result.addAll(cleanupErrors);
@@ -295,6 +302,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
                 String message = safeError(error);
                 entry.fail(message);
                 cleanupErrors.add(message);
+                lastCleanupExceptionType = safeExceptionType(error);
             }
         }
     }
@@ -314,6 +322,10 @@ final class LifecycleScopeImpl implements LifecycleScope {
                     String error = String.join("; ", scope.cleanupErrors);
                     if (!error.isBlank() && !cleanupErrors.contains(error)) {
                         cleanupErrors.add(error);
+                    }
+                    if (lastCleanupExceptionType.isBlank()
+                            && !scope.lastCleanupExceptionType.isBlank()) {
+                        lastCleanupExceptionType = scope.lastCleanupExceptionType;
                     }
                     return true;
                 }
@@ -437,22 +449,42 @@ final class LifecycleScopeImpl implements LifecycleScope {
         }
     }
 
+    private static String safeExceptionType(Throwable error) {
+        try {
+            Throwable current = error;
+            if ((current instanceof CompletionException
+                    || current instanceof java.util.concurrent.ExecutionException)
+                    && current.getCause() != null) {
+                current = current.getCause();
+            }
+            Class<?> type = current.getClass();
+            return type == null ? "" : type.getName();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     static String safeError(Throwable error) {
         if (error == null) {
             return "cleanup failed";
         }
-        if (error instanceof CompletionException completion && completion.getCause() != null) {
-            return safeError(completion.getCause());
+        Throwable current = error;
+        if ((current instanceof CompletionException
+                || current instanceof java.util.concurrent.ExecutionException)
+                && current.getCause() != null) {
+            current = current.getCause();
         }
-        String text;
+        String type;
+        String message;
         try {
-            text = error.getMessage();
-            if (text == null || text.isBlank()) {
-                text = error.getClass().getName();
-            }
+            type = current.getClass().getName();
+            message = current.getMessage();
         } catch (Throwable ignored) {
-            return "<malformed error message>";
+            return "<malformed error description>";
         }
+        String text = message == null || message.isBlank()
+                ? type
+                : type + ": " + message;
         return text.length() <= 500 ? text : text.substring(0, 500);
     }
 
@@ -468,7 +500,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
     private record ScopeNode(LifecycleScopeImpl scope, long sequence) implements Node {
     }
 
-    // 单个受管条目；释放器字段只在成功后清空，失败时保留用于 ComponentHandle.retryAsync()。
+    // 单个受管条目；释放器字段只在成功后清空，失败时保留用于 MountHandle.retryAsync()。
     private static final class Entry implements Node {
         private final String id;
         private final String description;

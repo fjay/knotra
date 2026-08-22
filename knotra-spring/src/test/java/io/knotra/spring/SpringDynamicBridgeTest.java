@@ -6,11 +6,10 @@ import io.knotra.CapabilityUnavailableException;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
+import io.knotra.ConfiguredMountHandle;
 import io.knotra.DynamicCapabilityClosedException;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -85,7 +84,8 @@ final class SpringDynamicBridgeTest {
         assertThrows(CapabilityUnavailableException.class, () ->
                 bridge.proxy().value());
 
-        runtime.provide(SOURCE, new SimpleApi("v1"));
+        runtime.publish(SOURCE, new SimpleApi("v1"))
+                .awaitSettled(java.time.Duration.ofSeconds(10));
         assertTrue(bridge.available());
         assertEquals("v1", bridge.proxy().value());
         assertEquals("v1", bridge.withCurrent(Api::value));
@@ -112,7 +112,7 @@ final class SpringDynamicBridgeTest {
         CountDownLatch asyncEntered = new CountDownLatch(1);
         CompletableFuture<Void> firstRelease = new CompletableFuture<>();
         AtomicReference<GatedApi> firstApi = new AtomicReference<>();
-        ComponentHandle<ProviderConfig> provider = mountTrackedProvider(
+        ConfiguredMountHandle<ProviderConfig> provider = mountTrackedProvider(
                 "tracked-provider",
                 new ProviderConfig("v1"),
                 firstRelease,
@@ -143,7 +143,7 @@ final class SpringDynamicBridgeTest {
         bridge.close();
     }
 
-    private ComponentHandle<ProviderConfig> mountTrackedProvider(
+    private ConfiguredMountHandle<ProviderConfig> mountTrackedProvider(
             String mountId,
             ProviderConfig config,
             CompletableFuture<Void> release,

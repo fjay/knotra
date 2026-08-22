@@ -180,9 +180,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                     } else if (mode == Mode.CHILD) {
                         context.mountChild(
                                 "private-child",
-                                privateChildFactory(),
-                                NoConfig.INSTANCE,
-                                io.knotra.MountOptions.DEFAULT);
+                                privateChildFactory());
                     }
                 }
 
@@ -313,9 +311,7 @@ public final class TestRuntimeComponentProvider implements RuntimeComponentProvi
                                         }
                                     };
                                 }
-                            },
-                            NoConfig.INSTANCE,
-                            io.knotra.MountOptions.DEFAULT);
+                            });
                 }
             };
         }

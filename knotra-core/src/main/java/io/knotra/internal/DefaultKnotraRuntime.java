@@ -2,32 +2,40 @@ package io.knotra.internal;
 
 import io.knotra.ActivationContext;
 import io.knotra.ActivationState;
+import io.knotra.AdvancedRuntime;
+import io.knotra.PublicationChange;
 import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
 import io.knotra.CapabilityUnavailableException;
 import io.knotra.ComponentFactory;
 import io.knotra.ComponentGoal;
-import io.knotra.ComponentHandle;
-import io.knotra.ComponentNotActiveException;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
+import io.knotra.ConfiguredMountHandle;
 import io.knotra.ContextHandle;
 import io.knotra.ContextInfo;
 import io.knotra.ContextState;
+import io.knotra.FailureInfo;
+import io.knotra.FailurePhase;
 import io.knotra.DiagnosticCode;
 import io.knotra.DynamicCapabilityClosedException;
 import io.knotra.KnotraConfig;
 import io.knotra.KnotraRuntime;
 import io.knotra.LifecycleState;
+import io.knotra.MountHandle;
+import io.knotra.MountNotActiveException;
+import io.knotra.NoConfig;
 import io.knotra.MountOptions;
-import io.knotra.Provided;
+import io.knotra.Registration;
 import io.knotra.RegistrationHandle;
 import io.knotra.RuntimeDiagnostic;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.RuntimeTransaction;
+import io.knotra.Settlement;
+import io.knotra.SettlementReport;
+import io.knotra.StagedRegistration;
 import io.knotra.TransactionReceipt;
 import io.knotra.TransactionRejectedException;
-
 import java.lang.reflect.InvocationTargetException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -68,7 +76,7 @@ import java.util.stream.Stream;
  * 完成组件过渡时协调器可嵌套 {@link ComponentRuntime} 的过渡链锁。LifecycleScope 释放器、
  * 用户回调和 Future 回调不得反向获取协调器锁。</p>
  */
-public final class DefaultKnotraRuntime implements KnotraRuntime {
+final class DefaultKnotraRuntime implements KnotraRuntime {
     private final KnotraConfig configuration;
     // 结构一致性主锁：保护视图草稿、代际发布、可执行索引同步和过渡状态裁决。
     private final Object coordinator = new Object();
@@ -78,10 +86,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
 
     // 组件与激活索引的写入口在协调器内；并发读取用于驱动状态机或校验句柄归属。
     private final Map<String, ComponentRuntime> components = new ConcurrentHashMap<>();
-    private final Map<String, ComponentHandleImpl<?>> componentHandles =
+    private final Map<String, MountHandleImpl> componentHandles =
             new ConcurrentHashMap<>();
-    // 组件移出主视图后仍需为旧句柄报告稳定的终态。
-    private final Map<String, ComponentState> terminalComponents = new ConcurrentHashMap<>();
+    // 组件移出主视图后旧句柄固定报告 DISPOSED；失败清理仍保留在 live view。
     private final Map<String, ActivationRuntime> activations = new ConcurrentHashMap<>();
     private final Map<String, RegistrationHandleImpl> registrationHandles =
             new ConcurrentHashMap<>();
@@ -95,8 +102,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     private final AtomicBoolean closing = new AtomicBoolean();
     private final AtomicReference<CompletableFuture<Void>> closeFuture =
             new AtomicReference<>();
+    private final AdvancedRuntime advanced = new AdvancedRuntimeImpl();
 
-    public DefaultKnotraRuntime(KnotraConfig configuration) {
+    DefaultKnotraRuntime(KnotraConfig configuration) {
         this.configuration = Objects.requireNonNull(configuration, "configuration");
         contextHandles.put("ctx-root", new ContextHandleImpl(this, "ctx-root"));
     }
@@ -112,16 +120,10 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     @Override
-    public <T> Provided<T> provide(CapabilityKey<T> key, T value) {
-        TransactionReceipt<RegistrationHandle> receipt =
-                transact(transaction -> transaction.provide(root(), key, value));
-        return new ProvidedImpl<>(
-                receipt.value(),
-                key,
-                receipt.settlement());
+    public AdvancedRuntime advanced() {
+        return advanced;
     }
 
-    @Override
     public RuntimeSnapshot snapshot() {
         RuntimeSnapshot partial;
         Map<String, ActivationRuntime> activationCopy;
@@ -129,7 +131,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             partial = view.snapshotWithoutScopes();
             activationCopy = new HashMap<>(activations);
         }
-        // Scope 树有独立锁；先在协调器内复制激活集合，再在锁外生成稳定 DTO。
         List<RuntimeSnapshot.LifecycleScopeSnapshot> scopes = activationCopy.values().stream()
                 .flatMap(activation ->
                         activation.scope.snapshots(activation.activationId).stream())
@@ -139,55 +140,101 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return new RuntimeSnapshot(
                 partial.generation(),
                 partial.contexts(),
-                partial.components(),
+                partial.mounts(),
                 partial.activations(),
                 partial.registrations(),
                 scopes,
                 partial.diagnostics());
     }
 
-    @Override
-    public void revoke(RegistrationHandle registration) {
-        if (registration instanceof ProvidedImpl<?> provided) {
-            if (provided.runtime() == this) {
-                revoke(provided);
-            } else {
-                transact(transaction -> {
-                    transaction.revoke(registration);
-                    return null;
-                });
-            }
-            return;
-        }
-        transact(transaction -> {
-            transaction.revoke(registration);
-            return null;
-        });
+    /**
+     * Build a stable report after propagation converged. A failed affected mount does not
+     * make the settlement future exceptional; callers inspect the outcomes instead.
+     */
+    private SettlementReport settlementReport(
+            long generation,
+            Set<String> affectedMounts,
+            Map<String, String> removedMountIds) {
+        RuntimeSnapshot snapshot = snapshot();
+        Map<String, RuntimeSnapshot.MountSnapshot> current = snapshot.mounts().stream()
+                .collect(Collectors.toMap(RuntimeSnapshot.MountSnapshot::handleId, mount -> mount));
+        List<SettlementReport.MountOutcome> outcomes = affectedMounts.stream()
+                .sorted()
+                .map(handleId -> {
+                    RuntimeSnapshot.MountSnapshot mount = current.get(handleId);
+                    ComponentState state = mount != null
+                            ? mount.state()
+                            : ComponentState.DISPOSED;
+                    String mountId = mount != null
+                            ? mount.mountId()
+                            : removedMountIds.getOrDefault(handleId, handleId);
+                    List<RuntimeDiagnostic> diagnostics = mount != null
+                            ? snapshot.diagnostics().stream()
+                                    .filter(diagnostic -> handleId.equals(diagnostic.targetId()))
+                                    .toList()
+                            : List.of();
+                    return new SettlementReport.MountOutcome(handleId, mountId, state, diagnostics);
+                })
+                .toList();
+        List<RuntimeDiagnostic> operationDiagnostics = outcomes.stream()
+                .flatMap(outcome -> outcome.diagnostics().stream())
+                .toList();
+        return new SettlementReport(generation, outcomes, operationDiagnostics);
     }
 
-    <T> Provided<T> replace(ProvidedImpl<T> handle, T value) {
-        handle.requireFresh("replace");
-        TransactionReceipt<RegistrationHandle> receipt = transact(transaction -> {
-            transaction.revoke(handle);
-            return transaction.provide(root(), handle.capabilityKey(), value);
-        });
-        handle.markStale();
-        return new ProvidedImpl<>(
-                receipt.value(),
-                handle.capabilityKey(),
+
+    <T> Registration<T> register(ContextHandle context, CapabilityKey<T> key, T value) {
+        TransactionReceipt<StagedRegistration<T>> receipt =
+                transact(transaction -> transaction.provide(context, key, value));
+        StagedRegistration<T> staged = receipt.value();
+        return new RegistrationImpl<>(
+                staged instanceof StagedRegistrationImpl<T> internal
+                        ? internal.registration()
+                        : null,
+                key,
+                context,
                 receipt.settlement());
     }
 
-    <T> void revoke(ProvidedImpl<T> handle) {
+    Settlement revokeRegistration(RegistrationHandle registration) {
+        if (registration instanceof RegistrationImpl<?> typed) {
+            if (typed.runtime() != this) {
+                throw new IllegalArgumentException(
+                        "registration handle does not belong to this runtime");
+            }
+            return revoke(typed);
+        }
+        TransactionReceipt<Void> receipt = transact(transaction -> {
+            transaction.revoke(registration);
+            return null;
+        });
+        return receipt.settlement();
+    }
+
+    <T> Registration<T> replace(RegistrationImpl<T> handle, T value) {
+        handle.requireFresh("replace");
+        TransactionReceipt<StagedRegistration<T>> receipt = transact(transaction -> {
+            transaction.revoke(handle);
+            return transaction.provide(handle.context(), handle.capabilityKey(), value);
+        });
+        handle.markStale();
+        return new RegistrationImpl<>(
+                ((StagedRegistrationImpl<T>) receipt.value()).registration(),
+                handle.capabilityKey(),
+                handle.context(),
+                receipt.settlement());
+    }
+
+    <T> Settlement revoke(RegistrationImpl<T> handle) {
         handle.requireFresh("revoke");
-        transact(transaction -> {
+        TransactionReceipt<Void> receipt = transact(transaction -> {
             transaction.revoke(handle);
             return null;
         });
         handle.markStale();
+        return receipt.settlement();
     }
 
-    @Override
     public <R> TransactionReceipt<R> transact(Function<RuntimeTransaction, R> action) {
         Objects.requireNonNull(action, "action");
         MutationRecorder recorder = new MutationRecorder();
@@ -210,10 +257,11 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     LifecycleScopeImpl.safeError(error))));
         }
 
-        long committedGeneration;
+        long committedGeneration = 0;
         Set<String> postCommitDirty = new LinkedHashSet<>();
         Set<String> contextDisposals = new LinkedHashSet<>();
         List<CompletableFuture<Void>> registrationDrains = List.of();
+        ExecutableCommitPlan executable = new ExecutableCommitPlan();
         synchronized (coordinator) {
             if (closing.get()) {
                 throw new TransactionRejectedException(List.of(new RuntimeDiagnostic(
@@ -224,12 +272,10 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             if (recorder.intents.isEmpty()) {
                 return new TransactionReceipt<>(
                         callbackValue,
-                        view.generation,
-                        CompletableFuture.completedFuture(null));
+                        DefaultSettlement.empty(view.generation));
             }
 
             RuntimeView.Draft draft = new RuntimeView.Draft(view);
-            ExecutableCommitPlan executable = new ExecutableCommitPlan();
             Set<String> dirty = new LinkedHashSet<>();
             boolean viewChanged = false;
             try {
@@ -241,8 +287,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 if (!viewChanged) {
                     return new TransactionReceipt<>(
                             callbackValue,
-                            view.generation,
-                            CompletableFuture.completedFuture(null));
+                            DefaultSettlement.empty(view.generation));
                 }
                 RuntimeView next = draft.publishOnce();
                 view = next;
@@ -256,20 +301,34 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
         }
 
-        List<CompletableFuture<?>> componentSettlements =
-                new ArrayList<>(schedule(postCommitDirty));
-        CompletableFuture<Void> componentSettlement = componentSettlements.isEmpty()
-                ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.allOf(componentSettlements.toArray(CompletableFuture[]::new));
-        List<CompletableFuture<?>> settlements = new ArrayList<>(componentSettlements);
+        final long committedGenerationResult = committedGeneration;
+        Set<String> affectedMounts = new LinkedHashSet<>(postCommitDirty);
+        affectedMounts.addAll(executable.mounts.keySet());
+        affectedMounts.addAll(executable.removedComponents.keySet());
+        affectedMounts.addAll(executable.configs.keySet());
+        Map<String, String> removedMountIds = new HashMap<>();
+        executable.removedComponents.forEach((handleId, removed) ->
+                removedMountIds.putIfAbsent(handleId, removed.mountId()));
+        executable.reportedRemovedMounts.forEach((handleId, removed) ->
+                removedMountIds.putIfAbsent(handleId, removed.mountId()));
+        OperationSettlement operationSettlement =
+                new OperationSettlement(affectedMounts, removedMountIds);
+
+        CompletableFuture<Void> componentSettlement =
+                operationSettlement.await(postCommitDirty);
+        List<CompletableFuture<?>> settlements = new ArrayList<>();
+        settlements.add(componentSettlement);
         settlements.addAll(registrationDrains);
         for (String contextId : outermostContextDisposals(contextDisposals)) {
             settlements.add(settleContextDisposal(contextId, componentSettlement));
         }
-        CompletableFuture<Void> settlement = settlements.isEmpty()
-                ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.allOf(settlements.toArray(CompletableFuture[]::new));
-        return new TransactionReceipt<>(callbackValue, committedGeneration, settlement);
+        CompletableFuture<Void> settlement = CompletableFuture.allOf(
+                settlements.toArray(CompletableFuture[]::new));
+        Settlement committedSettlement = new DefaultSettlement(
+                committedGenerationResult,
+                settlement.thenApply(ignored -> operationSettlement.report(
+                        committedGenerationResult)));
+        return new TransactionReceipt<>(callbackValue, committedSettlement);
     }
 
     @Override
@@ -438,8 +497,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         if (data != null) {
             return data.state();
         }
-        ComponentState terminal = terminalComponents.get(handleId);
-        return terminal == null ? ComponentState.DISPOSED : terminal;
+        return ComponentState.DISPOSED;
     }
 
     ComponentGoal componentGoal(String handleId) {
@@ -463,7 +521,12 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         : CompletableFuture.completedFuture(state));
     }
 
-    <C> ComponentHandle<C> requireActive(ComponentHandleImpl<C> handle, Duration timeout) {
+    <C> ConfiguredMountHandleImpl<C> requireActiveConfigured(
+            ConfiguredMountHandleImpl<C> handle, Duration timeout) {
+        return (ConfiguredMountHandleImpl<C>) requireActive(handle, timeout);
+    }
+
+    MountHandle requireActive(MountHandleImpl handle, Duration timeout) {
         if (timeout != null && (timeout.isZero() || timeout.isNegative())) {
             throw new IllegalArgumentException("timeout must be positive");
         }
@@ -490,10 +553,8 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         if (settledNormally && settled == ComponentState.ACTIVE) {
             return handle;
         }
-        // 单次协调观察：状态与诊断来自同一代际；中断标记已在上游恢复。
         FailureSnapshot snapshot = failureSnapshot(handle.handleId());
         if (snapshot.state() == ComponentState.ACTIVE) {
-            // 并发过渡刚刚完成；返回自身而不是抛出声称 ACTIVE 的 not-active 异常。
             return handle;
         }
         ComponentState failureState = settledNormally ? settled : snapshot.state();
@@ -504,7 +565,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         if (detail != null) {
             diagnostics.add(detail);
         }
-        throw new ComponentNotActiveException(
+        throw new MountNotActiveException(
                 failureState,
                 handle.handleId(),
                 handle.mountId(),
@@ -550,20 +611,23 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     <C> CompletionStage<ComponentState> reconfigure(
-            ComponentHandleImpl<C> handle,
+            ConfiguredMountHandleImpl<C> handle,
             C config) {
         try {
-            transact(transaction -> {
+            TransactionReceipt<Void> receipt = transact(transaction -> {
                 transaction.reconfigure(handle, config);
                 return null;
             });
-            return whenSettled(handle.handleId());
+            return receipt.settlement().whenSettled().thenApply(report -> report
+                    .outcome(handle.handleId())
+                    .map(SettlementReport.MountOutcome::state)
+                    .orElseGet(() -> componentState(handle.handleId())));
         } catch (TransactionRejectedException rejection) {
             return CompletableFuture.failedFuture(rejection);
         }
     }
 
-    <C> CompletionStage<ComponentState> retry(ComponentHandleImpl<C> handle) {
+    CompletionStage<ComponentState> retry(MountHandleImpl handle) {
         ComponentRuntime component = components.get(handle.handleId());
         if (component == null || componentHandles.get(handle.handleId()) != handle) {
             return failedFuture("handle does not belong to this runtime");
@@ -577,7 +641,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return component.enqueue(this, executor);
     }
 
-    <C> CompletionStage<ComponentState> dispose(ComponentHandleImpl<C> handle) {
+    CompletionStage<ComponentState> dispose(MountHandleImpl handle) {
         if (handle.runtime == this
                 && componentState(handle.handleId()) == ComponentState.DISPOSED
                 && componentGoal(handle.handleId()) == ComponentGoal.DISPOSED) {
@@ -585,6 +649,11 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         // 合并并发 dispose：所有调用方共享一个请求 Future，失败请求可被下一次尝试替换。
         synchronized (disposeRequests) {
+            if (handle.runtime == this
+                    && componentState(handle.handleId()) == ComponentState.DISPOSED
+                    && componentGoal(handle.handleId()) == ComponentGoal.DISPOSED) {
+                return CompletableFuture.completedFuture(ComponentState.DISPOSED);
+            }
             CompletableFuture<ComponentState> existing =
                     disposeRequests.get(handle.handleId());
             if (existing != null && !existing.isCompletedExceptionally()) {
@@ -669,19 +738,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         && component.mountId().equals(mountId));
     }
 
-    <C> ComponentHandleImpl<C> createProvisionalHandle(
-            String contextId,
-            String mountId,
-            PreparedComponent<C> prepared) {
-        return new ComponentHandleImpl<>(
-                this,
-                Sequences.handle(),
-                new ComponentHandleImpl.Identity(
-                        mountId,
-                        prepared.descriptor().componentId(),
-                        prepared.factoryId(),
-                        contextId));
-    }
 
     private boolean applyIntent(
             RuntimeView.Draft draft,
@@ -692,7 +748,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             case ProvideIntent provide -> applyProvide(draft, provide);
             case RevokeIntent revoke -> applyRevoke(draft, revoke, dirty, executable);
             case ChildContextIntent child -> applyChildContext(draft, child);
-            case MountIntent<?> mount -> applyMount(draft, mount, dirty, executable);
+            case MountIntent mount -> applyMount(draft, mount, dirty, executable);
             case ReconfigureIntent<?> reconfigure ->
                     applyReconfigure(draft, reconfigure, dirty, executable);
             case DisposeIntent dispose ->
@@ -814,7 +870,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
 
     private boolean applyMount(
             RuntimeView.Draft draft,
-            MountIntent<?> intent,
+            MountIntent intent,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
         ContextHandleImpl context = requireContext(draft, intent.context());
@@ -868,7 +924,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             ReconfigureIntent<?> intent,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
-        ComponentHandleImpl<?> handle = requireComponent(draft, intent.handle());
+        MountHandleImpl handle = requireComponent(draft, intent.handle());
         RuntimeView.ComponentData data = draft.components.get(handle.handleId());
         if (data == null || data.goal() == ComponentGoal.DISPOSED) {
             throw reject(
@@ -914,12 +970,15 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             DisposeIntent intent,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
-        ComponentHandleImpl<?> handle = requireComponent(draft, intent.handle());
+        MountHandleImpl handle = requireComponent(draft, intent.handle());
         RuntimeView.ComponentData parent = draft.components.get(handle.handleId());
         if (parent != null) {
             draft.components.put(
                     handle.handleId(),
                     parent.withGoal(ComponentGoal.DISPOSED));
+            executable.reportedRemovedMounts.putIfAbsent(
+                    handle.handleId(),
+                    new ExecutableCommitPlan.RemovedMount(parent.mountId()));
         }
         // 先处置该 Activation 拥有的子树，再闭包到外部依赖方；二者共同决定 STOPPING 顺序。
         Set<String> live = disposeOwnershipForActivation(
@@ -932,7 +991,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         RuntimeView.ComponentData latest = draft.components.get(handle.handleId());
         if (latest != null && latest.currentActivationId() == null) {
             removeComponentInView(draft, handle.handleId());
-            executable.removedComponents.add(handle.handleId());
+            executable.removedComponents.put(
+                    handle.handleId(),
+                    new ExecutableCommitPlan.RemovedMount(handle.mountId()));
             return true;
         }
         dirty.addAll(live);
@@ -981,6 +1042,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             draft.components.put(
                     handleId,
                     component.withGoal(ComponentGoal.DISPOSED));
+            executable.reportedRemovedMounts.putIfAbsent(
+                    handleId,
+                    new ExecutableCommitPlan.RemovedMount(component.mountId()));
         }
         Set<String> live = handles.stream()
                 .filter(handleId -> draft.components.get(handleId) != null
@@ -992,7 +1056,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             RuntimeView.ComponentData component = draft.components.get(handleId);
             if (component != null && component.currentActivationId() == null) {
                 removeComponentInView(draft, handleId);
-                executable.removedComponents.add(handleId);
+                executable.removedComponents.put(
+                        handleId,
+                        new ExecutableCommitPlan.RemovedMount(component.mountId()));
             } else if (component != null) {
                 dirty.add(handleId);
             }
@@ -1012,16 +1078,34 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             RuntimeView.ActivationData activation =
                     draft.activations.get(component.currentActivationId());
-            if (activation == null
-                    || !RuntimeView.activationTracksGraph(activation.state())) {
+            if (activation == null) {
                 continue;
             }
+            boolean tracksGraph =
+                    RuntimeView.activationTracksGraph(activation.state());
+            ComponentRuntime executableRuntime =
+                    components.get(component.handleId());
+            boolean cleaningForRestart =
+                    component.goal() == ComponentGoal.RUNNING
+                            && (component.state() == ComponentState.STOPPING
+                                || (component.state() == ComponentState.FAILED
+                                    && executableRuntime != null
+                                    && executableRuntime.failedCleanup != null));
+            if (!tracksGraph && !cleaningForRestart) {
+                continue;
+            }
+            ActivationRuntime executableActivation =
+                    activations.get(component.currentActivationId());
+            Map<String, RuntimeView.BindingData> previousBindings =
+                    tracksGraph || executableActivation == null
+                            ? activation.bindings()
+                            : executableActivation.bindings;
             Map<String, RuntimeView.BindingData> effective =
                     draft.effectiveBindings(component, Map.of());
             for (CapabilityRequirement requirement
                     : component.descriptor().sortedRequirements()) {
                 RuntimeView.BindingData old =
-                        activation.bindings().get(requirement.key().name());
+                        previousBindings.get(requirement.key().name());
                 RuntimeView.BindingData next =
                         effective.get(requirement.key().name());
                 if (!bindingIdentityEqual(old, next)) {
@@ -1067,8 +1151,8 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 }
                 if (topologyChanged) {
                     executable.resetAutoRestart.add(component.handleId());
+                    dirty.add(component.handleId());
                 }
-                dirty.add(component.handleId());
             }
         }
     }
@@ -1142,9 +1226,14 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 continue;
             }
             draft.components.put(handleId, component.withGoal(ComponentGoal.DISPOSED));
+            executable.reportedRemovedMounts.putIfAbsent(
+                    handleId,
+                    new ExecutableCommitPlan.RemovedMount(component.mountId()));
             if (component.currentActivationId() == null) {
                 removeComponentInView(draft, handleId);
-                executable.removedComponents.add(handleId);
+                executable.removedComponents.put(
+                        handleId,
+                        new ExecutableCommitPlan.RemovedMount(component.mountId()));
             } else {
                 live.add(handleId);
             }
@@ -1242,10 +1331,10 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return handle;
     }
 
-    private ComponentHandleImpl<?> requireComponent(
+    private MountHandleImpl requireComponent(
             RuntimeView.Draft draft,
-            ComponentHandle<?> candidate) {
-        if (!(candidate instanceof ComponentHandleImpl<?> handle)
+            MountHandle candidate) {
+        if (!(candidate instanceof MountHandleImpl handle)
                 || handle.runtime != this
                 || !draft.components.containsKey(handle.handleId())) {
             throw reject(
@@ -1295,16 +1384,14 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 runtime.reconcileAttempts = 0;
             }
         }
-        for (String handleId : executable.removedComponents) {
+        for (String handleId : executable.removedComponents.keySet()) {
             components.remove(handleId);
             componentHandles.remove(handleId);
-            terminalComponents.put(handleId, ComponentState.DISPOSED);
         }
 
-        for (MountIntent<?> mount : executable.mounts.values()) {
+        for (MountIntent mount : executable.mounts.values()) {
             String handleId = mount.handle().handleId();
             if (!next.components.containsKey(handleId)) {
-                terminalComponents.put(handleId, ComponentState.DISPOSED);
                 continue;
             }
             ComponentRuntime runtime = new ComponentRuntime(
@@ -1315,6 +1402,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             components.put(handleId, runtime);
             componentHandles.put(handleId, mount.handle());
         }
+
         for (Map.Entry<String, ExecutableCommitPlan.ConfigUpdate> entry
                 : executable.configs.entrySet()) {
             ComponentRuntime runtime = components.get(entry.getKey());
@@ -1443,7 +1531,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return ordered;
     }
 
-    // 将注册归属还原为提供方 ComponentHandle，只保留本次也在停止集合内的内部依赖。
+    // 将注册归属还原为提供方 MountHandle，只保留本次也在停止集合内的内部依赖。
     private Map<String, Set<String>> stopProviders(
             RuntimeView current,
             Set<String> handles) {
@@ -1576,7 +1664,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             removeComponentInView(draft, component.handleId);
             components.remove(component.handleId);
             componentHandles.remove(component.handleId);
-            terminalComponents.put(component.handleId, ComponentState.DISPOSED);
             state = ComponentState.DISPOSED;
         } else {
             draft.components.put(
@@ -1652,6 +1739,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         component.pendingStartFailure = false;
         component.blockedNonConvergent = false;
         component.lastStartError = "";
+        component.lastStartFailure = FailureInfo.EMPTY;
         return activation;
     }
 
@@ -1660,7 +1748,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             ComponentRuntime runtime,
             ActivationRuntime activation,
             CompletableFuture<ComponentState> future) {
-        List<ChildMountPlan<?>> plans = new ArrayList<>();
+        List<ChildMountPlan> plans = new ArrayList<>();
         ActivationContext context = new ActivationContextImpl(
                 this,
                 activation,
@@ -1671,6 +1759,11 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             runtime.prepared.start(context, activation.config);
         } catch (Throwable error) {
             startError = error;
+            runtime.lastStartFailure = FailureInfo.capture(
+                    error,
+                    FailurePhase.ACTIVATION,
+                    configuration.failureDetailPolicy(),
+                    null);
         }
         activation.closed.set(true);
 
@@ -1801,7 +1894,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     // 父 Activation 失败时，未提交的临时子句柄立即转入终态，挂载 ID 可在后续代际复用。
-    private void discardProvisionalChildren(List<ChildMountPlan<?>> plans) {
+    private void discardProvisionalChildren(List<ChildMountPlan> plans) {
         for (ChildMountPlan plan : plans) {
             String handleId = plan.handle().handleId();
             ComponentRuntime child = components.remove(handleId);
@@ -1810,7 +1903,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 child.failedCleanup = null;
             }
             componentHandles.remove(handleId);
-            terminalComponents.put(handleId, ComponentState.DISPOSED);
         }
     }
 
@@ -1818,7 +1910,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     private CommitDecision validateActivation(
             ComponentRuntime runtime,
             ActivationRuntime activation,
-            List<ChildMountPlan<?>> plans,
+            List<ChildMountPlan> plans,
             Throwable startError) {
         RuntimeView current = view;
         RuntimeView.ComponentData data = current.components.get(runtime.handleId);
@@ -1919,7 +2011,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     private String childPlanConflict(
             RuntimeView current,
             String contextId,
-            List<ChildMountPlan<?>> plans) {
+            List<ChildMountPlan> plans) {
         // 类型检查覆盖其他仍在 STARTING 的暂存 Activation，防止并发批次合 publish 后破坏名称类型固定。
         Map<String, Class<?>> tentativeTypes = new HashMap<>(current.capabilityTypes);
         for (RuntimeView.RegistrationData staged
@@ -1958,7 +2050,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
 
     private Map<String, RuntimeView.RegistrationData> activationRegistrationsForValidation(
             RuntimeView current,
-            List<ChildMountPlan<?>> plans) {
+            List<ChildMountPlan> plans) {
         Map<String, RuntimeView.RegistrationData> registrations = new HashMap<>();
         for (ActivationRuntime activation : activations.values()) {
             if (activation.stale.get()
@@ -1977,7 +2069,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             ComponentRuntime runtime,
             ActivationRuntime activation,
             CommitDecision decision,
-            List<ChildMountPlan<?>> plans) {
+            List<ChildMountPlan> plans) {
         RuntimeView.ComponentData data = draft.components.get(runtime.handleId);
         RuntimeView.ActivationData activationData =
                 draft.activations.get(activation.activationId);
@@ -2085,9 +2177,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 runtime.handleId,
                 data.withState(ComponentState.STOPPING));
         activation.markStale();
-        for (ChildMountPlan plan : plans) {
-            terminalComponents.put(plan.handle().handleId(), ComponentState.DISPOSED);
-        }
         Set<String> dirty = new LinkedHashSet<>(Set.of(runtime.handleId));
         return new PostCommitPlan(List.of(), dirty, new ExecutableCommitPlan());
     }
@@ -2102,9 +2191,19 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         activation.stale.set(!decision.success() || decision.stale());
         runtime.pendingStartFailure = !decision.success() && !decision.stale() && !decision.suppressCycle();
         runtime.suppressAutoRestart = decision.suppressCycle();
-        runtime.lastStartError = decision.success() || decision.stale()
-                ? ""
-                : decision.message();
+        if (decision.success() || decision.stale()) {
+            runtime.lastStartError = "";
+            runtime.lastStartFailure = FailureInfo.EMPTY;
+        } else {
+            runtime.lastStartError = decision.message();
+            if (FailureInfo.EMPTY.equals(runtime.lastStartFailure)) {
+                runtime.lastStartFailure = FailureInfo.capture(
+                        new IllegalStateException(decision.message()),
+                        FailurePhase.ACTIVATION,
+                        configuration.failureDetailPolicy(),
+                        null);
+            }
+        }
         for (String activationId : postCommit.executable().staleActivations) {
             ActivationRuntime impacted = activations.get(activationId);
             if (impacted != null) {
@@ -2114,7 +2213,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         for (ChildMountPlan plan : postCommit.children()) {
             String handleId = plan.handle().handleId();
             if (!next.components.containsKey(handleId)) {
-                terminalComponents.put(handleId, ComponentState.DISPOSED);
                 continue;
             }
             ComponentRuntime child = new ComponentRuntime(
@@ -2240,6 +2338,24 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         runtime.lastCleanupError = cleanupDetail.isBlank()
                                 ? "cleanup failed"
                                 : "cleanup failed: " + cleanupDetail;
+                        if (cleanupError != null) {
+                            runtime.lastCleanupFailure = FailureInfo.capture(
+                                    cleanupError,
+                                    FailurePhase.CLEANUP,
+                                    configuration.failureDetailPolicy(),
+                                    null);
+                        } else {
+                            String exceptionType = activation.scope.lastCleanupExceptionType();
+                            runtime.lastCleanupFailure = new FailureInfo(
+                                    FailurePhase.CLEANUP,
+                                    exceptionType.isBlank()
+                                            ? IllegalStateException.class.getName()
+                                            : exceptionType,
+                                    activation.scope.lastCleanupError(),
+                                    List.of(),
+                                    List.of(),
+                                    java.time.Instant.now());
+                        }
                         runtime.failedCleanup = activation;
                         if (activationData != null) {
                             draft.activations.put(
@@ -2255,6 +2371,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     } else {
                         // 清理成功后才能移除 Activation 索引，避免 Snapshot 或停止图丢失待清理资源。
                         runtime.lastCleanupError = "";
+                        runtime.lastCleanupFailure = FailureInfo.EMPTY;
                         runtime.failedCleanup = null;
                         draft.activations.remove(activation.activationId);
                         activations.remove(activation.activationId);
@@ -2262,9 +2379,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                             removeComponentInView(draft, runtime.handleId);
                             components.remove(runtime.handleId);
                             componentHandles.remove(runtime.handleId);
-                            terminalComponents.put(
-                                    runtime.handleId,
-                                    ComponentState.DISPOSED);
                             state = ComponentState.DISPOSED;
                             restart = false;
                         } else if (runtime.pendingStartFailure) {
@@ -2433,7 +2547,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 RuntimeView.ComponentData component = draft.components.get(handleId);
                 if (component != null && component.currentActivationId() == null) {
                     removeComponentInView(draft, handleId);
-                    executable.removedComponents.add(handleId);
+                    executable.removedComponents.put(
+                            handleId,
+                            new ExecutableCommitPlan.RemovedMount(component.mountId()));
                 } else if (component != null) {
                     dirty.add(handleId);
                 }
@@ -2598,19 +2714,22 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     diagnostics.add(new RuntimeDiagnostic(
                             DiagnosticCode.ACTIVATION_FAILED,
                             component.handleId(),
-                            startError));
+                            startError,
+                            runtime.lastStartFailure));
                 }
                 if (!cleanupError.isBlank()) {
                     diagnostics.add(new RuntimeDiagnostic(
                             DiagnosticCode.CLEANUP_FAILED,
                             component.handleId(),
-                            cleanupError));
+                            cleanupError,
+                            runtime.lastCleanupFailure));
                 }
                 if (startError.isBlank() && cleanupError.isBlank()) {
                     diagnostics.add(new RuntimeDiagnostic(
                             DiagnosticCode.ACTIVATION_FAILED,
                             component.handleId(),
-                            "component failed"));
+                            "component failed",
+                            runtime == null ? FailureInfo.EMPTY : runtime.lastStartFailure));
                 }
             }
         }
@@ -2632,12 +2751,71 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     private record PostCommitPlan(
-            List<ChildMountPlan<?>> children,
+            List<ChildMountPlan> children,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
     }
 
-    private record ComponentTerminal(ComponentState state) {
+    /**
+     * Operation-scoped transition aggregation. A parent mount becomes ACTIVE before its owned
+     * children are scheduled; the transaction/publication settlement follows the ownership closure
+     * without making children wait on the parent transition itself.
+     */
+    private final class OperationSettlement {
+        private final Set<String> affectedMounts =
+                ConcurrentHashMap.newKeySet();
+        private final Map<String, String> removedMountIds;
+
+        OperationSettlement(
+                Set<String> affectedMounts,
+                Map<String, String> removedMountIds) {
+            this.affectedMounts.addAll(affectedMounts);
+            this.removedMountIds = Map.copyOf(removedMountIds);
+        }
+
+        CompletableFuture<Void> await(Set<String> initial) {
+            return awaitTransitions(new ArrayList<>(schedule(initial)));
+        }
+
+        private CompletableFuture<Void> awaitTransitions(
+                List<CompletionStage<ComponentState>> transitions) {
+            if (transitions.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return CompletableFuture.allOf(transitions.stream()
+                            .map(CompletionStage::toCompletableFuture)
+                            .toArray(CompletableFuture[]::new))
+                    .thenComposeAsync(ignored -> {
+                        Set<String> owned = ownedClosure();
+                        Set<String> next = new LinkedHashSet<>(owned);
+                        next.removeAll(affectedMounts);
+                        if (next.isEmpty()) {
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        affectedMounts.addAll(next);
+                        return awaitTransitions(next.stream()
+                                .map(DefaultKnotraRuntime.this::whenSettled)
+                                .toList());
+                    }, executor);
+        }
+
+        private Set<String> ownedClosure() {
+            RuntimeView current = view;
+            Set<String> result = new LinkedHashSet<>();
+            for (String handleId : affectedMounts) {
+                if (current.components.containsKey(handleId)) {
+                    result.addAll(current.ownershipDescendants(handleId));
+                }
+            }
+            return result;
+        }
+
+        SettlementReport report(long generation) {
+            return settlementReport(
+                    generation,
+                    new LinkedHashSet<>(affectedMounts),
+                    removedMountIds);
+        }
     }
 
     // stale 表示按最新代际重试；非 stale 失败才作为组件启动失败保留并要求显式 retry。
@@ -2675,15 +2853,15 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             ContextHandleImpl handle) implements Intent {
     }
 
-    record MountIntent<C>(
+    record MountIntent(
             ContextHandleImpl context,
             String mountId,
-            PreparedComponent<C> prepared,
-            ComponentHandleImpl<C> handle) implements Intent {
+            PreparedComponent<?> prepared,
+            MountHandleImpl handle) implements Intent {
     }
 
     private record ReconfigureIntent<C>(
-            ComponentHandleImpl<C> handle,
+            ConfiguredMountHandleImpl<C> handle,
             Object config,
             long expectedRevision,
             boolean equivalent) implements Intent {
@@ -2693,7 +2871,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     private record DisposeIntent(
-            ComponentHandleImpl<?> handle) implements Intent {
+            MountHandleImpl handle) implements Intent {
     }
 
     private record ContextDisposeIntent(
@@ -2718,31 +2896,35 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         private final List<Intent> intents = new ArrayList<>();
         private final Map<String, ProvisionalConfig> provisionalConfigs = new HashMap<>();
         @Override
-        public <T> RegistrationHandle provide(
+        public <T> StagedRegistration<T> provide(
                 ContextHandle context,
                 CapabilityKey<T> key,
                 T value) {
             Objects.requireNonNull(context, "context");
             Objects.requireNonNull(key, "key");
             Objects.requireNonNull(value, "value");
+            ContextHandleImpl target = requireThisContext(context);
             RegistrationHandleImpl handle = new RegistrationHandleImpl(
                     DefaultKnotraRuntime.this,
                     Sequences.registration());
             intents.add(new ProvideIntent(
                     handle,
-                    (ContextHandleImpl) context,
+                    target,
                     key,
                     value));
-            return handle;
+            return new StagedRegistrationImpl<>(handle, key, target);
         }
+
 
         @Override
         public void revoke(RegistrationHandle registration) {
             Objects.requireNonNull(registration, "registration");
             RegistrationHandleImpl handle;
-            if (registration instanceof ProvidedImpl<?> provided) {
-                provided.requireFresh("revoke");
-                handle = provided.registration();
+            if (registration instanceof RegistrationImpl<?> typed) {
+                typed.requireFresh("revoke");
+                handle = typed.registration();
+            } else if (registration instanceof StagedRegistrationImpl<?> staged) {
+                handle = staged.registration();
             } else if (registration instanceof RegistrationHandleImpl internal) {
                 handle = internal;
             } else {
@@ -2772,7 +2954,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
 
         @Override
-        public <C> ComponentHandle<C> mount(
+        public <C> ConfiguredMountHandle<C> mount(
                 ContextHandle context,
                 String mountId,
                 ComponentFactory<C> factory,
@@ -2781,30 +2963,31 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
 
         @Override
-        public <C> ComponentHandle<C> mount(
+        public <C> ConfiguredMountHandle<C> mount(
                 ContextHandle context,
                 String mountId,
                 ComponentFactory<C> factory,
                 C config,
                 MountOptions options) {
             Objects.requireNonNull(context, "context");
+            ContextHandleImpl target = requireThisContext(context);
             PreparedComponent<C> prepared = PreparedComponent.prepare(
                     factory,
                     config,
                     options == null ? MountOptions.DEFAULT : options);
-            ComponentHandleImpl<C> handle = new ComponentHandleImpl<>(
+            ConfiguredMountHandleImpl<C> handle = new ConfiguredMountHandleImpl<>(
                     DefaultKnotraRuntime.this,
                     Sequences.handle(),
-                    new ComponentHandleImpl.Identity(
+                    new MountHandleImpl.Identity(
                             mountId,
                             prepared.descriptor().componentId(),
                             prepared.factoryId(),
-                            ((ContextHandleImpl) context).contextId()));
+                            target.contextId()));
             provisionalConfigs.put(
                     handle.handleId(),
                     new ProvisionalConfig(prepared.config(), 1));
-            intents.add(new MountIntent<>(
-                    (ContextHandleImpl) context,
+            intents.add(new MountIntent(
+                    target,
                     mountId,
                     prepared,
                     handle));
@@ -2812,31 +2995,59 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
 
         @Override
-        public ComponentHandle<io.knotra.NoConfig> mount(
+        public MountHandle mount(
                 ContextHandle context,
                 String mountId,
                 ComponentFactory<io.knotra.NoConfig> factory) {
-            return mount(context, mountId, factory, io.knotra.NoConfig.INSTANCE, MountOptions.DEFAULT);
+            return mountPlain(context, mountId, factory, MountOptions.DEFAULT);
         }
 
         @Override
-        public ComponentHandle<io.knotra.NoConfig> mount(
+        public MountHandle mount(
                 ContextHandle context,
                 String mountId,
                 ComponentFactory<io.knotra.NoConfig> factory,
                 MountOptions options) {
-            return mount(context, mountId, factory, io.knotra.NoConfig.INSTANCE, options);
+            return mountPlain(context, mountId, factory, options);
         }
 
+        private MountHandleImpl mountPlain(
+                ContextHandle context,
+                String mountId,
+                ComponentFactory<NoConfig> factory,
+                MountOptions options) {
+            ContextHandleImpl target = requireThisContext(context);
+            if (mountId == null || mountId.isBlank()) {
+                throw new IllegalArgumentException("mountId must not be blank");
+            }
+            PreparedComponent<NoConfig> prepared = PreparedComponent.prepare(
+                    factory,
+                    NoConfig.INSTANCE,
+                    options == null ? MountOptions.DEFAULT : options);
+            PlainMountHandleImpl handle = new PlainMountHandleImpl(
+                    DefaultKnotraRuntime.this,
+                    Sequences.handle(),
+                    new MountHandleImpl.Identity(
+                            mountId,
+                            prepared.descriptor().componentId(),
+                            prepared.factoryId(),
+                            target.contextId()));
+            intents.add(new MountIntent(
+                    target,
+                    mountId,
+                    prepared,
+                    handle));
+            return handle;
+        }
         @Override
-        public <C> ComponentHandle<C> reconfigure(
-                ComponentHandle<C> handle,
+        public <C> ConfiguredMountHandle<C> reconfigure(
+                ConfiguredMountHandle<C> handle,
                 C config) {
             Objects.requireNonNull(handle, "handle");
             Objects.requireNonNull(
                     config,
                     "config (use NoConfig.INSTANCE for components without configuration)");
-            if (!(handle instanceof ComponentHandleImpl<C> typed)
+            if (!(handle instanceof ConfiguredMountHandleImpl<C> typed)
                     || typed.runtime != DefaultKnotraRuntime.this
                     || !ownsOrProvisionallyOwns(typed)) {
                 throw new IllegalArgumentException(
@@ -2861,9 +3072,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
 
         @Override
-        public void dispose(ComponentHandle<?> handle) {
+        public void dispose(MountHandle handle) {
             Objects.requireNonNull(handle, "handle");
-            if (!(handle instanceof ComponentHandleImpl<?> typed)
+            if (!(handle instanceof MountHandleImpl typed)
                     || typed.runtime != DefaultKnotraRuntime.this
                     || !ownsOrProvisionallyOwns(typed)) {
                 throw new IllegalArgumentException(
@@ -2883,9 +3094,18 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             intents.add(new ContextDisposeIntent(handle));
         }
 
-        private boolean ownsOrProvisionallyOwns(ComponentHandleImpl<?> handle) {
+        private ContextHandleImpl requireThisContext(ContextHandle context) {
+            if (!(context instanceof ContextHandleImpl handle)
+                    || handle.runtime != DefaultKnotraRuntime.this) {
+                throw new IllegalArgumentException(
+                        "context handle does not belong to this runtime");
+            }
+            return handle;
+        }
+
+        private boolean ownsOrProvisionallyOwns(MountHandleImpl handle) {
             for (Intent intent : intents) {
-                if (intent instanceof MountIntent<?> mount
+                if (intent instanceof MountIntent mount
                         && mount.handle().handleId().equals(handle.handleId())) {
                     return true;
                 }
@@ -2893,9 +3113,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             return componentHandles.get(handle.handleId()) == handle;
         }
 
-        private PreparedComponent<?> preparedFor(ComponentHandleImpl<?> handle) {
+        private PreparedComponent<?> preparedFor(MountHandleImpl handle) {
             for (Intent intent : intents) {
-                if (intent instanceof MountIntent<?> mount
+                if (intent instanceof MountIntent mount
                         && mount.handle().handleId().equals(handle.handleId())) {
                     return mount.prepared();
                 }
@@ -2909,7 +3129,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
 
         private ProvisionalConfig provisionalConfigFor(
-                ComponentHandleImpl<?> handle,
+                MountHandleImpl handle,
                 PreparedComponent<?> prepared) {
             ProvisionalConfig provisional = provisionalConfigs.get(handle.handleId());
             if (provisional != null) {
@@ -2932,6 +3152,56 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         LifecycleScopeImpl.safeError(error),
                         error);
             }
+        }
+    }
+
+    private final class AdvancedRuntimeImpl implements AdvancedRuntime {
+        @Override
+        public RuntimeSnapshot snapshot() {
+            return DefaultKnotraRuntime.this.snapshot();
+        }
+
+        @Override
+        public <R> TransactionReceipt<R> transact(
+                Function<RuntimeTransaction, R> transaction) {
+            return DefaultKnotraRuntime.this.transact(transaction);
+        }
+
+        @Override
+        public <T> PublicationChange<T> publication(
+                ContextHandle context,
+                CapabilityKey<T> key,
+                T value) {
+            return PublicationImpl.publish(
+                    DefaultKnotraRuntime.this,
+                    context,
+                    key,
+                    value);
+        }
+
+        @Override
+        public <T> Registration<T> register(CapabilityKey<T> key, T value) {
+            return register(root(), key, value);
+        }
+
+        @Override
+        public <T> Registration<T> register(
+                ContextHandle context,
+                CapabilityKey<T> key,
+                T value) {
+            return DefaultKnotraRuntime.this.register(context, key, value);
+        }
+
+        @Override
+        public Settlement revoke(RegistrationHandle registration) {
+            return revokeRegistration(registration);
+        }
+
+        @Override
+        public ContextHandle childContext(ContextHandle parent, String name) {
+            TransactionReceipt<ContextHandle> receipt = transact(transaction ->
+                    transaction.childContext(parent, name));
+            return receipt.value();
         }
     }
 }

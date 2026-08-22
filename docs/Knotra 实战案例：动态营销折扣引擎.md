@@ -1,221 +1,228 @@
 # 实战案例：动态营销折扣引擎
 
-> 以电商大促期间常见的“营销折扣与促销策略热插拔”为场景，演示如何通过 Knotra 实现业务零重启、策略即时生效、在途计算安全排空与插件级安全卸载。
+场景：电商大促期间，折扣规则需要根据活动阶段快速调整；结算链路不能重启，正在计算的订单不能跨新旧规则混用。这个案例展示如何用 Publication 管理策略槽位、用动态代理保持结算服务在线，以及如何区分 fixed dependency 与 dynamic dependency。
 
----
+## 合约设计
 
-## 业务背景与技术挑战
-
-在电商结算中心，营销促销策略（如新人立减、双十一满减、VIP 会员阶梯折上折）由运营人员随时调整或按活动时间点自动切换。
-
-```mermaid
-graph LR
-    O["订单结算请求 Order"] --> C["结算中心 CheckoutService"]
-    C -->|动态代理调用| S["促销折扣策略 DiscountStrategy"]
-    S --> R["折后应付金额 DiscountResult"]
-```
-
-### 核心痛点与诉求
-- **严禁重启服务**：大促流量洪峰期间，重启结算服务会导致用户无法下单或连接超时。
-- **业务消费方零感知**：结算服务（`CheckoutService`）属于核心长驻服务，策略升级时不应触发结算服务本身的销毁或重建。
-- **在途计算防中断**：当新旧策略交替时，已经进入旧策略计算流程的在途订单必须安全完成，不能中途抛错。
-- **第三方插件热插拔**：某些大型促销活动（如黑五专属策略）需要打包为独立 JAR 插件动态加载，活动结束后彻底卸载并释放 ClassLoader。
-
----
-
-## 共享契约模块定义
-
-共享合约模块（`contract`）仅包含接口、数据模型与能力 Key，由宿主工程与策略插件共同引用：
+共享业务合约：
 
 ```java
-package com.example.promotion.contract;
-
-import io.knotra.CapabilityKey;
-
-// 1. 业务数据模型
-public record Order(String orderId, double originalAmount, String userTier) {}
-
-public record DiscountResult(double originalAmount, double finalAmount, String strategyName) {}
-
-// 2. 促销策略契约接口
 public interface DiscountStrategy {
-    DiscountResult applyDiscount(Order order);
+    Discount apply(Order order);
 }
 
-// 3. 契约标识符常量
-public final class PromotionContracts {
-    // 促销策略能力 Key
-    public static final CapabilityKey<DiscountStrategy> DISCOUNT_STRATEGY =
-            CapabilityKey.of("promotion.discount-strategy", DiscountStrategy.class);
+public interface CheckoutService {
+    Receipt checkout(Order order);
+}
 
-    // 结算服务自身对外暴露的能力 Key
-    public static final CapabilityKey<CheckoutServiceContract> CHECKOUT_SERVICE =
-            CapabilityKey.of("promotion.checkout-service", CheckoutServiceContract.class);
+public record Order(String orderId, String userId, int amount, String tier) {}
+public record Discount(String ruleId, int amount, String description) {}
+public record Receipt(String orderId, int payable, String discountRule) {}
+```
+
+策略是多实现、多阶段并存的场景，显式命名比 `Class<T>` 默认 key 更清楚：
+
+```java
+public interface PromotionContracts {
+    CapabilityKey<DiscountStrategy> CAMPAIGN =
+            CapabilityKey.of("promotion.campaign", DiscountStrategy.class);
+    CapabilityKey<DiscountStrategy> LOYALTY =
+            CapabilityKey.of("promotion.loyalty", DiscountStrategy.class);
 }
 ```
 
-为了让结算服务保持面向接口编程，定义结算服务接口：
+## 策略实现
+
+基础满减：
 
 ```java
-package com.example.promotion.contract;
-
-public interface CheckoutServiceContract {
-    DiscountResult processCheckout(Order order);
+public record ThresholdDiscount(int threshold, int amount) implements DiscountStrategy {
+    @Override
+    public Discount apply(Order order) {
+        return order.amount() >= threshold
+                ? new Discount("threshold-" + threshold, amount, "满减")
+                : new Discount("none", 0, "无折扣");
+    }
 }
 ```
 
----
-
-## 结算消费方服务实现
-
-结算服务实现 `CheckoutServiceContract` 并依赖 `DiscountStrategy`。通过注入 **`dynamicProxyRequired` 动态代理**，底层策略发生热替换或升级时，结算服务自身**保持在线且无需重启**：
+会员分层叠加券：
 
 ```java
-package com.example.promotion.core;
+public record TieredCampaignDiscount(Map<String, Integer> rates) implements DiscountStrategy {
+    @Override
+    public Discount apply(Order order) {
+        int rate = rates.getOrDefault(order.tier(), 0);
+        int amount = order.amount() * rate / 100;
+        return new Discount("tiered-" + order.tier(), amount, "会员折扣");
+    }
+}
+```
 
-import com.example.promotion.contract.*;
-import io.knotra.NoConfig;
-import io.knotra.beans.BeanDefinition;
-import io.knotra.beans.Beans;
+策略对象保持纯函数形态：不做 I/O、不保存订单状态、不启动线程。
 
-// 纯 POJO 结算服务（零 Knotra 框架侵入）
-public final class CheckoutService implements CheckoutServiceContract {
-    private final DiscountStrategy discountStrategy; // 由 Knotra 注入动态代理
+## 结算服务
 
-    public CheckoutService(DiscountStrategy discountStrategy) {
-        this.discountStrategy = discountStrategy;
+结算服务对底层策略使用动态代理。策略替换时结算服务实例不重建：
+
+```java
+public final class DynamicCheckoutService implements CheckoutService {
+
+    private final DiscountStrategy campaign;
+
+    public DynamicCheckoutService(DiscountStrategy campaign) {
+        this.campaign = campaign;
     }
 
     @Override
-    public DiscountResult processCheckout(Order order) {
-        // 动态代理自动获取调用租约并路由至当前最新的策略实现
-        DiscountResult result = discountStrategy.applyDiscount(order);
-        System.out.printf("订单 [%s] 原价: %.2f, 应付: %.2f (应用策略: %s)%n",
-                order.orderId(), result.originalAmount(), result.finalAmount(), result.strategyName());
-        return result;
-    }
-}
-
-// 声明装配工厂：将动态代理注入构造函数，并将创建出的实例发布为 CHECKOUT_SERVICE
-public final class CheckoutAssembly {
-    public static BeanDefinition<NoConfig, CheckoutService> createDefinition() {
-        return Beans.component("checkout-service")
-                // 1. 注入动态依赖：底层提供方替换时，消费方不重启
-                .with(Beans.dynamicProxyRequired(PromotionContracts.DISCOUNT_STRATEGY))
-                // 2. 构造函数创建实例
-                .create(CheckoutService::new)
-                // 3. 对外发布装配好的结算能力
-                .provide(PromotionContracts.CHECKOUT_SERVICE)
-                .build();
+    public Receipt checkout(Order order) {
+        Discount discount = campaign.apply(order);
+        return new Receipt(
+                order.orderId(),
+                Math.max(order.amount() - discount.amount(), 0),
+                discount.ruleId());
     }
 }
 ```
 
----
-
-## 促销策略实现与演进
-
-### 基础策略：全场 95 折（V1）
+定义并挂载：
 
 ```java
-package com.example.promotion.strategy;
-
-import com.example.promotion.contract.DiscountResult;
-import com.example.promotion.contract.DiscountStrategy;
-import com.example.promotion.contract.Order;
-
-public final class DefaultNineFiveDiscount implements DiscountStrategy {
-    @Override
-    public DiscountResult applyDiscount(Order order) {
-        double finalPrice = order.originalAmount() * 0.95;
-        return new DiscountResult(order.originalAmount(), finalPrice, "全场 95 折");
-    }
-}
+BeanDefinition<DynamicCheckoutService> definition = Beans
+        .component("dynamic-checkout")
+        .with(Beans.dynamic(PromotionContracts.CAMPAIGN))
+        .create(DynamicCheckoutService::new)
+        .provideAs(CheckoutService.class, service -> service)
+        .build();
 ```
 
-### 进阶策略：满 200 减 50 阶梯促销（V2）
+如果某类结算必须在一次请求里读取多个数据并固定同一代策略，注入 `DynamicCapability<DiscountStrategy>` 并用 `call` 包住整个计算：
 
 ```java
-package com.example.promotion.strategy;
-
-import com.example.promotion.contract.DiscountResult;
-import com.example.promotion.contract.DiscountStrategy;
-import com.example.promotion.contract.Order;
-
-public final class TieredThresholdDiscount implements DiscountStrategy {
-    @Override
-    public DiscountResult applyDiscount(Order order) {
-        double original = order.originalAmount();
-        double discount = (original >= 200.0) ? 50.0 : 0.0;
-        double finalPrice = Math.max(0.0, original - discount);
-        return new DiscountResult(original, finalPrice, "满 200 减 50 大促");
-    }
-}
+Quote quote = capability.call(current -> new Quote(
+        current.apply(order),
+        inventory.reserve(order),
+        risk.evaluate(order)));
 ```
 
----
-
-## 运行时热替换与安全排空演练
-
-完整端到端演示：挂载结算服务、在线替换促销策略、在途安全收敛与验证：
+## 发布与热替换
 
 ```java
-package com.example.promotion.host;
+try (KnotraRuntime runtime = KnotraRuntime.create()) {
+    PublicationChange<DiscountStrategy> initial = runtime.publish(
+            PromotionContracts.CAMPAIGN,
+            new ThresholdDiscount(300, 30));
+    Publication<DiscountStrategy> campaign = initial.publication();
 
-import com.example.promotion.contract.*;
-import com.example.promotion.core.CheckoutAssembly;
-import com.example.promotion.strategy.DefaultNineFiveDiscount;
-import com.example.promotion.strategy.TieredThresholdDiscount;
-import io.knotra.*;
-import io.knotra.beans.Beans;
+    MountHandle checkout = definition.mount(runtime);
+    checkout.requireActive(Duration.ofSeconds(10));
 
-public class PromotionEngineDemo {
-    public static void main(String[] args) {
-        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+    var view = runtime.root().view();
+    Receipt before = view.require(CheckoutService.class)
+            .checkout(new Order("A1", "u1", 400, "gold"));
 
-            // 1. 发布初始策略 V1（全场 95 折）
-            Provided<DiscountStrategy> strategyProvided = runtime.provide(
-                    PromotionContracts.DISCOUNT_STRATEGY,
-                    new DefaultNineFiveDiscount()
-            );
+    PublicationChange<DiscountStrategy> upgraded =
+            campaign.update(new TieredCampaignDiscount(Map.of("gold", 15)));
+    SettlementReport report = upgraded.awaitSettled(Duration.ofSeconds(10));
 
-            // 2. 挂载长驻结算服务（Knotra 自动完成依赖注入并发布 CHECKOUT_SERVICE）
-            ComponentHandle<NoConfig> checkoutHandle = Beans.mount(
-                    runtime, CheckoutAssembly.createDefinition());
-            checkoutHandle.requireActive();
-
-            // 3. 从 Knotra 容器直接获取已经装配完毕的结算服务实例（无需手动 new）
-            CheckoutServiceContract checkoutService = runtime.root().view().require(
-                    PromotionContracts.CHECKOUT_SERVICE);
-
-            // 4. 处理首批订单（命中 V1 策略）
-            Order order1 = new Order("ORD-001", 100.0, "REGULAR");
-            checkoutService.processCheckout(order1);
-            // 控制台输出: 订单 [ORD-001] 原价: 100.00, 应付: 95.00 (应用策略: 全场 95 折)
-
-            // 5. 运行时热替换为 V2 策略（满 200 减 50），应用不重启
-            System.out.println(">>> [活动开始] 正在热切换为大促满减策略...");
-            Provided<DiscountStrategy> v2 = strategyProvided.replace(new TieredThresholdDiscount());
-
-            // 等待依赖收敛就绪（底层在途任务安全排空）
-            v2.whenSettled().toCompletableFuture().join();
-
-            // 6. 再次处理订单（无缝命中 V2 策略，CheckoutService 实例未发生任何重启）
-            Order order2 = new Order("ORD-002", 300.0, "VIP");
-            checkoutService.processCheckout(order2);
-            // 控制台输出: 订单 [ORD-002] 原价: 300.00, 应付: 250.00 (应用策略: 满 200 减 50 大促)
-
-            System.out.println(">>> 促销策略热替换成功，结算服务全程无中断。");
-        }
+    if (report.hasFailedMounts()) {
+        throw new IllegalStateException(report.failedMounts().toString());
     }
+
+    checkout.requireActive(Duration.ofSeconds(10));
+    Receipt after = view.require(CheckoutService.class)
+            .checkout(new Order("A2", "u1", 400, "gold"));
 }
 ```
 
----
+结果：
 
-## 架构价值总结
+```text
+A1 payable=370 rule=threshold-300
+A2 payable=340 rule=tiered-gold
+```
 
-- **业务代码零污染**：`CheckoutService` 仅面向纯 Java 接口编程，无框架注解或硬编码依赖。
-- **容器自动装配托管**：通过 `Beans.component`，Knotra 自动完成依赖查找、代理注入与生命周期管理，业务使用时直接通过 `runtime.root().view().require(...)` 获取。
-- **无感平滑切换**：通过 `dynamicProxyRequired` 动态代理，提供方升级时消费方保持在线，方法调用自动穿透到最新实现。
-- **在途任务安全保护**：策略替换时，Knotra 通过租约排空机制等待旧策略上的在途计算安全返回，避免产生脏数据或中途报错。
+`report.allActive()` 可能为 false，因为动态代理结算服务不需要重建，影响集可能为空。这不是故障；确认具体结算服务可用要用 `checkout.requireActive(Duration.ofSeconds(10))`。
+
+## 固定代际消费方
+
+订单风控或批量计费如果必须保证整批订单使用同一策略，应使用 fixed dependency：
+
+```java
+BeanDefinition<BatchSettlementJob> definition = Beans
+        .component("batch-settlement")
+        .with(Beans.required(PromotionContracts.CAMPAIGN))
+        .create(BatchSettlementJob::new)
+        .build();
+```
+
+提供方替换时，该 Job 会绑定新的 Registration 并重建。旧 Activation 中已经开始的批次继续使用旧代际，完成并 drain 后释放。
+
+选择规则：
+
+- 单次方法调用或无状态路由：`dynamic`。
+- 一次回调中多个观察必须一致：`dynamicCapability`。
+- 一个业务对象整个生命周期都要绑定一代：`required`。
+- 提供方可有可无且消费方可独立工作：`optional` / `dynamicOptional`。
+
+## 双策略并行
+
+活动与积分使用两个槽位：
+
+```java
+BeanDefinition<CompositeCheckoutService> definition = Beans
+        .component("composite-checkout")
+        .with(Beans.dynamic(PromotionContracts.CAMPAIGN))
+        .with(Beans.dynamic(PromotionContracts.LOYALTY))
+        .create(CompositeCheckoutService::new)
+        .provideAs(CheckoutService.class, service -> service)
+        .build();
+```
+
+两个 Publication 独立更新，各自返回自己的 `PublicationChange`。不要保存第一次 change 再拿它更新第二次策略；长期槽位对象是 `Publication<T>`。
+
+## 回滚策略
+
+发布新策略前保留当前策略对象：
+
+```java
+DiscountStrategy previous = currentStrategy;
+PublicationChange<DiscountStrategy> change = campaign.update(next);
+SettlementReport report = change.awaitSettled(Duration.ofSeconds(30));
+
+if (report.hasFailedMounts() && cannotTolerateFailure) {
+    campaign.update(previous).awaitSettled(Duration.ofSeconds(30));
+}
+```
+
+回滚也是一次新的代际，不是恢复旧 Registration 身份。监控上应记录 generation 和失败 outcome，而不是只记录“update 方法返回”。
+
+## 灰度与 Context
+
+不同租户可以使用子 Context 遮蔽全局策略：
+
+```java
+ContextHandle vip = runtime.advanced()
+        .transact(transaction -> transaction.childContext(runtime.root(), "vip"))
+        .value();
+
+runtime.publish(vip, PromotionContracts.CAMPAIGN, new TieredCampaignDiscount(vipRates))
+        .awaitSettled(Duration.ofSeconds(10));
+
+Receipt receipt = vip.view().require(CheckoutService.class).checkout(order);
+```
+
+在 vip Context 下挂载的结算服务看到 vip 策略；根 Context 服务仍使用全局策略。Context 释放后其中的 Publication 进入 `DISPLACED`，不会静默回落为可更新槽位。
+
+## 运行检查
+
+大促平台建议监控：
+
+- 每次 update 的 settlement generation 与耗时。
+- `hasFailedMounts()` 及失败挂载 ID。
+- 动态代理调用失败率，特别是 provider 缺失。
+- fixed 消费方重建次数。
+- 策略对象池和订单线程是否持有旧策略强引用。
+- 灰度 Context 数量和释放状态。
+
+核心收益不是少写几行装配代码，而是把“策略代际、消费方重建、在途调用 drain”变成显式可观测的运行时行为。

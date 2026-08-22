@@ -1,35 +1,32 @@
 package io.knotra.pf4j;
 
-import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
-import io.knotra.ConfigDecoder;
-import io.knotra.ContextHandle;
-
 import java.util.Objects;
 
+import io.knotra.ComponentFactory;
+import io.knotra.ConfigDecoder;
+import io.knotra.ContextHandle;
+import io.knotra.NoConfig;
+
 /**
- * 活跃 artifact 工厂的内部句柄实现。
- *
- * <p>句柄只在 artifact 处于 ACTIVE 时有效；drain 会清空工厂与 decoder，使陈旧句柄
- * 无法继续挂载或解码。挂载前重新执行配置 token 与实例类型校验，防止 raw cast
- * 绕过类型化解析。</p>
+ * Internal active factory view. Mounting is split into the two leaf classes so the public type
+ * never presents a no-config mount as a configured mount.
  */
-final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
+abstract class ManagedFactory implements ArtifactFactoryHandle {
 
     final DefaultPf4jArtifactAdapter owner;
     final ManagedArtifact artifact;
     final String factoryId;
-    final Class<C> configType;
-    volatile ConfigDecoder<C> decoder;
-    volatile ComponentFactory<C> factory;
+    final Class<?> configType;
+    volatile ConfigDecoder<?> decoder;
+    volatile ComponentFactory<?> factory;
 
     ManagedFactory(
             DefaultPf4jArtifactAdapter owner,
             ManagedArtifact artifact,
             String factoryId,
-            Class<C> configType,
-            ConfigDecoder<C> decoder,
-            ComponentFactory<C> factory) {
+            Class<?> configType,
+            ConfigDecoder<?> decoder,
+            ComponentFactory<?> factory) {
         this.owner = owner;
         this.artifact = artifact;
         this.factoryId = factoryId;
@@ -64,58 +61,12 @@ final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
     }
 
     @Override
-    public Class<C> configType() {
+    public Class<?> configType() {
         return configType;
     }
 
-    @Override
-    public C decodeConfig(Object rawConfig) {
-        ConfigDecoder<C> current = requireUsable("decode");
-        C decoded;
-        try {
-            decoded = current.decode(rawConfig);
-        } catch (Throwable failure) {
-            throw new ArtifactOperationException(
-                    artifact.artifactId,
-                    "decode",
-                    "factory " + factoryId + " could not decode configuration: "
-                            + FailureText.describe(failure));
-        }
-        if (decoded == null || !configType.isInstance(decoded)) {
-            throw new ArtifactOperationException(
-                    artifact.artifactId,
-                    "decode",
-                    "factory " + factoryId + " decoder must produce "
-                            + configType.getName() + ", not "
-                            + (decoded == null ? "null" : decoded.getClass().getName()));
-        }
-        return decoded;
-    }
-
-    @Override
-    public ComponentHandle<C> mount(ContextHandle context, String mountId, C config) {
-        ComponentFactory<C> current = requireUsable("mount");
-        if (config == null) {
-            throw new ArtifactOperationException(
-                    artifact.artifactId,
-                    "mount",
-                    "factory " + factoryId + " requires non-null config type "
-                            + configType.getName()
-                            + "; use mount(context, mountId) when the decoder supplies defaults");
-        }
-        if (!configType.isInstance(config)) {
-            throw new ArtifactOperationException(
-                    artifact.artifactId,
-                    "mount",
-                    "factory " + factoryId + " requires config type "
-                            + configType.getName() + ", not "
-                            + config.getClass().getName());
-        }
-        return owner.mount(this, context, mountId, current, config);
-    }
-
-    private <T> T requireUsable(String phase) {
-        T current = phase.equals("mount") ? (T) factory : (T) decoder;
+    final <T> T requireUsable(String phase) {
+        Object current = "mount".equals(phase) ? factory : decoder;
         if (current == null
                 || !artifact.acceptingMounts
                 || artifact.state != ArtifactState.ACTIVE) {
@@ -124,6 +75,123 @@ final class ManagedFactory<C> implements ArtifactFactoryHandle<C> {
                     phase,
                     "factory handle is no longer usable: " + factoryId);
         }
-        return current;
+        return cast(current);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T cast(Object value) {
+        return (T) value;
+    }
+
+    static final class NoConfigFactory extends ManagedFactory
+            implements ArtifactFactoryHandle.NoConfig {
+
+        NoConfigFactory(
+                DefaultPf4jArtifactAdapter owner,
+                ManagedArtifact artifact,
+                String factoryId,
+                ConfigDecoder<io.knotra.NoConfig> decoder,
+                ComponentFactory<io.knotra.NoConfig> factory) {
+            super(owner, artifact, factoryId, io.knotra.NoConfig.class, decoder, factory);
+        }
+
+        @Override
+        public io.knotra.MountHandle mount(ContextHandle context, String mountId) {
+            ComponentFactory<io.knotra.NoConfig> current = requireUsable("mount");
+            return owner.mount(this, context, mountId, current);
+        }
+    }
+
+    static final class ConfiguredFactory<C> extends ManagedFactory
+            implements ArtifactFactoryHandle.Configured<C> {
+
+        ConfiguredFactory(
+                DefaultPf4jArtifactAdapter owner,
+                ManagedArtifact artifact,
+                String factoryId,
+                Class<C> configType,
+                ConfigDecoder<C> decoder,
+                ComponentFactory<C> factory) {
+            super(owner, artifact, factoryId, configType, decoder, factory);
+        }
+
+        @Override
+        public C decodeConfig(Object rawConfig) {
+            ConfigDecoder<C> current = requireUsable("decode");
+            C decoded;
+            try {
+                decoded = current.decode(rawConfig);
+            } catch (Throwable failure) {
+                throw new ArtifactOperationException(
+                        artifact.artifactId,
+                        "decode",
+                        "factory " + factoryId + " could not decode configuration: "
+                                + FailureText.describe(failure));
+            }
+            if (decoded == null || !configType.isInstance(decoded)) {
+                throw new ArtifactOperationException(
+                        artifact.artifactId,
+                        "decode",
+                        "factory " + factoryId + " decoder must produce "
+                                + configType.getName() + ", not "
+                                + (decoded == null ? "null" : decoded.getClass().getName()));
+            }
+            return decoded;
+        }
+
+        @Override
+        public io.knotra.ConfiguredMountHandle<C> mount(
+                ContextHandle context,
+                String mountId,
+                C config) {
+            ComponentFactory<C> current = requireUsable("mount");
+            if (config == null) {
+                throw new ArtifactOperationException(
+                        artifact.artifactId,
+                        "mount",
+                        "factory " + factoryId + " requires non-null config type "
+                                + configType.getName());
+            }
+            if (!configType.isInstance(config)) {
+                throw new ArtifactOperationException(
+                        artifact.artifactId,
+                        "mount",
+                        "factory " + factoryId + " requires config type "
+                                + configType.getName() + ", not "
+                                + config.getClass().getName());
+            }
+            return owner.mount(this, context, mountId, current, config);
+        }
+    }
+
+    static <C> ManagedFactory create(
+            DefaultPf4jArtifactAdapter owner,
+            ManagedArtifact artifact,
+            String factoryId,
+            Class<C> configType,
+            ConfigDecoder<C> decoder,
+            ComponentFactory<C> factory) {
+        Objects.requireNonNull(configType, "configType");
+        if (configType == io.knotra.NoConfig.class) {
+            @SuppressWarnings("unchecked")
+            ConfigDecoder<io.knotra.NoConfig> noConfigDecoder =
+                    (ConfigDecoder<io.knotra.NoConfig>) decoder;
+            @SuppressWarnings("unchecked")
+            ComponentFactory<io.knotra.NoConfig> noConfigFactory =
+                    (ComponentFactory<io.knotra.NoConfig>) factory;
+            return new NoConfigFactory(
+                    owner,
+                    artifact,
+                    factoryId,
+                    noConfigDecoder,
+                    noConfigFactory);
+        }
+        return new ConfiguredFactory<>(
+                owner,
+                artifact,
+                factoryId,
+                configType,
+                decoder,
+                factory);
     }
 }

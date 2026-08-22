@@ -6,13 +6,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.example.integration.contract.IntegrationCoordinator;
-import io.knotra.ComponentFactory;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
+import io.knotra.MountFactory;
 import io.knotra.loader.ClasspathFactoryResolver;
 import io.knotra.loader.ComponentEntry;
-import io.knotra.loader.ComponentFactoryResolver;
 import io.knotra.loader.ComponentTree;
 import io.knotra.loader.FactoryRef;
 import io.knotra.loader.KnotraLoader;
@@ -55,10 +53,6 @@ final class LoaderPf4jBridgeIntegrationTest {
         runtime.close();
     }
 
-    private static ComponentFactoryResolver artifactBridge(Pf4jArtifactAdapter adapter) {
-        return Pf4jFactoryResolver.of(adapter);
-    }
-
     @Test
     void officialBridgeReconcilesNestedTreeWithDecoderIdentityAndOwnership(
             @TempDir Path pluginsRoot) throws Exception {
@@ -67,7 +61,7 @@ final class LoaderPf4jBridgeIntegrationTest {
             KnotraLoader loader = KnotraLoader.over(
                     runtime,
                     runtime.root(),
-                    artifactBridge(adapter));
+                    Pf4jFactoryResolver.of(adapter));
             try {
                 ReconcileResult rejected = loader.reconcile(ComponentTree.of(
                         ComponentEntry.configured("greeting", GREETING, "   ")));
@@ -75,7 +69,7 @@ final class LoaderPf4jBridgeIntegrationTest {
                 assertTrue(rejected.diagnostics().stream()
                         .anyMatch(item -> item.code() == LoaderDiagnosticCode.CONFIG_INVALID),
                         () -> rejected.diagnostics().toString());
-                assertTrue(runtime.snapshot().components().isEmpty());
+                assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
 
                 ComponentTree desired = ComponentTree.of(ComponentEntry.configured(
                         "greeting", GREETING, "  hello  ",
@@ -96,7 +90,7 @@ final class LoaderPf4jBridgeIntegrationTest {
                         greeting.contextPath());
                 assertTrue(parent.contextPath().endsWith("greeting/parent"),
                         parent.contextPath());
-                assertTrue(runtime.snapshot().contexts().stream()
+                assertTrue(runtime.advanced().snapshot().contexts().stream()
                         .anyMatch(context -> context.canonicalPath()
                                 .endsWith("greeting/parent")));
                 assertEquals(3, adapter.ownership(IntegrationTestKit.ARTIFACT_ID).size(),
@@ -132,7 +126,7 @@ final class LoaderPf4jBridgeIntegrationTest {
             assertFalse(result.converged());
             assertTrue(result.diagnostics().stream().anyMatch(
                     item -> item.code() == LoaderDiagnosticCode.RESOLUTION_FAILED));
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             assertTrue(loader.snapshot().entries().isEmpty());
         }
     }
@@ -142,10 +136,10 @@ final class LoaderPf4jBridgeIntegrationTest {
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
-            ComponentFactory<NoConfig> local = IntegrationTestKit.classpathFactory(
-                    "local-recovery", (context, config) -> {
+            MountFactory local = IntegrationTestKit.classpathFactory(
+                    "local-recovery", context -> {
                     });
-            ComponentFactoryResolver classpath = ClasspathFactoryResolver.builder()
+            ClasspathFactoryResolver classpath = ClasspathFactoryResolver.builder()
                     .add(LOCAL, local)
                     .build();
             KnotraLoader loader = KnotraLoader.over(
@@ -172,7 +166,7 @@ final class LoaderPf4jBridgeIntegrationTest {
 
                 assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                         IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
-                assertTrue(runtime.snapshot().components().isEmpty(),
+                assertTrue(runtime.advanced().snapshot().mounts().isEmpty(),
                         "the drained race must not leave a partial mount");
                 assertTrue(loader.snapshot().entry("gated").isEmpty());
 
@@ -191,9 +185,9 @@ final class LoaderPf4jBridgeIntegrationTest {
     @Test
     void loaderRetryConvergesAfterAFailedStart() throws Exception {
         AtomicInteger starts = new AtomicInteger();
-        ComponentFactory<NoConfig> flaky = IntegrationTestKit.classpathFactory(
+        MountFactory flaky = IntegrationTestKit.classpathFactory(
                 "flaky",
-                (context, config) -> {
+                context -> {
                     if (starts.incrementAndGet() == 1) {
                         throw new IllegalStateException("intentional first-start failure");
                     }

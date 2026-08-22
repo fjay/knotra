@@ -47,6 +47,7 @@
         <module>knotra-spring-starter</module>
         <module>knotra-pf4j-starter</module>
         <module>knotra-integration-tests</module>
+        <module>knotra-docs-examples</module>
     </modules>
 
     <dependencyManagement>

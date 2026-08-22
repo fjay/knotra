@@ -1,28 +1,24 @@
 package io.knotra.internal;
 
-
 /**
- * 用户 {@code start()} 中提出的子挂载暂存计划。
+ * A child mount staged by component start code.
  *
- * <p>计划由 {@link ActivationContextImpl} 创建，只包含临时 {@link ComponentHandleImpl}、挂载 ID 和
- * 已归一化的 {@link PreparedComponent}；父 Activation 提交成功后才由
- * {@link DefaultKnotraRuntime} 写入视图并创建子 {@link ComponentRuntime}，失败则连同临时句柄一起废弃。</p>
+ * <p>The plan is created by {@link ActivationContextImpl}. The parent activation publishes it only
+ * after successful commit; a failed activation discards both the provisional handle and prepared
+ * component.</p>
  */
-final class ChildMountPlan<C> {
-    private final ComponentHandleImpl<C> handle;
+final class ChildMountPlan {
+    private final MountHandleImpl handle;
     private final String mountId;
-    private final PreparedComponent<C> prepared;
+    private final PreparedComponent<?> prepared;
 
-    ChildMountPlan(
-            ComponentHandleImpl<C> handle,
-            String mountId,
-            PreparedComponent<C> prepared) {
+    ChildMountPlan(MountHandleImpl handle, String mountId, PreparedComponent<?> prepared) {
         this.handle = handle;
         this.mountId = mountId;
         this.prepared = prepared;
     }
 
-    ComponentHandleImpl<C> handle() {
+    MountHandleImpl handle() {
         return handle;
     }
 
@@ -30,7 +26,7 @@ final class ChildMountPlan<C> {
         return mountId;
     }
 
-    PreparedComponent<C> prepared() {
+    PreparedComponent<?> prepared() {
         return prepared;
     }
 }

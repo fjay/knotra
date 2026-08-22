@@ -99,7 +99,7 @@ final class LifecycleReconcileTest {
             configs.add(config);
         }, CapabilityRequirement.required(TEXT));
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
-                LoaderTestKit.resolver(ref, factory));
+                LoaderTestKit.resolver(ref, factory, (Object raw) -> String.valueOf(raw)));
         try {
             var waiting = loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("alpha", ref, "one")));
@@ -120,7 +120,7 @@ final class LifecycleReconcileTest {
     void failedActivationIsNotAutomaticallyRetried() throws Exception {
         FactoryRef ref = FactoryRef.of("bad");
         AtomicInteger attempts = new AtomicInteger();
-        var factory = LoaderTestKit.factory("bad", (context, config) -> {
+        ComponentFactory<NoConfig> factory = LoaderTestKit.factory("bad", (context, config) -> {
             attempts.incrementAndGet();
             throw new IllegalStateException("temporary");
         });
@@ -130,6 +130,10 @@ final class LifecycleReconcileTest {
             var first = loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE)));
             assertFalse(first.converged());
+            assertTrue(first.diagnostics().stream().anyMatch(diagnostic ->
+                    diagnostic.code() == LoaderDiagnosticCode.ACTIVATION_FAILED
+                            && diagnostic.message().contains("java.lang.IllegalStateException: temporary")),
+                    () -> String.valueOf(first.diagnostics()));
             assertEquals(ComponentState.FAILED, loader.snapshot().entry("alpha").orElseThrow().state());
 
             loader.reconcile(ComponentTree.of(
@@ -144,7 +148,7 @@ final class LifecycleReconcileTest {
     void failedContextTeardownBlocksReplacementThenRetries() throws Exception {
         FactoryRef ref = FactoryRef.of("old");
         AtomicBoolean failOnce = new AtomicBoolean(true);
-        var factory = LoaderTestKit.factory("old", (context, config) ->
+        ComponentFactory<NoConfig> factory = LoaderTestKit.factory("old", (context, config) ->
                 context.lifecycle().onClose("cleanup", () -> {
                     if (failOnce.getAndSet(false)) {
                         throw new IllegalStateException("cleanup failed");
@@ -158,8 +162,8 @@ final class LifecycleReconcileTest {
             var blocked = loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("beta", ref, NoConfig.INSTANCE)));
             LoaderTestKit.assertRejected(blocked, LoaderDiagnosticCode.TEARDOWN_FAILED);
-            assertTrue(runtime.snapshot().components().stream()
-                    .noneMatch(component -> component.mountId().equals("beta")));
+            assertTrue(runtime.advanced().snapshot().mounts().stream()
+                    .noneMatch(mount -> mount.mountId().equals("beta")));
 
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("beta", ref, NoConfig.INSTANCE))));
@@ -249,13 +253,14 @@ final class LifecycleReconcileTest {
                 FactoryIdentity.of("implementation", "", "old"), oldFactory);
         ResolvedFactory newDefinition = new ResolvedFactory(
                 FactoryIdentity.of("implementation", "", "new"),
+                ResolvedFactory.FactoryKind.PLAIN,
                 null,
                 (context, config) -> java.util.concurrent.CompletableFuture.failedFuture(
                         new ControlledMountException(java.util.List.of(new io.knotra.RuntimeDiagnostic(
                                 io.knotra.DiagnosticCode.INVALID_MOUNT_ID,
                                 context.mountId(),
                                 "controlled mount rejected")))),
-                ReconfigureStrategy.direct());
+                ReconfigureStrategy.unsupportedPlain());
         AtomicReference<ResolvedFactory> selected = new AtomicReference<>(oldDefinition);
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), wanted ->
                 selected.get() == null ? java.util.Optional.empty() : java.util.Optional.of(selected.get()));
@@ -286,6 +291,7 @@ final class LifecycleReconcileTest {
                 LoaderTestKit.factory("old", (context, config) -> {}));
         ResolvedFactory oldDefinition = new ResolvedFactory(
                 directOld.identity(),
+                ResolvedFactory.FactoryKind.PLAIN,
                 null,
                 (context, config) -> {
                     if (rejectFallback.get()) {
@@ -297,16 +303,17 @@ final class LifecycleReconcileTest {
                     }
                     return directOld.mountStrategy().mountAsync(context, config);
                 },
-                ReconfigureStrategy.direct());
+                ReconfigureStrategy.unsupportedPlain());
         ResolvedFactory newDefinition = new ResolvedFactory(
                 FactoryIdentity.of("implementation", "", "new"),
+                ResolvedFactory.FactoryKind.PLAIN,
                 null,
                 (context, config) -> CompletableFuture.failedFuture(
                         new ControlledMountException(List.of(new io.knotra.RuntimeDiagnostic(
                                 io.knotra.DiagnosticCode.INVALID_MOUNT_ID,
                                 context.mountId(),
                                 "replacement rejected")))),
-                ReconfigureStrategy.direct());
+                ReconfigureStrategy.unsupportedPlain());
         AtomicReference<ResolvedFactory> selected = new AtomicReference<>(oldDefinition);
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), wanted ->
                 java.util.Optional.of(selected.get()));
@@ -360,15 +367,15 @@ final class LifecycleReconcileTest {
         FactoryRef providerRef = FactoryRef.of("provider");
         FactoryRef consumerRef = FactoryRef.of("consumer");
         List<String> observed = new CopyOnWriteArrayList<>();
-        var provider = LoaderTestKit.factory("provider", (context, config) -> {
+        ComponentFactory<String> provider = LoaderTestKit.factory("provider", (context, config) -> {
             if (config.equals("child")) {
                 context.provide(TEXT, "child");
             }
         });
-        var consumer = LoaderTestKit.factory("consumer", (context, config) ->
+        ComponentFactory<NoConfig> consumer = LoaderTestKit.factory("consumer", (context, config) ->
                 observed.add(context.require(TEXT)), CapabilityRequirement.required(TEXT));
         ComponentFactoryResolver resolver = CompositeFactoryResolver.of(
-                LoaderTestKit.resolver(providerRef, provider),
+                LoaderTestKit.resolver(providerRef, provider, (Object raw) -> String.valueOf(raw)),
                 LoaderTestKit.resolver(consumerRef, consumer));
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver);
         try {
@@ -399,7 +406,7 @@ final class LifecycleReconcileTest {
         CountDownLatch entered = new CountDownLatch(1);
         CompletableFuture<Void> gate = new CompletableFuture<>();
         AtomicInteger enteredCount = new AtomicInteger();
-        var factory = LoaderTestKit.factory("serialized", (context, config) -> {
+        ComponentFactory<NoConfig> factory = LoaderTestKit.factory("serialized", (context, config) -> {
             enteredCount.incrementAndGet();
             entered.countDown();
             gate.join();
@@ -433,7 +440,7 @@ final class LifecycleReconcileTest {
     void closeFailureCanBeRetried() throws Exception {
         FactoryRef ref = FactoryRef.of("alpha");
         AtomicBoolean failOnce = new AtomicBoolean(true);
-        var factory = LoaderTestKit.factory("alpha", (context, config) ->
+        ComponentFactory<NoConfig> factory = LoaderTestKit.factory("alpha", (context, config) ->
                 context.lifecycle().onClose("cleanup", () -> {
                     if (failOnce.getAndSet(false)) {
                         throw new IllegalStateException("cleanup failed");
@@ -450,14 +457,14 @@ final class LifecycleReconcileTest {
         assertTrue(loader.snapshot().closed());
         loader.close();
         assertTrue(loader.snapshot().entries().isEmpty());
-        assertTrue(runtime.snapshot().components().isEmpty());
+        assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
     }
 
     private RegistrationHandle provide(String value) {
-        var result = runtime.transact(mutation ->
+        var result = runtime.advanced().transact(mutation ->
                 mutation.provide(runtime.root(), TEXT, value));
         try {
-            result.settlement().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            result.settlement().awaitSettled(java.time.Duration.ofSeconds(10));
         } catch (Exception error) {
             throw new AssertionError(error);
         }

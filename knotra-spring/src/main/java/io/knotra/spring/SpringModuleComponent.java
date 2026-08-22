@@ -107,7 +107,7 @@ final class SpringModuleComponent<C> implements Component<C> {
             case OPTIONAL_OPTIONAL -> registerOptionalWrapper(context, spring, cast(dependency));
             case DYNAMIC_CAPABILITY_REQUIRED, DYNAMIC_CAPABILITY_OPTIONAL ->
                     registerDynamicCapability(context, spring, cast(dependency));
-            case DYNAMIC_PROXY_REQUIRED, DYNAMIC_PROXY_OPTIONAL ->
+            case DYNAMIC_REQUIRED, DYNAMIC_OPTIONAL ->
                     registerDynamicProxy(context, spring, cast(dependency));
         }
     }

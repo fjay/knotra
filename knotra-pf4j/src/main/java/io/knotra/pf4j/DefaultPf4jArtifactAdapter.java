@@ -15,15 +15,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import io.knotra.ComponentFactory;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
 import io.knotra.ConfigDecoder;
+import io.knotra.ConfiguredMountHandle;
 import io.knotra.ContextHandle;
 import io.knotra.KnotraRuntime;
+import io.knotra.MountHandle;
 import io.knotra.MountOptions;
-import io.knotra.TransactionRejectedException;
+import io.knotra.NoConfig;
+import io.knotra.RuntimeTransaction;
 import io.knotra.RuntimeSnapshot;
+import io.knotra.TransactionRejectedException;
 import io.knotra.pf4j.spi.ExportedComponentFactory;
 import io.knotra.pf4j.spi.RuntimeComponentProvider;
 import org.pf4j.CompoundPluginDescriptorFinder;
@@ -56,7 +59,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     private final Map<String, ManagedArtifact> artifacts = new LinkedHashMap<>();
     private final Map<String, ArtifactDiagnostic> loadFailures = new LinkedHashMap<>();
     private final Map<String, ArtifactSnapshot> terminalSnapshots = new LinkedHashMap<>();
-    private final Map<String, ManagedFactory<?>> catalog = new LinkedHashMap<>();
+    private final Map<String, ManagedFactory> catalog = new LinkedHashMap<>();
     private final AtomicBoolean closeStarted = new AtomicBoolean();
     private final Object closeLock = new Object();
     private CompletableFuture<Void> closeFuture;
@@ -76,16 +79,24 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }
 
         @Override
-        public Optional<ArtifactFactoryHandle<?>> resolve(String factoryId) {
+        public Optional<ArtifactFactoryHandle> resolve(String factoryId) {
             return Optional.ofNullable(activeFactory(factoryId));
         }
 
         @Override
-        public <C> Optional<ArtifactFactoryHandle<C>> resolve(
+        public Optional<ArtifactFactoryHandle.NoConfig> resolveNoConfig(String factoryId) {
+            ManagedFactory handle = activeFactory(factoryId);
+            return handle instanceof ArtifactFactoryHandle.NoConfig noConfig
+                    ? Optional.of(noConfig)
+                    : Optional.empty();
+        }
+
+        @Override
+        public <C> Optional<ArtifactFactoryHandle.Configured<C>> resolve(
                 String factoryId,
                 Class<C> configType) {
             Objects.requireNonNull(configType, "configType");
-            ManagedFactory<?> handle = activeFactory(factoryId);
+            ManagedFactory handle = activeFactory(factoryId);
             if (handle == null) {
                 return Optional.empty();
             }
@@ -95,9 +106,13 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                                 + handle.configType().getName()
                                 + ", not " + configType.getName());
             }
-            // 前面的精确 token 相等保证工厂泛型与调用方请求一致，这里只是恢复编译期类型。
+            if (!(handle instanceof ArtifactFactoryHandle.Configured<?> configured)) {
+                throw new IllegalArgumentException(
+                        "factory " + factoryId + " does not accept configuration");
+            }
             @SuppressWarnings("unchecked")
-            ArtifactFactoryHandle<C> typed = (ArtifactFactoryHandle<C>) handle;
+            ArtifactFactoryHandle.Configured<C> typed =
+                    (ArtifactFactoryHandle.Configured<C>) configured;
             return Optional.of(typed);
         }
     };
@@ -177,7 +192,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         return coordinator.submit(() -> {
             synchronized (stateLock) {
                 List<ArtifactFactoryCatalogEntry> entries = new ArrayList<>();
-                for (ManagedFactory<?> factory : catalog.values()) {
+                for (ManagedFactory factory : catalog.values()) {
                     entries.add(new ArtifactFactoryCatalogView(
                             factory.artifactId(),
                             factory.artifactVersion(),
@@ -190,7 +205,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }).join();
     }
 
-    private ManagedFactory<?> activeFactory(String factoryId) {
+    private ManagedFactory activeFactory(String factoryId) {
         Objects.requireNonNull(factoryId, "factoryId");
         return coordinator.submit(() -> {
             synchronized (stateLock) {
@@ -332,38 +347,59 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }
     }
 
-    <C> ComponentHandle<C> mount(
-            ManagedFactory<C> handle,
+    MountHandle mount(
+            ManagedFactory.NoConfigFactory handle,
+            ContextHandle context,
+            String mountId,
+            ComponentFactory<NoConfig> factory) {
+        return mount(handle, context, mountId, transaction -> transaction.mount(
+                context, mountId, guarded(factory, handle), mountOptions(handle)));
+    }
+
+    <C> ConfiguredMountHandle<C> mount(
+            ManagedFactory handle,
             ContextHandle context,
             String mountId,
             ComponentFactory<C> factory,
             C config) {
+        return mount(handle, context, mountId, transaction -> transaction.mount(
+                context, mountId, guarded(factory, handle), config, mountOptions(handle)));
+    }
+
+    private <C> ComponentFactory<C> guarded(
+            ComponentFactory<C> factory,
+            ManagedFactory handle) {
+        return GuardedComponentFactory.wrap(
+                factory,
+                classLoaderPolicy,
+                handle.artifact.metadata);
+    }
+
+    private MountOptions mountOptions(ManagedFactory handle) {
+        return new MountOptions(
+                handle.artifact.metadata.origin(),
+                handle.artifact.metadata.metadata());
+    }
+
+    private <H extends MountHandle> H mount(
+            ManagedFactory handle,
+            ContextHandle context,
+            String mountId,
+            java.util.function.Function<RuntimeTransaction, H> commit) {
         Objects.requireNonNull(context, "context");
         if (mountId == null || mountId.isBlank()) {
             throw new IllegalArgumentException("mountId must not be blank");
         }
         beginMount(handle);
         boolean lostRace = false;
-        ComponentHandle<C> component = null;
+        H component = null;
         try {
             synchronized (stateLock) {
                 requireMountableLocked(handle);
             }
-            ComponentFactory<C> guarded = GuardedComponentFactory.wrap(
-                    factory,
-                    classLoaderPolicy,
-                    handle.artifact.metadata);
-            // 提交 Core 事务不持有内存状态锁；组件启动仍由 Core 控制在协调器之外。
+            // The core transaction is submitted without the adapter memory lock; core owns startup.
             try {
-                component = runtime.transact(transaction -> transaction.mount(
-                        context,
-                        mountId,
-                        guarded,
-                        config,
-                        new MountOptions(
-                                handle.artifact.metadata.origin(),
-                                handle.artifact.metadata.metadata())))
-                        .value();
+                component = runtime.advanced().transact(commit::apply).value();
             } catch (TransactionRejectedException failure) {
                 throw new ArtifactOperationException(
                         handle.artifact.artifactId,
@@ -372,7 +408,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         failure.diagnostics());
             }
             synchronized (stateLock) {
-                // Core 已提交的句柄即使撞上并发 drain，也必须先记入所有权再决定回滚。
+                // A committed core handle is recorded before deciding whether a concurrent drain won.
                 handle.artifact.directHandles.put(component.handleId(), component);
                 if (handle.artifact.acceptingMounts
                         && handle.artifact.state == ArtifactState.ACTIVE) {
@@ -380,15 +416,14 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 }
                 lostRace = true;
             }
-        // 正常路径在此解除 in-flight 计数；输给 drain 的路径等补偿 dispose 完成后解除。
         } finally {
             if (!lostRace) {
                 endMount(handle.artifact);
             }
         }
 
-        // mount 提交后撞上 drain：先保留所有权，异步 dispose 完成前不能卸载插件。
-        ComponentHandle<C> rejected = component;
+        // A mount that committed during drain keeps ownership until compensation completes.
+        H rejected = component;
         rejected.disposeAsync().whenComplete((ignored, disposalFailure) ->
                 endMount(handle.artifact));
         throw new ArtifactOperationException(
@@ -397,7 +432,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 "artifact entered draining while mount was in flight");
     }
 
-    private void beginMount(ManagedFactory<?> handle) {
+    private void beginMount(ManagedFactory handle) {
         synchronized (stateLock) {
             if (closeStarted.get()) {
                 throw new ArtifactOperationException(
@@ -408,7 +443,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }
     }
 
-    private void requireMountableLocked(ManagedFactory<?> handle) {
+    private void requireMountableLocked(ManagedFactory handle) {
         if (handle.factory == null
                 || !handle.artifact.acceptingMounts
                 || handle.artifact.state != ArtifactState.ACTIVE) {
@@ -631,7 +666,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 dependencies(wrapper),
                 wrapper);
         candidate.pf4jStateView = () -> pf4jState(artifactId);
-        List<ManagedFactory<?>> discovered = discoverFactories(candidate, requireProvider);
+        List<ManagedFactory> discovered = discoverFactories(candidate, requireProvider);
         // 锁外发现期间同 ID 可能已被并发协调发布；只有最终检查通过才提交目录。
         synchronized (stateLock) {
             ManagedArtifact existing = artifacts.get(artifactId);
@@ -641,7 +676,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             }
             artifacts.put(artifactId, candidate);
             loadFailures.remove(artifactId);
-            for (ManagedFactory<?> factory : discovered) {
+            for (ManagedFactory factory : discovered) {
                 candidate.factories.add(factory);
                 candidate.factoriesById.put(factory.factoryId, factory);
                 candidate.factoryIdHistory.add(factory.factoryId);
@@ -685,7 +720,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         return wrapper;
     }
 
-    private List<ManagedFactory<?>> discoverFactories(
+    private List<ManagedFactory> discoverFactories(
             ManagedArtifact artifact,
             boolean requireProvider) {
         List<RuntimeComponentProvider> providers = pluginManager.getExtensions(
@@ -699,7 +734,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                     "artifact has no RuntimeComponentProvider entries: " + artifact.artifactId);
         }
         Set<String> localIds = new LinkedHashSet<>();
-        List<ManagedFactory<?>> result = new ArrayList<>();
+        List<ManagedFactory> result = new ArrayList<>();
         for (RuntimeComponentProvider provider : providers) {
             // 先保证 provider 扩展点身份来自宿主，再调用插件代码，避免被私有副本分派。
             classLoaderPolicy.validateInterface(
@@ -724,7 +759,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     private <C> void addDiscoveredFactory(
-            List<ManagedFactory<?>> result,
+            List<ManagedFactory> result,
             Set<String> localIds,
             ManagedArtifact artifact,
             ExportedComponentFactory<C> exported) {
@@ -751,7 +786,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         "factory id is already cataloged: " + factoryId);
             }
         }
-        result.add(new ManagedFactory<>(
+        result.add(ManagedFactory.create(
                 this,
                 artifact,
                 factoryId,
@@ -905,7 +940,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             artifact.transition = phase;
             artifact.acceptingMounts = false;
             artifact.drainFuture = result;
-            for (ManagedFactory<?> factory : artifact.factories) {
+            for (ManagedFactory factory : artifact.factories) {
                 catalog.remove(factory.factoryId);
             }
             artifact.invalidateFactories();
@@ -981,7 +1016,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }
         List<CompletableFuture<ComponentState>> disposals = new ArrayList<>();
         for (ManagedArtifact artifact : request.artifacts()) {
-            for (ComponentHandle<?> handle : artifact.rootHandles()) {
+            for (MountHandle handle : artifact.rootHandles()) {
                 if (handle.state() == ComponentState.DISPOSED) {
                     continue;
                 }
@@ -1015,7 +1050,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 });
     }
 
-    private CompletableFuture<ComponentState> disposeRootHandle(ComponentHandle<?> handle) {
+    private CompletableFuture<ComponentState> disposeRootHandle(MountHandle handle) {
         boolean failedDisposedGoal = handle.state() == ComponentState.FAILED
                 && handle.goal() == io.knotra.ComponentGoal.DISPOSED;
         // FAILED 且目标是 DISPOSED 时，只剩可重试的清理，不应重新启动组件。
@@ -1033,7 +1068,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
     private boolean isRuntimeClosing() {
         String rootId = runtime.root().contextId();
-        return runtime.snapshot().contexts().stream()
+        return runtime.advanced().snapshot().contexts().stream()
                 .filter(context -> context.contextId().equals(rootId))
                 .findFirst()
                 .map(context -> context.state() == io.knotra.ContextState.DISPOSING
@@ -1045,10 +1080,10 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         Set<String> artifactIds = request.artifacts().stream()
                 .map(artifact -> artifact.artifactId)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
-        RuntimeSnapshot snapshot = runtime.snapshot();
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         List<String> missing = new ArrayList<>();
         synchronized (stateLock) {
-            for (RuntimeSnapshot.ComponentSnapshot component : snapshot.components()) {
+            for (RuntimeSnapshot.MountSnapshot component : snapshot.mounts()) {
                 ComponentOrigin origin = component.origin();
                 if (origin.kind() != ComponentOrigin.Kind.ARTIFACT
                         || !artifactIds.contains(origin.sourceId())
@@ -1158,32 +1193,27 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         if (artifact == null || artifact.state == ArtifactState.UNLOADED) {
             return List.of();
         }
-        RuntimeSnapshot snapshot = runtime.snapshot();
-        Map<String, RuntimeSnapshot.ComponentSnapshot> byId = snapshot.components().stream()
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
+        Map<String, RuntimeSnapshot.MountSnapshot> byId = snapshot.mounts().stream()
                 .collect(Collectors.toMap(
-                        RuntimeSnapshot.ComponentSnapshot::handleId,
+                        RuntimeSnapshot.MountSnapshot::handleId,
                         item -> item,
                         (left, right) -> right,
                         LinkedHashMap::new));
         synchronized (stateLock) {
-            // Runtime 快照是存活句柄的权威来源；已 dispose 且消失的本地记录可以清理。
+            // Runtime snapshot is authoritative; stale local records for disposed mounts are removed.
             artifact.directHandles.keySet().removeIf(handleId ->
                     artifact.directHandles.get(handleId) != null
                             && artifact.directHandles.get(handleId).state() == ComponentState.DISPOSED
                             && !byId.containsKey(handleId));
             List<ArtifactOwnership> result = new ArrayList<>();
-            for (RuntimeSnapshot.ComponentSnapshot component : snapshot.components()) {
+            for (RuntimeSnapshot.MountSnapshot component : snapshot.mounts()) {
                 ComponentOrigin origin = component.origin();
                 if (origin.kind() != ComponentOrigin.Kind.ARTIFACT
                         || !origin.sourceId().equals(artifactId)) {
                     continue;
                 }
-                ManagedFactory<?> direct = component.parentHandleId() == null
-                        ? null
-                        : null;
-                String factoryId = direct == null
-                        ? component.factoryId()
-                        : direct.factoryId;
+                String factoryId = component.factoryId();
                 result.add(new ArtifactOwnership(
                         artifactId,
                         factoryId,

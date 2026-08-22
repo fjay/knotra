@@ -27,7 +27,7 @@ final class LifecycleAndDependencyTest {
         runtime.close();
     }
 
-    private ComponentHandle<NoConfig> mount(String id, TestKit.Start<NoConfig> start,
+    private MountHandle mount(String id, TestKit.Start<NoConfig> start,
                                              CapabilityRequirement... requirements) {
         return TestKit.mount(runtime, runtime.root(), id, id, start, requirements);
     }
@@ -100,9 +100,9 @@ final class LifecycleAndDependencyTest {
         var disposing = handle.disposeAsync().toCompletableFuture();
         try {
             assertEquals(ComponentState.STOPPING, handle.state(),
-                    () -> runtime.snapshot().toString());
+                    () -> runtime.advanced().snapshot().toString());
             assertTrue(bothRunning.await(10, TimeUnit.SECONDS),
-                    () -> runtime.snapshot().toString());
+                    () -> runtime.advanced().snapshot().toString());
             assertTrue(events.contains("later"));
         } finally {
             gate.complete(null);
@@ -130,7 +130,7 @@ final class LifecycleAndDependencyTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(ComponentState.FAILED, handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertEquals(List.of("after", "before"), events);
-        assertTrue(runtime.snapshot().diagnostics().stream()
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream()
                 .anyMatch(diagnostic -> diagnostic.code() == DiagnosticCode.CLEANUP_FAILED));
     }
 
@@ -200,7 +200,7 @@ final class LifecycleAndDependencyTest {
         }, CapabilityRequirement.required(A));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
         provider.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
-        assertEquals(List.of("consumer", "provider"), order, () -> runtime.snapshot().toString());
+        assertEquals(List.of("consumer", "provider"), order, () -> runtime.advanced().snapshot().toString());
         assertEquals(ComponentState.WAITING, consumer.state());
     }
 

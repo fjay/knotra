@@ -37,7 +37,21 @@ final class TestKit {
         };
     }
 
-    static ComponentHandle<NoConfig> mount(
+    static MountFactory mountFactory(String id, Component<NoConfig> component) {
+        return new MountFactory() {
+            @Override
+            public String factoryId() {
+                return id;
+            }
+
+            @Override
+            public Component<NoConfig> create() {
+                return component;
+            }
+        };
+    }
+
+    static MountHandle mount(
             KnotraRuntime runtime,
             ContextHandle context,
             String mountId,
@@ -46,7 +60,7 @@ final class TestKit {
         return mount(runtime, context, mountId, "component-" + mountId, start, requirements);
     }
 
-    static ComponentHandle<NoConfig> mount(
+    static MountHandle mount(
             KnotraRuntime runtime,
             ContextHandle context,
             String mountId,
@@ -57,7 +71,7 @@ final class TestKit {
                 ComponentDescriptor.named(componentId, requirements),
                 start);
         ComponentFactory<NoConfig> factory = factory(componentId, component);
-        return runtime.transact(transaction ->
+        return runtime.advanced().transact(transaction ->
                 transaction.mount(context, mountId, factory)).value();
     }
 
@@ -70,25 +84,25 @@ final class TestKit {
             ContextHandle context,
             CapabilityKey<String> key,
             String value) {
-        return runtime.transact(transaction ->
+        return runtime.advanced().transact(transaction ->
                 transaction.provide(context, key, value)).value();
     }
 
     static ContextHandle child(KnotraRuntime runtime, ContextHandle parent, String name) {
-        return runtime.transact(transaction ->
+        return runtime.advanced().transact(transaction ->
                 transaction.childContext(parent, name)).value();
     }
 
-    static RuntimeSnapshot.ComponentSnapshot component(
+    static RuntimeSnapshot.MountSnapshot component(
             KnotraRuntime runtime,
-            ComponentHandle<?> handle) {
-        return runtime.snapshot().components().stream()
+            MountHandle handle) {
+        return runtime.advanced().snapshot().mounts().stream()
                 .filter(item -> item.handleId().equals(handle.handleId()))
                 .findFirst()
                 .orElseThrow();
     }
 
-    static Callable<ComponentState> settle(ComponentHandle<?> handle) {
+    static Callable<ComponentState> settle(MountHandle handle) {
         return () -> handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 

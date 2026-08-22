@@ -4,7 +4,7 @@ package io.knotra;
  * LifecycleScope 中单个受管条目的只读观察句柄。
  *
  * <p>用于查询清理进度与失败详情；清理失败的条目保持 FAILED 并保留有界错误文本，
- * 可通过重新触发清理（如 {@link ComponentHandle#retryAsync()}）重试。
+ * 可通过重新触发清理（如 {@link MountHandle#retryAsync()}）重试。
  */
 public interface ManagedHandle {
     String entryId();

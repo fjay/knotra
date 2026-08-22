@@ -47,7 +47,7 @@ final class ConcurrencySnapshotGcTest {
         }
     }
 
-    private ComponentHandle<NoConfig> mount(String id, TestKit.Start<NoConfig> start,
+    private MountHandle mount(String id, TestKit.Start<NoConfig> start,
                                              CapabilityRequirement... requirements) {
         return TestKit.mount(runtime, runtime.root(), id, id, start, requirements);
     }
@@ -59,12 +59,12 @@ final class ConcurrencySnapshotGcTest {
                 ComponentDescriptor.named("same"), (context, config) -> starts.incrementAndGet()));
         ExecutorService executor = Executors.newFixedThreadPool(16);
         try {
-            var outcomes = new ArrayList<CompletableFuture<TransactionReceipt<ComponentHandle<NoConfig>>>>();
+            var outcomes = new ArrayList<CompletableFuture<TransactionReceipt<MountHandle>>>();
             for (int i = 0; i < 16; i++) {
-                outcomes.add(CompletableFuture.supplyAsync(() -> runtime.transact(transaction ->
+                outcomes.add(CompletableFuture.supplyAsync(() -> runtime.advanced().transact(transaction ->
                         transaction.mount(runtime.root(), "same", factory)), executor));
             }
-            var committed = new ArrayList<TransactionReceipt<ComponentHandle<NoConfig>>>();
+            var committed = new ArrayList<TransactionReceipt<MountHandle>>();
             int rejected = 0;
             for (var future : outcomes) {
                 try {
@@ -89,9 +89,9 @@ final class ConcurrencySnapshotGcTest {
         AtomicInteger starts = new AtomicInteger();
         ComponentFactory<NoConfig> factory = TestKit.factory("multi", new TestKit.Scripted<>(
                 ComponentDescriptor.named("multi"), (context, config) -> starts.incrementAndGet()));
-        var first = runtime.transact(mutation ->
+        var first = runtime.advanced().transact(mutation ->
                 mutation.mount(runtime.root(), "one", factory, NoConfig.INSTANCE));
-        var second = runtime.transact(mutation ->
+        var second = runtime.advanced().transact(mutation ->
                 mutation.mount(runtime.root(), "two", factory, NoConfig.INSTANCE));
         TestKit.assertCommitted(first);
         TestKit.assertCommitted(second);
@@ -103,11 +103,11 @@ final class ConcurrencySnapshotGcTest {
 
     @Test
     void everyCommittedStructuralTransactionAdvancesGenerationByOne() {
-        long generation = runtime.snapshot().generation();
+        long generation = runtime.advanced().snapshot().generation();
         TestKit.provide(runtime, runtime.root(), X, "x");
-        assertEquals(generation + 1, runtime.snapshot().generation());
+        assertEquals(generation + 1, runtime.advanced().snapshot().generation());
         TestKit.child(runtime, runtime.root(), "child");
-        assertEquals(generation + 2, runtime.snapshot().generation());
+        assertEquals(generation + 2, runtime.advanced().snapshot().generation());
     }
 
     @Test
@@ -128,7 +128,7 @@ final class ConcurrencySnapshotGcTest {
             gate.get();
         });
         assertTrue(started.await(10, TimeUnit.SECONDS));
-        RuntimeSnapshot before = runtime.snapshot();
+        RuntimeSnapshot before = runtime.advanced().snapshot();
         assertEquals("root", child.view().require(X));
         assertEquals(ComponentState.ACTIVE, TestKit.component(runtime, consumer).state());
         assertTrue(before.registrations().stream().noneMatch(registration ->
@@ -137,7 +137,7 @@ final class ConcurrencySnapshotGcTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
         assertEquals("child", child.view().require(X));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call(),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
         assertNotEquals(originalActivation, TestKit.component(runtime, consumer).currentActivationId());
     }
 
@@ -157,12 +157,12 @@ final class ConcurrencySnapshotGcTest {
                     context.provide(X, "b-x");
                 }, CapabilityRequirement.required(Y));
         assertEquals(ComponentState.WAITING, TestKit.settle(second).call(),
-                () -> runtime.snapshot().toString());
-        assertTrue(runtime.snapshot().diagnostics().stream()
+                () -> runtime.advanced().snapshot().toString());
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream()
                 .anyMatch(diagnostic -> diagnostic.code() == DiagnosticCode.BINDING_CYCLE),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
         assertTrue(child.view().find(Y).isPresent(),
-                () -> runtime.snapshot().toString());
+                () -> runtime.advanced().snapshot().toString());
     }
 
     @Test
@@ -176,7 +176,7 @@ final class ConcurrencySnapshotGcTest {
                     entered.countDown();
                     gate.get();
                 }));
-        var handle = runtime.transact(mutation ->
+        var handle = runtime.advanced().transact(mutation ->
                 mutation.mount(runtime.root(), "configured", factory, new Object())).value();
         assertTrue(entered.await(10, TimeUnit.SECONDS));
         var reconfigured = handle.reconfigureAsync(new Object());
@@ -200,7 +200,7 @@ final class ConcurrencySnapshotGcTest {
                         }
                     });
                 }));
-        var handle = runtime.transact(mutation ->
+        var handle = runtime.advanced().transact(mutation ->
                 mutation.mount(runtime.root(), "configured", factory, NoConfig.INSTANCE)).value();
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals(ComponentState.FAILED, handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS));
@@ -212,7 +212,7 @@ final class ConcurrencySnapshotGcTest {
 
     @Test
     void parentDisposeDisposesOwnershipDescendantsAndChildrenCannotRestart() throws Exception {
-        AtomicReference<ComponentHandle<NoConfig>> child = new AtomicReference<>();
+        AtomicReference<MountHandle> child = new AtomicReference<>();
         var parent = mount("parent", (context, config) ->
                 child.set(context.mountChild("child",
                         TestKit.factory("child", new TestKit.Scripted<>(
@@ -223,7 +223,7 @@ final class ConcurrencySnapshotGcTest {
         parent.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ComponentState.DISPOSED, child.get().state());
         assertTrue(child.get().retryAsync().toCompletableFuture().isCompletedExceptionally());
-        assertTrue(runtime.snapshot().components().isEmpty());
+        assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
     }
 
     @Test
@@ -241,7 +241,7 @@ final class ConcurrencySnapshotGcTest {
                 instanceof java.util.concurrent.ExecutionException);
         runtime.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ContextState.DISPOSED, runtime.root().state());
-        TestKit.assertRejected(() -> runtime.transact(mutation ->
+        TestKit.assertRejected(() -> runtime.advanced().transact(mutation ->
                 mutation.provide(runtime.root(), Z, "z")),
                 DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
         assertTrue(runtime.root().view().find(Z).isEmpty());
@@ -251,12 +251,20 @@ final class ConcurrencySnapshotGcTest {
     @Test
     void snapshotContainsOnlyStableDtoValuesAndNoCapabilityValue() throws Exception {
         TestKit.provide(runtime, runtime.root(), X, "secret-x");
+        var failed = mount("failure", (context, config) -> {
+            throw new IllegalStateException("stable failure detail");
+        });
+        try {
+            failed.requireActive(java.time.Duration.ofSeconds(5));
+        } catch (MountNotActiveException expected) {
+            // Snapshot stability is asserted below.
+        }
         var handle = mount("snapshot", (context, config) -> {
             context.lifecycle().onClose("entry", () -> {});
             context.provide(Y, "secret-y");
         });
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
-        RuntimeSnapshot snapshot = runtime.snapshot();
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         assertStableDto(snapshot);
         assertFalse(snapshot.toString().contains("secret-x"));
         assertFalse(snapshot.toString().contains("secret-y"));
@@ -268,12 +276,12 @@ final class ConcurrencySnapshotGcTest {
                 snapshot.registrations().stream()
                         .filter(registration -> registration.capability().name().equals("y"))
                         .findFirst().orElseThrow().owner().kind());
-        assertEquals(ComponentOrigin.Kind.HOST, snapshot.components().getFirst().origin().kind());
+        assertEquals(ComponentOrigin.Kind.HOST, snapshot.mounts().getFirst().origin().kind());
     }
 
     @Test
-    void committedMountOptionsAreRecordedInComponentSnapshot() {
-        var result = runtime.transact(mutation -> mutation.mount(
+    void committedMountOptionsAreRecordedInMountSnapshot() {
+        var result = runtime.advanced().transact(mutation -> mutation.mount(
                 runtime.root(),
                 "options",
                 TestKit.factory("options", new TestKit.Scripted<>(
@@ -292,7 +300,7 @@ final class ConcurrencySnapshotGcTest {
         var consumer = TestKit.mount(runtime, child, "consumer",
                 (context, config) -> context.require(X), CapabilityRequirement.required(X));
         assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
-        TestKit.assertCommitted(runtime.transact(mutation -> {
+        TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
             mutation.revoke(registration);
             return null;
         }));
@@ -319,7 +327,7 @@ final class ConcurrencySnapshotGcTest {
         Class<?> componentClass = loader.loadClass("io.knotra.GcComponent");
         ComponentFactory<NoConfig> factory = new IsolatedFactoryAdapter(
                 componentClass.getDeclaredConstructor().newInstance());
-        var result = runtime.transact(mutation -> mutation.mount(
+        var result = runtime.advanced().transact(mutation -> mutation.mount(
                 runtime.root(), "gc", factory, NoConfig.INSTANCE));
         TestKit.assertCommitted(result);
         assertEquals(ComponentState.ACTIVE, TestKit.settle(result.value()).call());
@@ -420,12 +428,14 @@ final class ConcurrencySnapshotGcTest {
 
     private static void assertStableDto(Object value) {
         if (value == null || value instanceof String || value instanceof Number
-                || value instanceof Boolean || value instanceof Enum<?>) {
+                || value instanceof Boolean || value instanceof Enum<?>
+                || value instanceof java.time.temporal.Temporal) {
             return;
         }
         Class<?> type = value.getClass();
         boolean nestedDto = type.getName().startsWith("io.knotra.RuntimeSnapshot")
                 || value instanceof RuntimeDiagnostic
+                || value instanceof FailureInfo
                 || value instanceof MountOptions
                 || value instanceof ComponentOrigin;
         if (nestedDto) {

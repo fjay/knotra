@@ -8,10 +8,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import com.example.integration.contract.IntegrationCoordinator;
-import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
-import io.knotra.NoConfig;
+import io.knotra.MountHandle;
 import io.knotra.events.EventBusFactory;
 import io.knotra.loader.ComponentEntry;
 import io.knotra.loader.ComponentTree;
@@ -47,7 +46,7 @@ final class CrossModuleCloseIntegrationTest {
         runtime.close();
     }
 
-    private ComponentHandle<NoConfig> mountBus() {
+    private MountHandle mountBus() {
         return runtime.mount("bus", new EventBusFactory());
     }
 
@@ -63,7 +62,7 @@ final class CrossModuleCloseIntegrationTest {
                     runtime,
                     runtime.root(),
                     Pf4jFactoryResolver.of(adapter));
-            ComponentHandle<NoConfig> bus = mountBus();
+            MountHandle bus = mountBus();
             ReconcileResult reconcile = loader.reconcile(ComponentTree.of(
                     ComponentEntry.configured("greeting", GREETING, "loader")));
             assertTrue(reconcile.converged(), () -> reconcile.diagnostics().toString());
@@ -85,7 +84,7 @@ final class CrossModuleCloseIntegrationTest {
             runtime.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         } finally {
             adapter.close();
         }
@@ -127,9 +126,9 @@ final class CrossModuleCloseIntegrationTest {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
-            ComponentHandle<NoConfig> handle = adapter.factories()
-                    .resolve("integration-failing-cleanup", NoConfig.class).orElseThrow()
-                    .mount(runtime.root(), "failing", NoConfig.INSTANCE);
+            MountHandle handle = adapter.factories()
+                    .resolveNoConfig("integration-failing-cleanup").orElseThrow()
+                    .mount(runtime.root(), "failing");
             assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(handle));
 
             IntegrationCoordinator.failNextCleanup();
@@ -145,7 +144,7 @@ final class CrossModuleCloseIntegrationTest {
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
             assertEquals(ComponentState.DISPOSED, handle.state());
-            assertTrue(runtime.snapshot().components().isEmpty());
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
         } finally {
             IntegrationCoordinator.allowCleanup();
             adapter.close();
