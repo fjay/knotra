@@ -1,24 +1,24 @@
 # Knotra 插件工程化手册
 
-> 💡 **面向读者**：如果您需要构建一个“支持从外部 JAR 动态加载、安全热升级、干净卸载”的插件化系统，本文将手把手带您从零搭建多模块 Maven 工程，并遵循生产级安全规范。
+> **面向读者**：如果您需要构建一个“支持从外部 JAR 动态加载、安全热升级、干净卸载”的插件化系统，本文将手把手带您从零搭建多模块 Maven 工程，并遵循生产级安全规范。
 
 ---
 
-## 🏛️ 1. 插件体系三层架构设计
+## 1. 插件体系三层架构设计
 
 为了实现**插件的 ClassLoader 隔离与安全卸载**，必须将工程划分为三个独立模块：
 
 ```mermaid
 graph TD
-    subgraph 1. 共享合约模块 (contract)
+    subgraph contract_mod ["1. 共享合约模块 (contract)"]
         C["接口定义: Greeting.java<br/>配置契约: GreetingConfig.java<br/>(宿主与插件共同可见)"]
     end
 
-    subgraph 2. 宿主应用工程 (host-app)
+    subgraph host_mod ["2. 宿主应用工程 (host-app)"]
         H["宿主业务 + Knotra 运行时<br/>(compile 依赖 contract)"]
     end
 
-    subgraph 3. 插件实现工程 (greeting-plugin)
+    subgraph plugin_mod ["3. 插件实现工程 (greeting-plugin)"]
         P["插件实现: GreetingImpl.java<br/>(provided 依赖 contract & knotra-core)"]
     end
 
@@ -49,7 +49,7 @@ my-plugin-project/
 
 ---
 
-## 🛠️ 2. 手把手创建第一个插件工程
+## 2. 手把手创建第一个插件工程
 
 ### 步骤 1：定义共享合约模块 (`my-contract`)
 
@@ -81,7 +81,7 @@ public final class GreetingContracts {
 
 ### 步骤 2：配置插件工程的 `pom.xml`（关键在 `provided`）
 
-> ⚠️ **核心原则**：所有宿主已经拥有的类（Knotra 核心库、共享合约库、PF4J）在插件中必须标记为 `<scope>provided</scope>`，**绝对不能打进插件 JAR**！否则会导致同一个 Class 被两个 ClassLoader 加载，发生 `ClassCastException`。
+> **核心原则**：所有宿主已经拥有的类（Knotra 核心库、共享合约库、PF4J）在插件中必须标记为 `<scope>provided</scope>`，**绝对不能打进插件 JAR**！否则会导致同一个 Class 被两个 ClassLoader 加载，发生 `ClassCastException`。
 
 ```xml
 <project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -202,7 +202,7 @@ public final class GreetingProvider implements RuntimeComponentProvider {
 
 ---
 
-## 🚀 3. 宿主加载与运行插件
+## 3. 宿主加载与运行插件
 
 在宿主应用中，使用 `Pf4jArtifactAdapter` 加载并挂载插件：
 
@@ -253,7 +253,7 @@ public class HostApplication {
 
 ---
 
-## 🛑 4. 插件安全卸载与排空（Drain）机制
+## 4. 插件安全卸载与排空（Drain）机制
 
 Knotra 的插件卸载遵循**严格的排空流**，确保运行中的业务不受影响：
 
@@ -269,7 +269,7 @@ sequenceDiagram
 
     par 等待在途请求排空
         Adapter->>Component: 等待在途动态调用租约归零
-        Adapter->>Component: 执行 LIFO 资源清理 (close())
+        Adapter->>Component: 执行 LIFO 资源清理 (close)
     end
 
     Component-->>Adapter: 清理完毕 (DISPOSED)
@@ -279,7 +279,7 @@ sequenceDiagram
 
 ---
 
-## 🛡️ 5. 防止 ClassLoader 内存泄漏的 5 条黄金军规
+## 5. 防止 ClassLoader 内存泄漏的 5 条黄金军规
 
 在 Java 动态插件开发中，**Metaspace 内存溢出（OOM）**是最常见的灾难。请严格遵守以下 5 条军规：
 

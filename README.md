@@ -9,20 +9,20 @@ Knotra 是一个面向现代 Java 21+ 的 **JVM 动态组件运行时**。它让
 ![Version](https://img.shields.io/badge/version-0.1.0--SNAPSHOT-blue)
 ![Tests](https://img.shields.io/badge/tests-325%20passing-brightgreen)
 
-> 💡 **项目状态**：`0.1.0-SNAPSHOT`，正在活跃迭代中。要求 **Java 21+** 与 **Maven 3.9+**。
+> **项目状态**：`0.1.0-SNAPSHOT`，正在活跃迭代中。要求 **Java 21+** 与 **Maven 3.9+**。
 
 ---
 
-## 🧐 为什么需要 Knotra？它解决了什么痛点？
+## 为什么需要 Knotra？它解决了什么痛点？
 
 在传统的 Java / Spring 应用中，想要在运行时动态替换某块业务逻辑（例如：动态规则引擎、支付渠道插件、多租户定制算法），通常面临三大难题：
 
 ```mermaid
 graph LR
-    subgraph 传统动态方案的痛点
-        A["1. 状态撕裂"] -->|"新旧依赖同时存在<br/>数据不一致"| P1["❌ 逻辑错误"]
-        B["2. 暴力销毁"] -->|"旧组件仍在处理请求<br/>直接 close() 报错"| P2["❌ 业务流量受损"]
-        C["3. 内存泄漏"] -->|"ClassLoader 无法卸载<br/>Metaspace OOM"| P3["❌ JVM 崩溃"]
+    subgraph pain_points ["传统动态方案的痛点"]
+        A["1. 状态撕裂"] -->|"新旧依赖同时存在<br/>数据不一致"| P1["逻辑错误"]
+        B["2. 暴力销毁"] -->|"旧组件仍在处理请求<br/>直接 close 报错"| P2["业务流量受损"]
+        C["3. 内存泄漏"] -->|"ClassLoader 无法卸载<br/>Metaspace OOM"| P3["JVM 崩溃"]
     end
 ```
 
@@ -34,7 +34,7 @@ Knotra 专门为此而生，它在 JVM 内部建立了严格的**动态运行时
 
 ---
 
-## ⚡ 5 分钟极速上手（Hello World）
+## 5 分钟极速上手（Hello World）
 
 ### 1. 引入依赖
 
@@ -83,7 +83,7 @@ public final class Greeter {
 }
 ```
 
-### 3. 用 Knotra 组装并在运行时热替换！
+### 3. 用 Knotra 组装并在运行时热替换
 
 ```java
 import io.knotra.*;
@@ -112,7 +112,7 @@ public class QuickStart {
             ComponentHandle<NoConfig> greeterHandle = Beans.mount(runtime, greeterDef);
             greeterHandle.requireActive(); // 输出: v1: 你好, Knotra
 
-            // 步骤 3：运行时热替换为 V2 版本！
+            // 步骤 3：运行时热替换为 V2 版本
             System.out.println(">>> 正在热替换 Greeting 为 V2 实现...");
             Provided<Greeting> v2 = greeting.replace(name -> "v2: Bonjour, " + name);
 
@@ -133,33 +133,20 @@ v2: Bonjour, Knotra
 
 ---
 
-## 🧭 4 个核心心智模型（一看就懂）
+## 4 个核心心智模型
 
 ```mermaid
-classDiagram
-    class ComponentHandle {
-        <<逻辑挂载点 (插座)>>
-        +String name: "greeter"
-        +ComponentState state: ACTIVE
-        +requireActive()
-    }
-    class Activation_Gen1 {
-        <<第 1 代运行实例>>
-        +int generation: 1
-        +BindingSet: [Greeting v1]
-        +Instance: Greeter@0x1
-        +LifecycleScope: [资源清理清单]
-    }
-    class Activation_Gen2 {
-        <<第 2 代运行实例 (热替换后)>>
-        +int generation: 2
-        +BindingSet: [Greeting v2]
-        +Instance: Greeter@0x2
-        +LifecycleScope: [新资源清单]
-    }
+graph TD
+    subgraph component_model ["Knotra 组件运行模型"]
+        CH["ComponentHandle<br/>逻辑挂载点 / 永久插座"]
+        A1["Activation Gen1<br/>第1代运行实例 (已清理)"]
+        A2["Activation Gen2<br/>第2代运行实例 (当前 ACTIVE)"]
+        LS["LifecycleScope<br/>资源清单 (LIFO)"]
 
-    ComponentHandle ..> Activation_Gen1 : 历史代际 (已安全销毁)
-    ComponentHandle --> Activation_Gen2 : 当前活跃代际 (Active)
+        CH -.-> A1
+        CH --> A2
+        A2 --> LS
+    end
 ```
 
 | 概念 | 通俗类比 | 职责说明 |
@@ -173,23 +160,23 @@ classDiagram
 
 ---
 
-## 🗺️ 学习路径与导航矩阵
+## 学习路径与导航矩阵
 
 根据您的技术栈和目标场景，选择最适合的阅读路径：
 
 ```mermaid
 graph TD
-    Start["🚀 我想使用 Knotra"] --> Q1{"您的主要使用场景？"}
+    start_node["我想使用 Knotra"] --> q1{"您的主要使用场景？"}
 
-    Q1 -->|"纯 Java POJO 装配<br/>0~5个依赖显式编写"| P1["📘 Beans 指南: POJO DSL"]
-    Q1 -->|"业务类很多<br/>希望像 Spring 一样加注解"| P2["📘 Beans 指南: 编译期注解"]
-    Q1 -->|"现有 Spring Boot 工程<br/>想动态插拔 Controller/Service"| P3["📘 Spring 集成指南: 子容器与动态桥"]
-    Q1 -->|"需要从外部 JAR 文件<br/>动态加载/卸载插件"| P4["📘 插件工程化手册 (PF4J)"]
-    Q1 -->|"需要声明式配置<br/>自动对比与收敛期望状态"| P5["📘 API 指南: Loader 章节"]
-    Q1 -->|"排查生产问题 / 线程模型"| P6["📘 线程模型与排障指南"]
+    q1 -->|"纯 Java POJO 装配<br/>0~5个依赖显式编写"| p1["Beans 指南: POJO DSL"]
+    q1 -->|"业务类很多<br/>希望像 Spring 一样加注解"| p2["Beans 指南: 编译期注解"]
+    q1 -->|"现有 Spring Boot 工程<br/>想动态插拔 Controller/Service"| p3["Spring 集成指南: 子容器与动态桥"]
+    q1 -->|"需要从外部 JAR 文件<br/>动态加载/卸载插件"| p4["插件工程化手册 (PF4J)"]
+    q1 -->|"需要声明式配置<br/>自动对比与收敛期望状态"| p5["API 指南: Loader 章节"]
+    q1 -->|"排查生产问题 / 线程模型"| p6["线程模型与排障指南"]
 ```
 
-### 📚 完整文档索引
+### 完整文档索引
 
 - [Knotra Beans 与 Spring 集成指南](<docs/Knotra Beans 与 Spring 集成指南.md>)：
   - **POJO 装配**：手写类型安全 DSL、生命周期控制。
@@ -204,7 +191,7 @@ graph TD
 
 ---
 
-## 📦 模块分工一览
+## 模块分工一览
 
 | 模块 | 职责与定位 | 典型使用场景 |
 |---|---|---|
@@ -224,7 +211,7 @@ graph TD
 
 ---
 
-## 🛠️ 构建与测试
+## 构建与测试
 
 ```bash
 # 全工程编译与自动化验证 (包含 325 项测试)

@@ -1,32 +1,32 @@
 # Knotra API 与集成指南
 
-> 💡 **面向读者**：本文系统性介绍 Knotra `0.1.0-SNAPSHOT` 的核心架构、核心 API 契约与各扩展模块（Events、PF4J、Loader）。适合希望深入理解 Knotra 运行机制、或需要基于 Core API 进行底层定制与扩展的开发者。
+> **面向读者**：本文系统性介绍 Knotra `0.1.0-SNAPSHOT` 的核心架构、核心 API 契约与各扩展模块（Events、PF4J、Loader）。适合希望深入理解 Knotra 运行机制、或需要基于 Core API 进行底层定制与扩展的开发者。
 
 ---
 
-## 🏛️ 1. Knotra Core 架构全景
+## 1. Knotra Core 架构全景
 
 Knotra 的核心目标是：**在 JVM 运行期间安全管理组件的替换、依赖重连与资源回收**。其核心分层模型如下：
 
 ```mermaid
 graph TB
-    subgraph KnotraRuntime 运行时
+    subgraph knotra_runtime ["KnotraRuntime 运行时"]
         direction TB
-        RootContext["Root Context (根可见域)"]
-        ChildContext["Child Context (子可见域/租户)"]
+        RootContext["Root Context 根可见域"]
+        ChildContext["Child Context 子可见域/租户"]
         RootContext --> ChildContext
 
-        subgraph 组件与挂载
-            Handle["ComponentHandle (固定挂载点)"]
-            Activation["Activation (第 N 代运行实例)"]
-            Scope["LifecycleScope (LIFO 资源清单)"]
+        subgraph sub_comp ["组件与挂载"]
+            Handle["ComponentHandle 固定挂载点"]
+            Activation["Activation 第 N 代运行实例"]
+            Scope["LifecycleScope LIFO 资源清单"]
             Handle --> Activation
             Activation --> Scope
         end
 
-        subgraph 能力与依赖
-            CapKey["CapabilityKey&lt;T&gt; (服务契约)"]
-            Reg["Registration (服务提供记录)"]
+        subgraph sub_cap ["能力与依赖"]
+            CapKey["CapabilityKey 服务契约"]
+            Reg["Registration 服务提供记录"]
             CapKey --> Reg
         end
     end
@@ -41,7 +41,7 @@ graph TB
 
 ---
 
-## 🚀 2. 最小 Core 运行闭环
+## 2. 最小 Core 运行闭环
 
 ### 2.1 创建运行时与定义服务契约
 
@@ -65,7 +65,7 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
 ---
 
-## 🔌 3. 组件（Component）与依赖绑定
+## 3. 组件（Component）与依赖绑定
 
 ### 3.1 手写原生 ComponentFactory
 
@@ -111,13 +111,13 @@ boxHandle.requireActive(); // 阻塞等待直到组件成功进入 ACTIVE 状态
 
 ```mermaid
 graph TD
-    subgraph PINNED 绑定模式 (默认)
+    subgraph mode_pinned ["PINNED 绑定模式 (默认)"]
         P1["依赖 Provider 发生变更"] --> P2["销毁旧 Activation (清理资源)"]
         P2 --> P3["注入新 Provider，创建新 Activation"]
         P3 --> P4["消费方组件整机重载"]
     end
 
-    subgraph DYNAMIC 绑定模式 (动态代理)
+    subgraph mode_dynamic ["DYNAMIC 绑定模式 (动态代理)"]
         D1["依赖 Provider 发生变更"] --> D2["消费方组件不重启"]
         D2 --> D3["下次方法调用自动路由到新 Provider"]
     end
@@ -132,7 +132,7 @@ graph TD
 
 ---
 
-## ⚡ 4. 结构事务（RuntimeTransaction）
+## 4. 结构事务（RuntimeTransaction）
 
 当需要**原子执行多个操作**（例如：同时撤销旧服务、发布新服务、挂载新组件）时，使用结构事务：
 
@@ -150,13 +150,13 @@ TransactionReceipt<Provided<Tool>> receipt = runtime.transact(tx -> {
 System.out.println("事务已提交，当前 generation = " + receipt.generation());
 ```
 
-> 🔒 **事务特性**：
+> **事务特性**：
 > - 事务在调用线程同步完成校验与结构更新，**要么全部生效，要么全部回滚**。
 > - 若发生配置错误或冲突，抛出 `TransactionRejectedException`，不会留下半吊子脏状态。
 
 ---
 
-## 🌲 5. Context 层级与多租户遮蔽（Shadowing）
+## 5. Context 层级与多租户遮蔽（Shadowing）
 
 Context 可以形成树状层级结构，常用于**多租户定制**或**环境隔离**：
 
@@ -164,7 +164,7 @@ Context 可以形成树状层级结构，常用于**多租户定制**或**环境
 graph TD
     Root["Root Context<br/>公共服务: CurrencyRate = 7.0"]
     US["Context: us-tenant<br/>租户遮蔽: CurrencyRate = 1.0"]
-    CN["Context: cn-tenant<br/>(继承 Root: CurrencyRate = 7.0)"]
+    CN["Context: cn-tenant<br/>继承 Root: CurrencyRate = 7.0"]
 
     Root --> US
     Root --> CN
@@ -187,7 +187,7 @@ usWorkspace.disposeAsync().toCompletableFuture().join();
 
 ---
 
-## 🧹 6. 资源生命周期管理（`LifecycleScope`）
+## 6. 资源生命周期管理（`LifecycleScope`）
 
 每个 `Activation` 都拥有一个严格按照 **后进先出（LIFO）** 顺序释放的 `LifecycleScope`：
 
@@ -220,7 +220,7 @@ context.lifecycle().manageAsync("async-consumer", consumer);
 
 ---
 
-## 🛡️ 7. 动态调用租约（`DynamicCapability`）
+## 7. 动态调用租约（`DynamicCapability`）
 
 当使用动态依赖时，Knotra 在底层通过**调用租约（Call Lease）**机制，确保旧实现不会在执行中途被暴力拔出：
 
@@ -234,18 +234,18 @@ Receipt receipt = gateway.call(gw -> gw.charge(order));
 CompletionStage<Receipt> asyncReceipt = gateway.callAsync(gw -> gw.chargeAsync(order));
 ```
 
-> 💡 **租约排空（Drain）保证**：
+> **租约排空（Drain）保证**：
 > 当管理员替换 `PaymentGateway` 时，Knotra 会**先关闭旧实例的调用闸门**，等待所有已经开始的 `call` 任务执行完毕，然后才执行旧实例的 `close()` 清理。业务流量零报错。
 
 ---
 
-## 📨 8. 进程内事件总线（`knotra-events`）
+## 8. 进程内事件总线（`knotra-events`）
 
 `knotra-events` 提供类型化、支持安全排空的事件总线，包含 5 种分发模式：
 
 ```mermaid
 graph LR
-    subgraph 5 种事件分发模式
+    subgraph event_modes ["5 种事件分发模式"]
         M1["Sync: 顺序同步分发"]
         M2["Parallel: 并发异步分发"]
         M3["Serial: 链式顺序消费 (返回 false 中断)"]
@@ -277,7 +277,7 @@ bus.dispatch(ORDER_CREATED, new OrderCreatedEvent("ORD-1001"));
 
 ---
 
-## 📦 9. PF4J 插件与声明式 Loader
+## 9. PF4J 插件与声明式 Loader
 
 ### 9.1 加载外部 JAR 插件（`knotra-pf4j`）
 
@@ -323,7 +323,7 @@ try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver))
 
 ---
 
-## 🔍 10. 运行时快照与健康诊断（`RuntimeSnapshot`）
+## 10. 运行时快照与健康诊断（`RuntimeSnapshot`）
 
 通过快照可以无副作用地观测整个系统的运行状态：
 
@@ -344,7 +344,7 @@ snapshot.diagnostics().forEach(d -> {
 
 ---
 
-## 🏁 11. 优雅关闭顺序
+## 11. 优雅关闭顺序
 
 在关闭应用时，建议遵循**从外到内**的关闭顺序：
 

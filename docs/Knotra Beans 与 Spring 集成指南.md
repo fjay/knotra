@@ -1,10 +1,10 @@
 # Knotra Beans 与 Spring 集成指南
 
-> 💡 **面向读者**：如果您熟悉 Java 和 Spring 开发，但完全不了解 Knotra，本文将从零开始，用最熟悉的 Spring 语境带您理解 Knotra 如何管理 POJO 与 Spring 模块的动态生命周期。
+> **面向读者**：如果您熟悉 Java 和 Spring 开发，但完全不了解 Knotra，本文将从零开始，用最熟悉的 Spring 语境带您理解 Knotra 如何管理 POJO 与 Spring 模块的动态生命周期。
 
 ---
 
-## 🧭 1. Spring 开发者 3 分钟速览
+## 1. Spring 开发者 3 分钟速览
 
 ### 1.1 为什么有了 Spring，还需要 Knotra？
 
@@ -21,26 +21,26 @@ Spring 是优秀的依赖注入与应用容器，但其默认设计是**静态�
 
 ```mermaid
 graph TB
-    subgraph Knotra 运行时 [Knotra 动态运行时 (Runtime)]
+    subgraph knotra_runtime ["Knotra 动态运行时 Runtime"]
         direction TB
-        K[Knotra 事务与生命周期调度]
+        K["Knotra 事务与生命周期调度"]
 
-        subgraph 模式 A: 纯 POJO 模式
-            P[POJO Bean: 零外部依赖]
+        subgraph mode_pojo ["模式 A: 纯 POJO 模式"]
+            P["POJO Bean: 零外部依赖"]
         end
 
-        subgraph 模式 B: Spring 子容器模式
-            SC[Spring Child Context: 独立 Spring 容器]
-            SC --> B1[Service]
-            SC --> B2[Repository]
+        subgraph mode_spring ["模式 B: Spring 子容器模式"]
+            SC["Spring Child Context: 独立 Spring 容器"]
+            SC --> B1["Service"]
+            SC --> B2["Repository"]
         end
 
-        subgraph 模式 C: 宿主动态桥模式
-            SDB[SpringDynamicBridge 智能代理]
+        subgraph mode_bridge ["模式 C: 宿主动态桥模式"]
+            SDB["SpringDynamicBridge 智能代理"]
         end
     end
 
-    HostSpring[宿主 Spring Boot 单例 Service] -->|注入代理| SDB
+    HostSpring["宿主 Spring Boot 单例 Service"] -->|注入代理| SDB
     SDB -->|动态路由| SC
 ```
 
@@ -60,7 +60,7 @@ graph TB
 
 ---
 
-## 📦 2. Maven 依赖引入
+## 2. Maven 依赖引入
 
 在项目的 `pom.xml` 中引入 BOM 对齐版本：
 
@@ -98,7 +98,7 @@ graph TB
 
 ---
 
-## 🚀 3. 模式一：纯 POJO 业务组件装配（`knotra-beans`）
+## 3. 模式一：纯 POJO 业务组件装配（`knotra-beans`）
 
 很多时候，插件或业务策略根本不需要引入庞大的 Spring 容器。`knotra-beans` 提供了一个流畅的 DSL，让**普通的 Java POJO 也能享受类型安全的依赖注入与热重载**。
 
@@ -213,7 +213,7 @@ BeanDefinition<NoConfig, CheckoutService> checkoutDef = Beans.component("checkou
 
 ---
 
-## ⚡ 4. 模式二：编译期注解驱动（`knotra-beans-processor`）
+## 4. 模式二：编译期注解驱动（`knotra-beans-processor`）
 
 如果您不想手写 `Beans.component()` DSL，Knotra 提供了**编译期注解处理器**。它在 `javac` 编译时直接生成 Java 代码，**零反射、启动极快**。
 
@@ -287,7 +287,7 @@ handle.requireActive();
 
 ---
 
-## 🍃 5. 模式三：Spring 子容器动态插拔（`SpringModules`）
+## 5. 模式三：Spring 子容器动态插拔（`SpringModules`）
 
 这是**将一整套 Spring 模块（包含多个 `@Service`、`@Repository`、`@Configuration`）打包为动态插件**的核心模式。
 
@@ -295,22 +295,22 @@ handle.requireActive();
 
 ```mermaid
 graph TB
-    subgraph Knotra Runtime 宿主
-        KR[Knotra 运行时]
-        UP[宿主提供的 UserRepository]
+    subgraph knotra_host ["Knotra Runtime 宿主"]
+        KR["Knotra 运行时"]
+        UP["宿主提供的 UserRepository"]
     end
 
-    subgraph Spring Child Context 插件代际
+    subgraph spring_child ["Spring Child Context 插件代际"]
         direction TB
-        SCC[AnnotationConfigApplicationContext]
-        SCC -->|注入外部 Singleton| EB[UserRepository Bean 引用]
-        SCC -->|插件内部创建| PS[PaymentService Bean]
+        SCC["AnnotationConfigApplicationContext"]
+        SCC -->|注入外部 Singleton| EB["UserRepository Bean 引用"]
+        SCC -->|插件内部创建| PS["PaymentService Bean"]
         EB -.-> PS
     end
 
     KR -->|生命周期管理| SCC
     UP -->|借入使用| EB
-    PS -->|expose 发布为 Capability| KP[PAYMENT_SERVICE 供宿主调用]
+    PS -->|expose 发布为 Capability| KP["PAYMENT_SERVICE 供宿主调用"]
 ```
 
 ### 5.2 完整上手步骤
@@ -353,7 +353,7 @@ ComponentHandle<NoConfig> pluginHandle = runtime.mount("payment-plugin", pluginF
 pluginHandle.requireActive();
 ```
 
-> 🔍 **发生了什么？**
+> **发生了什么？**
 > 1. Knotra 自动为该插件创建独立的 `AnnotationConfigApplicationContext`；
 > 2. 将外部借入的 `UserRepository` 注册为 Spring 单例；
 > 3. 调用 `context.refresh()` 启动容器；
@@ -362,7 +362,7 @@ pluginHandle.requireActive();
 
 ---
 
-## 🌉 6. 模式四：Spring 宿主动态桥（`SpringDynamicBridge`）
+## 6. 模式四：Spring 宿主动态桥（`SpringDynamicBridge`）
 
 ### 6.1 场景：在宿主 Spring Boot 单例中无感知调用动态插件
 
@@ -410,24 +410,24 @@ public class OrderController {
 
 ---
 
-## 🛠️ 7. 常见场景选型决策指南
+## 7. 常见场景选型决策指南
 
 ```mermaid
 graph TD
-    Start["我该使用哪种装配方式？"] --> Q1{"是否必须使用 Spring 容器？"}
+    start_decision["我该使用哪种装配方式？"] --> q_spring{"是否必须使用 Spring 容器？"}
 
-    Q1 -->|"否 (普通 Java 类)"| Q2{"构造器参数数量？"}
-    Q2 -->|"0 ~ 5 个"| R1["✅ knotra-beans DSL<br/>(Beans.component)"]
-    Q2 -->|"较多 / 偏好注解"| R2["✅ knotra-beans-processor<br/>(@KnotraBean)"]
+    q_spring -->|"否 (普通 Java 类)"| q_args{"构造器参数数量？"}
+    q_args -->|"0 ~ 5 个"| res_pojo["knotra-beans DSL<br/>(Beans.component)"]
+    q_args -->|"较多 / 偏好注解"| res_proc["knotra-beans-processor<br/>(@KnotraBean)"]
 
-    Q1 -->|"是 (已有 Spring 代码)"| Q3{"组件在架构中的角色？"}
-    Q3 -->|"整块动态业务模块/插件"| R3["✅ SpringModules 子容器<br/>(SpringModules.noConfig/typed)"]
-    Q3 -->|"宿主单例调用动态插件"| R4["✅ SpringDynamicBridge<br/>(bridge.proxy())"]
+    q_spring -->|"是 (已有 Spring 代码)"| q_role{"组件在架构中的角色？"}
+    q_role -->|"整块动态业务模块/插件"| res_child["SpringModules 子容器<br/>(SpringModules.noConfig/typed)"]
+    q_role -->|"宿主单例调用动态插件"| res_bridge["SpringDynamicBridge<br/>(bridge.proxy())"]
 ```
 
 ---
 
-## ⚠️ 8. 避坑与核心原则
+## 8. 避坑与核心原则
 
 1. **不要在 Spring 子容器中重复扫描宿主的 Bean**：
    - Spring 子容器应该保持精简，只包含插件自身的 `@Configuration`。外部依赖一律通过 `.required("name", KEY)` 显式借入。

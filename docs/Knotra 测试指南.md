@@ -1,10 +1,10 @@
 # Knotra 测试指南
 
-> 💡 **面向读者**：编写动态组件系统与插件系统时，传统的单测往往容易写出“时序竞态”或“假死测试”。本文提供一套标准、可靠的 Knotra 测试套路，覆盖普通 POJO、依赖热替换、故障恢复与 ClassLoader 内存回收测试。
+> **面向读者**：编写动态组件系统与插件系统时，传统的单测往往容易写出“时序竞态”或“假死测试”。本文提供一套标准、可靠的 Knotra 测试套路，覆盖普通 POJO、依赖热替换、故障恢复与 ClassLoader 内存回收测试。
 
 ---
 
-## 🧭 1. Knotra 测试三大铁律
+## 1. Knotra 测试三大铁律
 
 1. **断言状态与代际，绝不断言调度时机**：
    - 优先检查 `handle.state() == ACTIVE`、`handle.requireActive()`、`DiagnosticCode`、`generation`；绝不要用 `Thread.sleep(100)` 来猜组件什么时候启动完成。
@@ -23,7 +23,7 @@ mvn clean verify
 
 ---
 
-## 🧪 2. 模式一：普通 POJO 组件单元测试
+## 2. 模式一：普通 POJO 组件单元测试
 
 测试核心逻辑：验证当底层 Provider 被 `replace()` 时，上层消费方是否自动以新依赖重新激活。
 
@@ -95,7 +95,7 @@ class GreeterComponentTest {
 
 ---
 
-## 🛑 3. 模式二：故障恢复与清理重试测试
+## 3. 模式二：故障恢复与清理重试测试
 
 Knotra 的一大特色是：**清理失败不吞没，保留现场并支持幂等重试**。以下演示如何测试清理失败场景：
 
@@ -135,7 +135,7 @@ void cleanupFailureRetainsDiagnosticsAndRecoversOnRetry() {
 
 ---
 
-## 🧹 4. 模式三：ClassLoader 卸载与 GC 回收验证测试
+## 4. 模式三：ClassLoader 卸载与 GC 回收验证测试
 
 为了确保动态加载的插件 JAR 在卸载后不会造成 Metaspace 内存泄漏，可以编写如下的 GC 断言测试：
 

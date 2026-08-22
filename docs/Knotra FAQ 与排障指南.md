@@ -1,10 +1,10 @@
 # Knotra FAQ 与排障指南
 
-> 💡 **面向读者**：当您的组件卡在某个状态（如 `WAITING` 或 `FAILED`）、调用报错或插件卸载遇到问题时，本文提供“症状 $\to$ 原因 $\to$ 解决方案”的快速排查路径。
+> **面向读者**：当您的组件卡在某个状态（如 `WAITING` 或 `FAILED`）、调用报错或插件卸载遇到问题时，本文提供“症状 ➔ 原因 ➔ 解决方案”的快速排查路径。
 
 ---
 
-## 🧭 1. 排障三板斧（30 秒快速定位）
+## 1. 排障三板斧（30 秒快速定位）
 
 遇到任何异常情况，第一步是**打印运行时快照（Snapshot）**：
 
@@ -29,7 +29,7 @@ snapshot.components().stream()
 
 ---
 
-## 🚦 2. 状态机速查表
+## 2. 状态机速查表
 
 ### 2.1 组件状态（ComponentState）
 
@@ -37,13 +37,13 @@ snapshot.components().stream()
 stateDiagram-v2
     [*] --> WAITING : 依赖缺失 / 环依赖
     WAITING --> STARTING : 依赖就绪 / 收到更新
-    STARTING --> ACTIVE : start() 执行成功
-    STARTING --> FAILED : start() 抛出异常
+    STARTING --> ACTIVE : start 执行成功
+    STARTING --> FAILED : start 抛出异常
     ACTIVE --> STOPPING : 依赖被替换 / 配置更新 / 销毁
     STOPPING --> WAITING : 重启中等待新依赖
     STOPPING --> STARTING : 触发下一代启动
     STOPPING --> DISPOSED : 销毁完成 (终态)
-    FAILED --> STARTING : 显式调用 retryAsync()
+    FAILED --> STARTING : 显式调用 retryAsync
     FAILED --> DISPOSED : 销毁
 ```
 
@@ -58,7 +58,7 @@ stateDiagram-v2
 
 ---
 
-## 📋 3. 常见诊断码（DiagnosticCode）与解决方案
+## 3. 常见诊断码（DiagnosticCode）与解决方案
 
 | 诊断码 (Enum) | 触发原因 (为什么报错) | 解决办法 (怎么修) |
 |---|---|---|
@@ -71,7 +71,7 @@ stateDiagram-v2
 
 ---
 
-## ❓ 4. 高频疑难问题解答（FAQ）
+## 4. 高频疑难问题解答（FAQ）
 
 ### Q1：为什么我的组件挂载后，一直是 `WAITING` 状态？
 
@@ -157,5 +157,5 @@ System.out.println("重试后状态: " + handle.state());
 3. **ThreadLocal 泄漏**：插件线程是否设置了 `ThreadLocal` 且未调用 `.remove()`？
 4. **第三方框架缓存**：如 Jackson、Log4j 等全局缓存了插件的 Class 对象。
 
-> 💡 **Knotra 的安全保证**：
+> **Knotra 的安全保证**：
 > Knotra 自身的 `Snapshot`、`ComponentHandle`、`Diagnostic` 均采用纯元数据设计，**绝对不会持有插件的 Class 或 ClassLoader 引用**。只要插件自身规范清理了线程与引用，插件 ClassLoader 会在卸载后被 JVM 垃圾回收（GC）。

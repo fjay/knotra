@@ -1,25 +1,25 @@
 # Knotra 线程模型与生产实践
 
-> 💡 **面向读者**：本文深入剖析 Knotra 运行时的线程调度机制、阻塞边界、类加载器（TCCL）切换规则以及生产环境运维落地的最佳实践。
+> **面向读者**：本文深入剖析 Knotra 运行时的线程调度机制、阻塞边界、类加载器（TCCL）切换规则以及生产环境运维落地的最佳实践。
 
 ---
 
-## 🧵 1. 线程模型全景图（谁在什么线程执行？）
+## 1. 线程模型全景图（谁在什么线程执行？）
 
 Knotra 基于 Java 21+ 虚拟线程与轻量守护线程构建，**没有笨重的全局线程池，也没有常驻的定时轮询线程**。
 
 ```mermaid
 graph TD
-    subgraph 宿主调用方线程
+    subgraph caller_threads ["宿主调用方线程"]
         HT["宿主业务线程"] -->|"1. 执行事务准备 (transact)"| TR["校验与发布结构意图"]
         HT -->|"2. 发起动态调用 (Dynamic Proxy / call)"| DP["直接穿透执行 Provider 方法"]
     end
 
-    subgraph Knotra 后台执行器
-        VT["Core 虚拟线程池<br/>(newVirtualThreadPerTaskExecutor)"] -->|"执行组件 start() 初始化<br/>与 LifecycleScope 清理"| ACT["各组件 Activation"]
-        LC["Loader 守护线程<br/>(loader-coordinator)"] -->|"单线程串行处理<br/>reconcile 期望树对比"| RE["收敛调度"]
-        PF["PF4J 守护线程<br/>(artifact-coordinator)"] -->|"单线程串行处理<br/>插件加载与 Drain 排空"| PL["插件状态机"]
-        EB["EventBus 缓存线程池<br/>(event-bus-worker)"] -->|"分发事件 (Parallel / Serial 等)"| EV["事件监听器 Listener"]
+    subgraph knotra_executors ["Knotra 后台执行器"]
+        VT["Core 虚拟线程池<br/>newVirtualThreadPerTaskExecutor"] -->|"执行组件 start 初始化<br/>与 LifecycleScope 清理"| ACT["各组件 Activation"]
+        LC["Loader 守护线程<br/>loader-coordinator"] -->|"单线程串行处理<br/>reconcile 期望树对比"| RE["收敛调度"]
+        PF["PF4J 守护线程<br/>artifact-coordinator"] -->|"单线程串行处理<br/>插件加载与 Drain 排空"| PL["插件状态机"]
+        EB["EventBus 缓存线程池<br/>event-bus-worker"] -->|"分发事件 (Parallel / Serial 等)"| EV["事件监听器 Listener"]
     end
 ```
 
@@ -36,7 +36,7 @@ graph TD
 
 ---
 
-## ⚡ 2. 组件 `start()` 与生命周期清理规则
+## 2. 组件 `start()` 与生命周期清理规则
 
 1. **`start()` 运行在虚拟线程上**：
    - 慢操作（如初始化数据库连接池、拉取远程配置）可以安全地在 `start()` 中执行，**绝不会阻塞 Knotra 内部协调器锁**，也不会卡住宿主事务。
@@ -49,7 +49,7 @@ graph TD
 
 ---
 
-## 🔀 3. 类加载器上下文（TCCL）自动切换
+## 3. 类加载器上下文（TCCL）自动切换
 
 在 Java 中，许多框架（如 SPI `ServiceLoader`、Jackson、Log4j、Spring XML 等）重度依赖 `Thread.currentThread().getContextClassLoader()`。
 
@@ -72,12 +72,12 @@ sequenceDiagram
     Knotra->>Knotra: 恢复 TCCL = AppClassLoader
 ```
 
-> 🛡️ **Knotra 机制**：
+> **Knotra 机制**：
 > Knotra 在执行组件 `start()`、EventBus 监听器、Spring 子容器初始化与自定义清理钩子时，**均会自动将 TCCL 切换为目标组件自身的 ClassLoader，并在执行完毕后严格恢复**。
 
 ---
 
-## 🛑 4. 生产环境优雅停机指南
+## 4. 生产环境优雅停机指南
 
 在应用准备停机（如接收到 `SIGTERM` 或应用上下文关闭）时，请遵循以下标准的异步等待模式：
 
@@ -109,7 +109,7 @@ public void shutdownGracefully() {
 
 ---
 
-## 📊 5. 生产环境可观测性与监控指标接入
+## 5. 生产环境可观测性与监控指标接入
 
 Knotra 的 `RuntimeSnapshot` 是完全无副作用的纯数据结构（DTO），可安全用于 Prometheus / Micrometer 指标采集：
 

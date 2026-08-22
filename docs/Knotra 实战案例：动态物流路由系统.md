@@ -1,19 +1,19 @@
 # 实战案例：动态物流路由系统
 
-> 💡 **面向读者**：本文通过一个完整的**“物流包裹动态路由系统”**案例，带您一步步走完从普通 POJO 装配、动态调用租约、PF4J 插件热升级到声明式期望树收敛的完整落地流程。
+> **面向读者**：本文通过一个完整的**“物流包裹动态路由系统”**案例，带您一步步走完从普通 POJO 装配、动态调用租约、PF4J 插件热升级到声明式期望树收敛的完整落地流程。
 
 ---
 
-## 📦 1. 业务背景与真正的问题
+## 1. 业务背景与真正的问题
 
 在一个现代物流分拨中心，每天有数百万包裹进入各仓库。系统需要根据包裹的目的地、承运商运力以及各仓库的特定规则，动态决定将包裹交给顺丰、京东还是中通配送。
 
 ```mermaid
 graph LR
-    P[待处理包裹 Parcel] --> Q[持久化队列 ParcelInbox]
-    Q --> D[队列分发器 ParcelDispatcher]
-    D -->|根据规则计算最优路径| R[动态路由规则引擎 RoutePlanner]
-    R --> S[顺丰 / 京东 / 中通]
+    P["待处理包裹 Parcel"] --> Q["持久化队列 ParcelInbox"]
+    Q --> D["队列分发器 ParcelDispatcher"]
+    D -->|根据规则计算最优路径| R["动态路由规则引擎 RoutePlanner"]
+    R --> S["顺丰 / 京东 / 中通"]
 ```
 
 ### 真实生产中的痛点：
@@ -24,7 +24,7 @@ graph LR
 
 ---
 
-## 📜 2. 第一步：定义共享合约包 (`com.acme.logistics.contract`)
+## 2. 第一步：定义共享合约包 (`com.acme.logistics.contract`)
 
 宿主应用和插件工程共同依赖此接口包：
 
@@ -52,7 +52,7 @@ public final class LogisticsContracts {
 
 ---
 
-## ⚡ 3. 第二步：编写队列消费分发器（消费方）
+## 3. 第二步：编写队列消费分发器（消费方）
 
 分发器从队列获取包裹，并调用动态注入的 `RoutePlanner` 计算路径。我们使用**动态代理（Dynamic Proxy）**，使得路由规则热升级时，分发器无需重启：
 
@@ -97,7 +97,7 @@ BeanDefinition<NoConfig, ParcelDispatcher> dispatcherDef = Beans.component("disp
 
 ---
 
-## 🔌 4. 第三步：开发 V1 与 V2 规则插件（PF4J）
+## 4. 第三步：开发 V1 与 V2 规则插件（PF4J）
 
 ### V1 规则插件实现（优先走经济型陆运）：
 
@@ -130,7 +130,7 @@ public final class SmartRoutePlanner implements RoutePlanner {
 
 ---
 
-## 🚀 5. 第四步：宿主运行时热升级与安全排空演练
+## 5. 第四步：宿主运行时热升级与安全排空演练
 
 ```java
 import io.knotra.*;
@@ -176,7 +176,7 @@ public class LogisticsSystemDemo {
                         .resolve("shanghai-smart-router", NoConfig.class).orElseThrow()
                         .mount(runtime.root(), "active-router");
 
-                // 4. 再次发送包裹，无缝路由到新规则！
+                // 4. 再次发送包裹，无缝路由到新规则
                 Parcel p2 = new Parcel("PKG-002", "北京", 25.0);
                 runtime.root().view().require(LogisticsContracts.ROUTE_PLANNER).plan(p2);
                 // 输出: 包裹 [PKG-002] 成功路由至承运商: SF-Express (Heavy-Freight)
@@ -190,7 +190,7 @@ public class LogisticsSystemDemo {
 
 ---
 
-## 🎯 6. 核心收获总结
+## 6. 核心收获总结
 
 通过本案例，我们验证了 Knotra 的核心生产价值：
 1. **业务解耦**：业务代码（`ParcelDispatcher`）不依赖 Knotra API，只面向业务接口编程；
