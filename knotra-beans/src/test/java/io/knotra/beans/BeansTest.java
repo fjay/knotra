@@ -66,7 +66,7 @@ final class BeansTest {
         List<Service> beans = new CopyOnWriteArrayList<>();
 
         BeanDefinition<Service> definition = Beans.component("rebind-consumer")
-                .with(Beans.required(dep))
+                .with(Beans.fixed(dep))
                 .create(value -> {
                     Service bean = new Service(value);
                     beans.add(bean);
@@ -93,7 +93,7 @@ final class BeansTest {
     void optionalDependencyAppearanceAndDisappearanceReactivateBean() throws Exception {
         List<String> observed = new CopyOnWriteArrayList<>();
         BeanDefinition<String> definition = Beans.component("opt-consumer")
-                .with(Beans.optional(OPT))
+                .with(Beans.fixedOptional(OPT))
                 .create(value -> {
                     String result = value.map(item -> "present:" + item).orElse("empty");
                     observed.add(result);
@@ -241,7 +241,7 @@ final class BeansTest {
         CapabilityKey<Service> out = CapabilityKey.of("rollback-out", Service.class);
         List<String> readerValues = new CopyOnWriteArrayList<>();
         BeanDefinition<String> reader = Beans.component("rollback-reader")
-                .with(Beans.required(out))
+                .with(Beans.fixed(out))
                 .create(value -> {
                     readerValues.add(value.value);
                     return value.value;
@@ -276,7 +276,7 @@ final class BeansTest {
         CapabilityKey<Integer> derived = CapabilityKey.of("atomic-derived", Integer.class);
         List<String> readerValues = new CopyOnWriteArrayList<>();
         BeanDefinition<String> reader = Beans.component("atomic-reader")
-                .with(Beans.required(primary))
+                .with(Beans.fixed(primary))
                 .create(value -> {
                     readerValues.add(value.value);
                     return value.value;
@@ -386,7 +386,7 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-1")
-                .with(Beans.required(D0))
+                .with(Beans.fixed(D0))
                 .create(v1 -> {
                     joined.add(v1);
                     return v1;
@@ -394,7 +394,7 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-2")
-                .with(Beans.required(D0), Beans.required(D1))
+                .with(Beans.fixed(D0), Beans.fixed(D1))
                 .create((v1, v2) -> {
                     String value = v1 + v2;
                     joined.add(value);
@@ -403,8 +403,8 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-3")
-                .with(Beans.required(D0))
-                .with(Beans.required(D1), Beans.required(D2))
+                .with(Beans.fixed(D0))
+                .with(Beans.fixed(D1), Beans.fixed(D2))
                 .create((v1, v2, v3) -> {
                     String value = v1 + v2 + v3;
                     joined.add(value);
@@ -413,8 +413,8 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-4")
-                .with(Beans.required(D0), Beans.required(D1))
-                .with(Beans.required(D2), Beans.required(D3))
+                .with(Beans.fixed(D0), Beans.fixed(D1))
+                .with(Beans.fixed(D2), Beans.fixed(D3))
                 .create((v1, v2, v3, v4) -> {
                     String value = v1 + v2 + v3 + v4;
                     joined.add(value);
@@ -423,8 +423,8 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-5")
-                .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
-                .with(Beans.required(D3), Beans.required(D4))
+                .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
+                .with(Beans.fixed(D3), Beans.fixed(D4))
                 .create((v1, v2, v3, v4, v5) -> {
                     String value = v1 + v2 + v3 + v4 + v5;
                     joined.add(value);
@@ -454,7 +454,7 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-1", Prefix.class)
-                        .with(Beans.required(D0))
+                        .with(Beans.fixed(D0))
                         .create((config, v1) -> {
                             String value = config.value() + v1;
                             joined.add(value);
@@ -464,7 +464,7 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-2", Prefix.class)
-                        .with(Beans.required(D0), Beans.required(D1))
+                        .with(Beans.fixed(D0), Beans.fixed(D1))
                         .create((config, v1, v2) -> {
                             String value = config.value() + v1 + v2;
                             joined.add(value);
@@ -474,7 +474,7 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-3", Prefix.class)
-                        .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
+                        .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
                         .create((config, v1, v2, v3) -> {
                             String value = config.value() + v1 + v2 + v3;
                             joined.add(value);
@@ -484,8 +484,8 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-4", Prefix.class)
-                        .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
-                        .with(Beans.required(D3))
+                        .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
+                        .with(Beans.fixed(D3))
                         .create((config, v1, v2, v3, v4) -> {
                             String value = config.value() + v1 + v2 + v3 + v4;
                             joined.add(value);
@@ -495,8 +495,8 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-5", Prefix.class)
-                        .with(Beans.required(D0), Beans.required(D1), Beans.required(D2))
-                        .with(Beans.required(D3), Beans.required(D4))
+                        .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
+                        .with(Beans.fixed(D3), Beans.fixed(D4))
                         .create((config, v1, v2, v3, v4, v5) -> {
                             String value = config.value() + v1 + v2 + v3 + v4 + v5;
                             joined.add(value);
@@ -512,8 +512,8 @@ final class BeansTest {
         register(D0, "0");
         List<String> observed = new CopyOnWriteArrayList<>();
         List<BeanDependency<?>> dependencies = List.of(
-                Beans.required(D0),
-                Beans.optional(OPT));
+                Beans.fixed(D0),
+                Beans.fixedOptional(OPT));
         BeanDefinition<String> definition = Beans.expert(
                         "expert-bean",
                         dependencies,
@@ -751,7 +751,7 @@ final class BeansTest {
     @Test
     void classShortcutsUseContractBinaryNameForDependenciesAndOutputs() throws Exception {
         BeanDefinition<String> definition = Beans.component("class-shortcuts")
-                .with(Beans.optional(Api.class))
+                .with(Beans.fixedOptional(Api.class))
                 .create(optional -> optional.map(Api::value).orElse("none"))
                 .provide(String.class)
                 .build();

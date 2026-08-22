@@ -152,10 +152,11 @@ A2 payable=340 rule=tiered-gold
 ```java
 BeanDefinition<BatchSettlementJob> definition = Beans
         .component("batch-settlement")
-        .with(Beans.required(PromotionContracts.CAMPAIGN))
+        .with(Beans.fixed(PromotionContracts.CAMPAIGN))
         .create(BatchSettlementJob::new)
         .build();
 ```
+
 
 提供方替换时，该 Job 会绑定新的 Registration 并重建。旧 Activation 中已经开始的批次继续使用旧代际，完成并 drain 后释放。
 

@@ -97,11 +97,11 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
 ```java
 BeanDefinition<CheckoutService> definition = Beans
         .component("checkout")
-        .with(Beans.required(Pricing.class))
-        .with(Beans.required(Inventory.class), Beans.optional(UserProfile.class))
+        .with(Beans.fixed(Pricing.class))
+        .with(Beans.fixed(Inventory.class), Beans.fixedOptional(UserProfile.class))
         .create((pricing, inventory, profile) ->
                 new CheckoutService(pricing, inventory, profile))
-        .provideAs(Checkout.class, service -> service)
+        .provideAs(Checkout.class)
         .build();
 ```
 
@@ -109,15 +109,16 @@ DSL 支持 0 到 5 个显式依赖。更多构造参数、复杂泛型或强一�
 
 ### 输出映射
 
-`provide(Class<T>)` 要求 Bean 本身实现合约；`provideAs(Class<P>, mapper)` 允许把内部实现映射成公开接口：
+`provide(Class<T>)` 要求 Bean 本身实现合约；`provideAs(Class<P>)` 允许类型转换导出，`provideAs(Class<P>, mapper)` 允许把内部实现映射成公开接口：
 
 ```java
 BeanDefinition<DefaultOrderService> definition = Beans
         .component("order-service")
-        .with(Beans.required(OrderRepository.class))
+        .with(Beans.fixed(OrderRepository.class))
         .create(DefaultOrderService::new)
         .provideAs(OrderService.class, DefaultOrderService::publicFacade)
         .build();
+
 ```
 
 多个输出在同一 Activation 中原子提交。任一输出为 null 或映射失败，整次启动失败，其他输出不会提前可见。
@@ -237,7 +238,7 @@ public final class CheckoutService implements Checkout {
 
     @KnotraConstructor
     CheckoutService(
-            @KnotraRequire("checkout.pricing") Pricing pricing,
+            @KnotraFixed("checkout.pricing") Pricing pricing,
             @KnotraOptional("checkout.profile") Optional<UserProfile> profile,
             @KnotraDynamicProxy("checkout.gateway") PaymentGateway gateway) {
         ...
@@ -268,8 +269,9 @@ MountHandle handle = definition.mount(runtime);
 
 - `@KnotraBean(id, outputs, config, lifecycle)`
 - `@KnotraConstructor`
-- `@KnotraRequire(name)`
+- `@KnotraFixed(name)`
 - `@KnotraOptional(name)`
+
 - `@KnotraDynamicProxy(name)`
 - `@KnotraConfig`
 - `@KnotraOutput(name, contract)`

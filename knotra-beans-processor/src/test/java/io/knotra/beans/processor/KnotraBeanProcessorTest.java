@@ -172,7 +172,7 @@ final class KnotraBeanProcessorTest {
         CompilerKit.Compilation compilation = CompilerKit.lastCompilation();
         CompilerKit.assertSuccess(compilation);
         String source = compilation.generatedSource("SixDependencyBean_KnotraFactory.java");
-        assertEquals(6, countOccurrences(source, "Beans.required("));
+        assertEquals(6, countOccurrences(source, "Beans.fixed("));
 
         runtime = KnotraRuntime.create();
         try (URLClassLoader loader = compilation.classLoader()) {
@@ -281,7 +281,7 @@ final class KnotraBeanProcessorTest {
 
                     @KnotraConstructor
                     ValidBean(
-                            @KnotraRequire("processor.storage") Storage storage,
+                            @KnotraFixed("processor.storage") Storage storage,
                             @KnotraOptional("processor.feature") Optional<Feature> feature,
                             @KnotraDynamicProxy("processor.router") Router router) {
                         this.storage = storage;
@@ -381,12 +381,12 @@ final class KnotraBeanProcessorTest {
 
                     @KnotraConstructor
                     SixDependencyBean(
-                            @KnotraRequire("processor.six-0") String zero,
-                            @KnotraRequire("processor.six-1") String one,
-                            @KnotraRequire("processor.six-2") String two,
-                            @KnotraRequire("processor.six-3") String three,
-                            @KnotraRequire("processor.six-4") String four,
-                            @KnotraRequire("processor.six-5") String five) {
+                            @KnotraFixed("processor.six-0") String zero,
+                            @KnotraFixed("processor.six-1") String one,
+                            @KnotraFixed("processor.six-2") String two,
+                            @KnotraFixed("processor.six-3") String three,
+                            @KnotraFixed("processor.six-4") String four,
+                            @KnotraFixed("processor.six-5") String five) {
                         this.joined = zero + one + two + three + four + five;
                     }
 
@@ -406,7 +406,7 @@ final class KnotraBeanProcessorTest {
                 new Object[] {"two constructors", """
                         class BadBean {
                             @KnotraConstructor BadBean() {}
-                            @KnotraConstructor BadBean(@KnotraRequire("x") String value) { this(); }
+                            @KnotraConstructor BadBean(@KnotraFixed("x") String value) { this(); }
                         }
                         """, "exactly one @KnotraConstructor"},
                 new Object[] {"unannotated parameter", """
@@ -441,7 +441,7 @@ final class KnotraBeanProcessorTest {
                         @KnotraOutput(
                                 name = "x", contract = String.class)
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraRequire("x") String value) {}
+                            @KnotraConstructor BadBean(@KnotraFixed("x") String value) {}
                         }
                         """, "duplicate capability name"},
                 new Object[] {"bad init", """
@@ -473,7 +473,7 @@ final class KnotraBeanProcessorTest {
 
                         @KnotraBean(id = "bad")
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraRequire("x") Contract<String> value) {}
+                            @KnotraConstructor BadBean(@KnotraFixed("x") Contract<String> value) {}
                         }
                         """, "contract must not be a generic or parameterized type"},
                 new Object[] {"optional nested type argument", """
@@ -511,7 +511,7 @@ final class KnotraBeanProcessorTest {
                         class BadBean {
                             private interface Contract { String value(); }
 
-                            @KnotraConstructor BadBean(@KnotraRequire("x") Contract value) {}
+                            @KnotraConstructor BadBean(@KnotraFixed("x") Contract value) {}
                         }
                         """, "contract must be accessible"},
                 new Object[] {"private nested optional contract", """

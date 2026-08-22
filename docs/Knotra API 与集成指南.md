@@ -31,7 +31,8 @@ CapabilityKey<Greeting> key = CapabilityKey.of(Greeting.class);
 System.out.println(key.name()); // Greeting.class.getName()
 ```
 
-多数接口只有一个实现槽位时，`runtime.publish(Greeting.class, value)`、`Beans.required(Greeting.class)` 和 `context.require(Greeting.class)` 足够。多个槽位使用显式名称：
+多数接口只有一个实现槽位时，`runtime.publish(Greeting.class, value)`、`Beans.fixed(Greeting.class)` 和 `context.require(Greeting.class)` 足够。多个槽位使用显式名称：
+
 
 ```java
 CapabilityKey<PaymentGateway> PRIMARY =

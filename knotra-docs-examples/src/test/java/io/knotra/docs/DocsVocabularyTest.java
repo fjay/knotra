@@ -21,7 +21,11 @@ final class DocsVocabularyTest {
             "BeanDefinition<NoConfig",
             "TransactionReceipt<Provided",
             ".components()",
-            "dynamicProxyRequired");
+            "dynamicProxyRequired",
+            "Beans.required(",
+            "Beans.optional(",
+            "KnotraRequire");
+
 
     @Test
     void userFacingDocsUseTheCurrentVocabulary() throws IOException {

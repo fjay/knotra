@@ -10,7 +10,7 @@ import io.knotra.beans.annotation.KnotraInit;
 import io.knotra.beans.annotation.KnotraNormalizeConfig;
 import io.knotra.beans.annotation.KnotraOptional;
 import io.knotra.beans.annotation.KnotraOutput;
-import io.knotra.beans.annotation.KnotraRequire;
+
 
 
 import javax.annotation.processing.AbstractProcessor;
@@ -345,16 +345,12 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             TypeMirror configType,
             boolean noConfig) {
         AnnotationMirror fixedMirror = mirror(parameter, KnotraFixed.class.getCanonicalName());
-        AnnotationMirror requireMirror = mirror(parameter, KnotraRequire.class.getCanonicalName());
         AnnotationMirror optionalMirror = mirror(parameter, KnotraOptional.class.getCanonicalName());
         AnnotationMirror dynamicMirror = mirror(parameter, KnotraDynamicProxy.class.getCanonicalName());
         AnnotationMirror configMirror = mirror(parameter, KnotraConfig.class.getCanonicalName());
 
         int declarations = 0;
         if (fixedMirror != null) {
-            declarations++;
-        }
-        if (requireMirror != null) {
             declarations++;
         }
         if (optionalMirror != null) {
@@ -368,7 +364,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         }
         if (declarations != 1) {
             error(parameter, "every constructor parameter must have exactly one of "
-                    + "@KnotraFixed, @KnotraRequire, @KnotraOptional, @KnotraDynamicProxy, or @KnotraConfig");
+                    + "@KnotraFixed, @KnotraOptional, @KnotraDynamicProxy, or @KnotraConfig");
             return null;
         }
 
@@ -397,10 +393,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         ParameterKind kind;
         if (fixedMirror != null) {
             dependencyMirror = fixedMirror;
-            kind = ParameterKind.REQUIRED;
-        } else if (requireMirror != null) {
-            dependencyMirror = requireMirror;
-            kind = ParameterKind.REQUIRED;
+            kind = ParameterKind.FIXED;
         } else if (optionalMirror != null) {
             dependencyMirror = optionalMirror;
             kind = ParameterKind.OPTIONAL;
@@ -416,7 +409,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
                 value(annotationValues.get("required"), Boolean.class, Boolean.TRUE));
 
         TypeMirror contract;
-        if (kind == ParameterKind.REQUIRED || kind == ParameterKind.DYNAMIC) {
+        if (kind == ParameterKind.FIXED || kind == ParameterKind.DYNAMIC) {
             contract = parameter.asType();
         } else {
             contract = optionalContract(parameter.asType())
@@ -442,16 +435,17 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             return null;
         }
 
-        if (kind == ParameterKind.REQUIRED) {
+        if (kind == ParameterKind.FIXED) {
             if (isParameterizedOrGeneric(parameter.asType())) {
-                error(parameter, "@KnotraRequire parameter type must not be a generic or parameterized type");
+                error(parameter, "@KnotraFixed parameter type must not be a generic or parameterized type");
                 return null;
             }
             if (!isSameErasedType(parameter.asType(), contract)) {
-                error(parameter, "@KnotraRequire parameter must have the exact contract type");
+                error(parameter, "@KnotraFixed parameter must have the exact contract type");
                 return null;
             }
         }
+
         if (kind == ParameterKind.OPTIONAL) {
             Optional<TypeMirror> value = exactOptionalOf(parameter.asType(), contract);
             if (value.isEmpty()) {
@@ -736,15 +730,16 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
                 }
                 first = false;
                 source.append("            Beans.");
-                if (parameter.kind() == ParameterKind.REQUIRED) {
-                    source.append("required");
+                if (parameter.kind() == ParameterKind.FIXED) {
+                    source.append("fixed");
                 } else if (parameter.kind() == ParameterKind.OPTIONAL) {
-                    source.append("optional");
+                    source.append("fixedOptional");
                 } else if (parameter.required()) {
                     source.append("dynamic");
                 } else {
                     source.append("dynamicOptional");
                 }
+
                 source.append("(KEY_").append(dependencyIndex(parameter, model.parameters())).append(')');
             }
             source.append(");\n");
@@ -785,13 +780,14 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             } else {
                 int index = dependencyIndexForArgs++;
                 source.append("                        ");
-                if (parameter.kind() == ParameterKind.REQUIRED) {
+                if (parameter.kind() == ParameterKind.FIXED) {
                     source.append("context.require(KEY_").append(index).append(')');
                 } else if (parameter.kind() == ParameterKind.OPTIONAL) {
                     source.append("context.find(KEY_").append(index).append(')');
                 } else {
                     source.append("context.subscribe(KEY_").append(index).append(").proxy()");
                 }
+
             }
         }
         source.append("))\n");
@@ -958,10 +954,11 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
     }
 
     private enum ParameterKind {
-        REQUIRED("@KnotraRequire"),
+        FIXED("@KnotraFixed"),
         OPTIONAL("@KnotraOptional"),
         DYNAMIC("@KnotraDynamicProxy"),
         CONFIG("@KnotraConfig");
+
 
         private final String annotationName;
 

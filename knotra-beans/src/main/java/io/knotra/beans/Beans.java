@@ -844,29 +844,9 @@ public final class Beans {
         return fixedOptional(CapabilityKey.of(type));
     }
 
-    /** 声明必需的固定依赖项（启动时必须就绪，提供方被替换将导致 Bean 重新激活）。 */
-    public static <T> BeanDependency<T> required(CapabilityKey<T> key) {
-        return fixed(key);
-    }
-
-    /** 基于类型声明必需的固定依赖项。 */
-    public static <T> BeanDependency<T> required(Class<T> type) {
-        return fixed(type);
-    }
-
-    /** 声明可选的固定依赖项。 */
-    public static <T> BeanDependency<Optional<T>> optional(CapabilityKey<T> key) {
-        return fixedOptional(key);
-    }
-
-    /** 基于类型声明可选的固定依赖项。 */
-    public static <T> BeanDependency<Optional<T>> optional(Class<T> type) {
-        return fixedOptional(type);
-    }
-
-
     /**
      * 声明必需的动态接口代理依赖项。
+
      *
      * <p>仅在组件首次启动激活时校验提供方是否存在；一旦处于 ACTIVE 状态，提供方缺失或热替换不会重启该 Bean，
      * 每次方法调用会自动获取提供方租约并透明路由。</p>
