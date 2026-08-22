@@ -20,23 +20,23 @@ Knotra 是一个面向现代 Java 21+ 的 **JVM 动态组件运行时**。它让
 ```mermaid
 graph LR
     subgraph pain_points ["传统动态方案的痛点"]
-        A["1. 状态撕裂"] -->|"新旧依赖同时存在<br/>数据不一致"| P1["逻辑错误"]
-        B["2. 暴力销毁"] -->|"旧组件仍在处理请求<br/>直接 close 报错"| P2["业务流量受损"]
-        C["3. 内存泄漏"] -->|"ClassLoader 无法卸载<br/>Metaspace OOM"| P3["JVM 崩溃"]
+        A["状态撕裂"] -->|"新旧依赖同时存在<br/>数据不一致"| P1["逻辑错误"]
+        B["暴力销毁"] -->|"旧组件仍在处理请求<br/>直接 close 报错"| P2["业务流量受损"]
+        C["内存泄漏"] -->|"ClassLoader 无法卸载<br/>Metaspace OOM"| P3["JVM 崩溃"]
     end
 ```
 
 Knotra 专门为此而生，它在 JVM 内部建立了严格的**动态运行时秩序**：
-1. **启动前不可见**：新组件完全初始化成功之前，对外部调用方彻底隐藏。
-2. **在途任务安全排空（Drain）**：旧组件被替换时，等待正在执行的方法或异步任务安全完成，再执行清理。
-3. **依赖代际严格一致（Generation Pinned）**：组件启动时固化依赖版本；底层依赖替换时，消费方自动安全重载，绝不发生“上半段用旧依赖、下半段用新依赖”的状态撕裂。
-4. **确定性资源清理（LIFO）**：严格按照启动相反顺序释放资源；清理失败保留现场并支持幂等重试。
+- **启动前不可见**：新组件完全初始化成功之前，对外部调用方彻底隐藏。
+- **在途任务安全排空（Drain）**：旧组件被替换时，等待正在执行的方法或异步任务安全完成，再执行清理。
+- **依赖代际严格一致（Generation Pinned）**：组件启动时固化依赖版本；底层依赖替换时，消费方自动安全重载，绝不发生“上半段用旧依赖、下半段用新依赖”的状态撕裂。
+- **确定性资源清理（LIFO）**：严格按照启动相反顺序释放资源；清理失败保留现场并支持幂等重试。
 
 ---
 
-## 5 分钟极速上手（Hello World）
+## 极速上手
 
-### 1. 引入依赖
+### 引入依赖
 
 配置 BOM 与 `knotra-starter`（包含 Core 核心与 Beans 装配支持）：
 
@@ -61,15 +61,17 @@ Knotra 专门为此而生，它在 JVM 内部建立了严格的**动态运行时
 </dependencies>
 ```
 
-### 2. 编写纯粹的业务类（无需继承任何框架类）
+### 编写纯粹的业务类
+
+业务类保持普通 Java 对象形状，无需继承任何框架类或接口：
 
 ```java
-// 1. 服务接口
+// 服务接口
 public interface Greeting {
     String greet(String name);
 }
 
-// 2. 业务消费方（纯普通 Java 类）
+// 业务消费方（纯普通 Java 类）
 public final class Greeter {
     private final Greeting greeting;
 
@@ -83,7 +85,7 @@ public final class Greeter {
 }
 ```
 
-### 3. 用 Knotra 组装并在运行时热替换
+### 组装并热替换
 
 ```java
 import io.knotra.*;
@@ -98,11 +100,11 @@ public class QuickStart {
         // 创建 Knotra 运行时
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
-            // 步骤 1：发布 V1 版本的 Greeting 实现
+            // 发布 V1 版本的 Greeting 实现
             Provided<Greeting> greeting = runtime.provide(
                     GREETING, name -> "v1: 你好, " + name);
 
-            // 步骤 2：装配并挂载 Greeter 组件（自动注入 GREETING 依赖）
+            // 装配并挂载 Greeter 组件（自动注入 GREETING 依赖）
             BeanDefinition<NoConfig, Greeter> greeterDef = Beans.component("greeter")
                     .with(Beans.required(GREETING))
                     .create(Greeter::new)
@@ -112,7 +114,7 @@ public class QuickStart {
             ComponentHandle<NoConfig> greeterHandle = Beans.mount(runtime, greeterDef);
             greeterHandle.requireActive(); // 输出: v1: 你好, Knotra
 
-            // 步骤 3：运行时热替换为 V2 版本
+            // 运行时热替换为 V2 版本
             System.out.println(">>> 正在热替换 Greeting 为 V2 实现...");
             Provided<Greeting> v2 = greeting.replace(name -> "v2: Bonjour, " + name);
 
@@ -133,7 +135,7 @@ v2: Bonjour, Knotra
 
 ---
 
-## 4 个核心心智模型
+## 核心心智模型
 
 ```mermaid
 graph TD

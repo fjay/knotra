@@ -4,16 +4,16 @@
 
 ---
 
-## 1. Spring 开发者 3 分钟速览
+## Spring 开发者速览
 
-### 1.1 为什么有了 Spring，还需要 Knotra？
+### 为什么有了 Spring，还需要 Knotra？
 
 Spring 是优秀的依赖注入与应用容器，但其默认设计是**静态单例模型**：应用启动时初始化所有 Bean，运行期间 Bean 的引用和结构通常不再改变。
 
 当您遇到以下**动态诉求**时，原生 Spring 会面临挑战：
-1. **在线热替换业务逻辑**：在不重启 JVM 的情况下，将 `WechatPayService` 热替换为 `AlipayService`。
-2. **安全排空（Drain）**：旧插件被替换时，必须等待正在处理的请求安全结束，再销毁旧容器；不能暴力直接 `close()`。
-3. **依赖代际一致性**：当底层数据库连接或基础服务更新时，依赖它的上层组件必须自动原子重建，绝不允许上层持有失效的旧连接。
+- **在线热替换业务逻辑**：在不重启 JVM 的情况下，将 `WechatPayService` 热替换为 `AlipayService`。
+- **安全排空（Drain）**：旧插件被替换时，必须等待正在处理的请求安全结束，再销毁旧容器；不能暴力直接 `close()`。
+- **依赖代际一致性**：当底层数据库连接或基础服务更新时，依赖它的上层组件必须自动原子重建，绝不允许上层持有失效的旧连接。
 
 **Knotra 与 Spring 的分工**：
 - **Spring** 负责组织组件内部复杂的 Bean 依赖图与生态支持（如 `@Transactional`、MVC 等）；
@@ -25,17 +25,17 @@ graph TB
         direction TB
         K["Knotra 事务与生命周期调度"]
 
-        subgraph mode_pojo ["模式 A: 纯 POJO 模式"]
+        subgraph mode_pojo ["纯 POJO 模式"]
             P["POJO Bean: 零外部依赖"]
         end
 
-        subgraph mode_spring ["模式 B: Spring 子容器模式"]
+        subgraph mode_spring ["Spring 子容器模式"]
             SC["Spring Child Context: 独立 Spring 容器"]
             SC --> B1["Service"]
             SC --> B2["Repository"]
         end
 
-        subgraph mode_bridge ["模式 C: 宿主动态桥模式"]
+        subgraph mode_bridge ["宿主动态桥模式"]
             SDB["SpringDynamicBridge 智能代理"]
         end
     end
@@ -46,7 +46,7 @@ graph TB
 
 ---
 
-### 1.2 核心术语人话对照字典
+### 核心术语人话对照字典
 
 | Knotra 术语 | Spring 对应概念 / 通俗比喻 | 含义解释 |
 |---|---|---|
@@ -60,7 +60,7 @@ graph TB
 
 ---
 
-## 2. Maven 依赖引入
+## Maven 依赖引入
 
 在项目的 `pom.xml` 中引入 BOM 对齐版本：
 
@@ -98,19 +98,21 @@ graph TB
 
 ---
 
-## 3. 模式一：纯 POJO 业务组件装配（`knotra-beans`）
+## 纯 POJO 业务组件装配（`knotra-beans`）
 
 很多时候，插件或业务策略根本不需要引入庞大的 Spring 容器。`knotra-beans` 提供了一个流畅的 DSL，让**普通的 Java POJO 也能享受类型安全的依赖注入与热重载**。
 
-### 3.1 编写干净的业务类（零框架依赖）
+### 编写干净的业务类
+
+业务类保持普通 Java 对象形状，无需实现任何 Knotra 框架接口：
 
 ```java
-// 1. 业务接口
+// 业务接口
 public interface Greeting {
     String greet(String name);
 }
 
-// 2. 纯 Java 实现（无需实现 Knotra 的任何接口）
+// 纯 Java 实现（无需实现 Knotra 的任何接口）
 public final class GreetingBean implements Greeting, AutoCloseable {
     @Override
     public String greet(String name) {
@@ -124,30 +126,30 @@ public final class GreetingBean implements Greeting, AutoCloseable {
 }
 ```
 
-### 3.2 装配与启动
+### 装配与启动
 
 ```java
 import io.knotra.*;
 import io.knotra.beans.*;
 
-// 1. 定义 Capability 契约 Key
+// 定义 Capability 契约 Key
 static final CapabilityKey<Greeting> GREETING =
         CapabilityKey.of("app.greeting", Greeting.class);
 
-// 2. 使用 DSL 定义 Bean
+// 使用 DSL 定义 Bean
 BeanDefinition<NoConfig, GreetingBean> factory = Beans.component("greeting")
         .create(GreetingBean::new)      // 构造函数
         .provide(GREETING)              // 对外发布的能力
         .build();
 
-// 3. 挂载并启动
+// 挂载并启动
 try (KnotraRuntime runtime = KnotraRuntime.create()) {
     ComponentHandle<NoConfig> handle = Beans.mount(runtime, factory);
     handle.requireActive(); // 确保组件启动成功
 }
 ```
 
-### 3.3 依赖注入：Required 与 Optional
+### 依赖注入：Required 与 Optional
 
 当组件需要依赖其他服务时，使用 `with(...)` 进行声明：
 
@@ -179,7 +181,7 @@ BeanDefinition<NoConfig, UserService> userDef = Beans.component("user-service")
 
 ---
 
-### 3.4 动态依赖（Dynamic）：热替换时不重启消费方
+### 动态依赖：热替换时不重启消费方
 
 如果您希望 Provider 替换时，消费方完全不需要重建（适合无状态服务或高频调用的网关），使用 **动态代理**：
 
@@ -213,11 +215,11 @@ BeanDefinition<NoConfig, CheckoutService> checkoutDef = Beans.component("checkou
 
 ---
 
-## 4. 模式二：编译期注解驱动（`knotra-beans-processor`）
+## 编译期注解驱动（`knotra-beans-processor`）
 
 如果您不想手写 `Beans.component()` DSL，Knotra 提供了**编译期注解处理器**。它在 `javac` 编译时直接生成 Java 代码，**零反射、启动极快**。
 
-### 4.1 配置 Maven Compiler Plugin
+### 配置 Maven Compiler Plugin
 
 ```xml
 <build>
@@ -239,7 +241,7 @@ BeanDefinition<NoConfig, CheckoutService> checkoutDef = Beans.component("checkou
 </build>
 ```
 
-### 4.2 像写 Spring 组件一样标注注解
+### 像写 Spring 组件一样标注注解
 
 ```java
 package com.example.service;
@@ -287,11 +289,11 @@ handle.requireActive();
 
 ---
 
-## 5. 模式三：Spring 子容器动态插拔（`SpringModules`）
+## Spring 子容器动态插拔（`SpringModules`）
 
 这是**将一整套 Spring 模块（包含多个 `@Service`、`@Repository`、`@Configuration`）打包为动态插件**的核心模式。
 
-### 5.1 工作机制图解
+### 工作机制图解
 
 ```mermaid
 graph TB
@@ -313,9 +315,9 @@ graph TB
     PS -->|expose 发布为 Capability| KP["PAYMENT_SERVICE 供宿主调用"]
 ```
 
-### 5.2 完整上手步骤
+### 完整上手步骤
 
-#### 第一步：编写插件内部的 Spring `@Configuration`
+#### 编写插件内部的 Spring 配置
 
 ```java
 package com.example.plugin;
@@ -334,17 +336,17 @@ public class PluginSpringConfig {
 }
 ```
 
-#### 第二步：用 `SpringModules` 定义子容器
+#### 用 SpringModules 定义子容器
 
 ```java
 import io.knotra.spring.SpringModules;
 
 ComponentFactory<NoConfig> pluginFactory = SpringModules.noConfig("payment-plugin")
-        // 1. 扫描插件的 Spring 配置类
+        // 扫描插件的 Spring 配置类
         .annotatedClasses(PluginSpringConfig.class)
-        // 2. 声明需要从 Knotra 借入的依赖，并指定在 Spring 容器中的 Bean Name
+        // 声明需要从 Knotra 借入的依赖，并指定在 Spring 容器中的 Bean Name
         .required("users", USER_REPOSITORY_KEY)
-        // 3. 声明把插件内部的哪个 Spring Bean 暴露为外部 Capability
+        // 声明把插件内部的哪个 Spring Bean 暴露为外部 Capability
         .expose(PAYMENT_SERVICE_KEY, "paymentService")
         .build();
 
@@ -354,17 +356,17 @@ pluginHandle.requireActive();
 ```
 
 > **发生了什么？**
-> 1. Knotra 自动为该插件创建独立的 `AnnotationConfigApplicationContext`；
-> 2. 将外部借入的 `UserRepository` 注册为 Spring 单例；
-> 3. 调用 `context.refresh()` 启动容器；
-> 4. 获取名为 `paymentService` 的 Bean 并发布到 Knotra 运行时中；
-> 5. 当外部 `USER_REPOSITORY_KEY` 发生热替换时，Knotra 会**自动优雅关闭当前 Spring 容器，并重新创建一个新的 Spring 容器**！
+> - Knotra 自动为该插件创建独立的 `AnnotationConfigApplicationContext`；
+> - 将外部借入的 `UserRepository` 注册为 Spring 单例；
+> - 调用 `context.refresh()` 启动容器；
+> - 获取名为 `paymentService` 的 Bean 并发布到 Knotra 运行时中；
+> - 当外部 `USER_REPOSITORY_KEY` 发生热替换时，Knotra 会**自动优雅关闭当前 Spring 容器，并重新创建一个新的 Spring 容器**！
 
 ---
 
-## 6. 模式四：Spring 宿主动态桥（`SpringDynamicBridge`）
+## Spring 宿主动态桥（`SpringDynamicBridge`）
 
-### 6.1 场景：在宿主 Spring Boot 单例中无感知调用动态插件
+### 在宿主单例中无感知调用动态插件
 
 在典型的 Spring Boot 宿主应用中，您的 Controller 或 Service 是单例的，无法随意重启。但它又需要调用某个可能会动态热更新的插件接口。
 
@@ -410,14 +412,14 @@ public class OrderController {
 
 ---
 
-## 7. 常见场景选型决策指南
+## 常见场景选型决策指南
 
 ```mermaid
 graph TD
     start_decision["我该使用哪种装配方式？"] --> q_spring{"是否必须使用 Spring 容器？"}
 
     q_spring -->|"否 (普通 Java 类)"| q_args{"构造器参数数量？"}
-    q_args -->|"0 ~ 5 个"| res_pojo["knotra-beans DSL<br/>(Beans.component)"]
+    q_args -->|"较少 (0~5个)"| res_pojo["knotra-beans DSL<br/>(Beans.component)"]
     q_args -->|"较多 / 偏好注解"| res_proc["knotra-beans-processor<br/>(@KnotraBean)"]
 
     q_spring -->|"是 (已有 Spring 代码)"| q_role{"组件在架构中的角色？"}
@@ -427,19 +429,19 @@ graph TD
 
 ---
 
-## 8. 避坑与核心原则
+## 避坑与核心原则
 
-1. **不要在 Spring 子容器中重复扫描宿主的 Bean**：
-   - Spring 子容器应该保持精简，只包含插件自身的 `@Configuration`。外部依赖一律通过 `.required("name", KEY)` 显式借入。
-2. **外部借入对象的所有权（External Singleton）**：
-   - 从宿主借入的依赖对象不归 Spring 子容器所有。Spring 子容器销毁时，**不会**调用这些借入对象的 `@PreDestroy` 或 `close()`。
-3. **多方法事务请使用显式 `withCurrent`**：
-   - 动态代理（Proxy）的方法调用是**单方法独立路由**的。如果您需要连续执行多步操作（例如 `begin() -> charge() -> commit()`）且必须落在同一个插件实例上，请使用：
-   ```java
-   bridge.withCurrent(gateway -> {
-       gateway.begin();
-       gateway.charge(order);
-       gateway.commit();
-       return null;
-   });
-   ```
+- **不要在 Spring 子容器中重复扫描宿主的 Bean**：
+  - Spring 子容器应该保持精简，只包含插件自身的 `@Configuration`。外部依赖一律通过 `.required("name", KEY)` 显式借入。
+- **外部借入对象的所有权（External Singleton）**：
+  - 从宿主借入的依赖对象不归 Spring 子容器所有。Spring 子容器销毁时，**不会**调用这些借入对象的 `@PreDestroy` 或 `close()`。
+- **多方法事务请使用显式 `withCurrent`**：
+  - 动态代理（Proxy）的方法调用是**单方法独立路由**的。如果您需要连续执行多步操作（例如 `begin() -> charge() -> commit()`）且必须落在同一个插件实例上，请使用：
+  ```java
+  bridge.withCurrent(gateway -> {
+      gateway.begin();
+      gateway.charge(order);
+      gateway.commit();
+      return null;
+  });
+  ```

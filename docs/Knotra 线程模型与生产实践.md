@@ -4,15 +4,15 @@
 
 ---
 
-## 1. 线程模型全景图（谁在什么线程执行？）
+## 线程模型全景图
 
 Knotra 基于 Java 21+ 虚拟线程与轻量守护线程构建，**没有笨重的全局线程池，也没有常驻的定时轮询线程**。
 
 ```mermaid
 graph TD
     subgraph caller_threads ["宿主调用方线程"]
-        HT["宿主业务线程"] -->|"1. 执行事务准备 (transact)"| TR["校验与发布结构意图"]
-        HT -->|"2. 发起动态调用 (Dynamic Proxy / call)"| DP["直接穿透执行 Provider 方法"]
+        HT["宿主业务线程"] -->|"执行事务准备 (transact)"| TR["校验与发布结构意图"]
+        HT -->|"发起动态调用 (Dynamic Proxy / call)"| DP["直接穿透执行 Provider 方法"]
     end
 
     subgraph knotra_executors ["Knotra 后台执行器"]
@@ -23,7 +23,7 @@ graph TD
     end
 ```
 
-### 各层执行器与并发规则速查表：
+### 各层执行器与并发规则速查表
 
 | 模块 / 场景 | 执行线程 | 命名规则 | 串行 / 并发特性 |
 |---|---|---|---|
@@ -36,20 +36,20 @@ graph TD
 
 ---
 
-## 2. 组件 `start()` 与生命周期清理规则
+## 组件初始化与生命周期清理规则
 
-1. **`start()` 运行在虚拟线程上**：
-   - 慢操作（如初始化数据库连接池、拉取远程配置）可以安全地在 `start()` 中执行，**绝不会阻塞 Knotra 内部协调器锁**，也不会卡住宿主事务。
-2. **虚拟线程友好性（Pinning 防范）**：
-   - 避免在 `start()` 中长时间持有原生的 `synchronized` 同步块；对于耗时锁，优先使用 `java.util.concurrent.locks.ReentrantLock`。
-3. **不可将 `ActivationContext` 逃逸保存**：
-   - `ActivationContext` 仅在 `start()` 执行期间有效。`start()` 返回后，若继续调用其 `require()` 或 `provide()` 会直接抛错。
-4. **组件外壳必须无状态**：
-   - `ComponentFactory.create()` 创建的组件外壳跨多次 Activation 复用。**严禁在外壳的成员变量中缓存业务对象、数据库连接或依赖引用**。业务对象必须每次在 `start()` 中新建。
+- **`start()` 运行在虚拟线程上**：
+  - 慢操作（如初始化数据库连接池、拉取远程配置）可以安全地在 `start()` 中执行，**绝不会阻塞 Knotra 内部协调器锁**，也不会卡住宿主事务。
+- **虚拟线程友好性（Pinning 防范）**：
+  - 避免在 `start()` 中长时间持有原生的 `synchronized` 同步块；对于耗时锁，优先使用 `java.util.concurrent.locks.ReentrantLock`。
+- **不可将 `ActivationContext` 逃逸保存**：
+  - `ActivationContext` 仅在 `start()` 执行期间有效。`start()` 返回后，若继续调用其 `require()` 或 `provide()` 会直接抛错。
+- **组件外壳必须无状态**：
+  - `ComponentFactory.create()` 创建的组件外壳跨多次 Activation 复用。**严禁在外壳的成员变量中缓存业务对象、数据库连接或依赖引用**。业务对象必须每次在 `start()` 中新建。
 
 ---
 
-## 3. 类加载器上下文（TCCL）自动切换
+## 类加载器上下文（TCCL）自动切换
 
 在 Java 中，许多框架（如 SPI `ServiceLoader`、Jackson、Log4j、Spring XML 等）重度依赖 `Thread.currentThread().getContextClassLoader()`。
 
@@ -77,24 +77,24 @@ sequenceDiagram
 
 ---
 
-## 4. 生产环境优雅停机指南
+## 生产环境优雅停机指南
 
-在应用准备停机（如接收到 `SIGTERM` 或应用上下文关闭）时，请遵循以下标准的异步等待模式：
+在应用准备停机（如接收到 `SIGTERM` 或应用上下文关闭）时，建议遵循以下标准的异步等待模式：
 
 ```java
 public void shutdownGracefully() {
     try {
-        // 1. 关闭 Loader（停止接收新的期望配置）
+        // 关闭 Loader（停止接收新的期望配置）
         if (loader != null) {
             loader.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
         }
 
-        // 2. 关闭 PF4J 插件适配器（排空在途请求并卸载插件）
+        // 关闭 PF4J 插件适配器（排空在途请求并卸载插件）
         if (plugins != null) {
             plugins.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
         }
 
-        // 3. 关闭 Knotra Runtime（清理核心 Context 与所有残留组件）
+        // 关闭 Knotra Runtime（清理核心 Context 与所有残留组件）
         if (runtime != null) {
             runtime.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
         }
@@ -109,7 +109,7 @@ public void shutdownGracefully() {
 
 ---
 
-## 5. 生产环境可观测性与监控指标接入
+## 生产环境可观测性与监控指标接入
 
 Knotra 的 `RuntimeSnapshot` 是完全无副作用的纯数据结构（DTO），可安全用于 Prometheus / Micrometer 指标采集：
 
@@ -118,7 +118,7 @@ Knotra 的 `RuntimeSnapshot` 是完全无副作用的纯数据结构（DTO），
 public void collectMetrics(MeterRegistry registry) {
     RuntimeSnapshot snapshot = runtime.snapshot();
 
-    // 1. 统计各状态组件数量
+    // 统计各状态组件数量
     long activeCount = snapshot.components().stream()
             .filter(c -> c.state() == ComponentState.ACTIVE).count();
     long waitingCount = snapshot.components().stream()
@@ -130,7 +130,7 @@ public void collectMetrics(MeterRegistry registry) {
     Gauge.builder("knotra.components.waiting", () -> waitingCount).register(registry);
     Gauge.builder("knotra.components.failed", () -> failedCount).register(registry);
 
-    // 2. 统计诊断告警数
+    // 统计诊断告警数
     Gauge.builder("knotra.diagnostics.count", () -> snapshot.diagnostics().size())
             .register(registry);
 }

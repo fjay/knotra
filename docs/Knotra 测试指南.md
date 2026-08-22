@@ -4,14 +4,14 @@
 
 ---
 
-## 1. Knotra 测试三大铁律
+## Knotra 测试核心原则
 
-1. **断言状态与代际，绝不断言调度时机**：
-   - 优先检查 `handle.state() == ACTIVE`、`handle.requireActive()`、`DiagnosticCode`、`generation`；绝不要用 `Thread.sleep(100)` 来猜组件什么时候启动完成。
-2. **使用有界等待（Await）**：
-   - 等待异步收敛时，使用 `whenSettled().toCompletableFuture().get(5, TimeUnit.SECONDS)`。
-3. **每个测试用例必须关闭 Runtime**：
-   - 在 `@AfterEach` 中调用 `runtime.close()`，确保测试之间彻底隔离，不泄漏虚拟线程与资源。
+- **断言状态与代际，绝不断言调度时机**：
+  - 优先检查 `handle.state() == ACTIVE`、`handle.requireActive()`、`DiagnosticCode`、`generation`；绝不要用 `Thread.sleep(100)` 来猜组件什么时候启动完成。
+- **使用有界等待（Await）**：
+  - 等待异步收敛时，使用 `whenSettled().toCompletableFuture().get(5, TimeUnit.SECONDS)`。
+- **每个测试用例必须关闭 Runtime**：
+  - 在 `@AfterEach` 中调用 `runtime.close()`，确保测试之间彻底隔离，不泄漏虚拟线程与资源。
 
 ```bash
 # 运行全部测试
@@ -23,7 +23,7 @@ mvn clean verify
 
 ---
 
-## 2. 模式一：普通 POJO 组件单元测试
+## 普通 POJO 组件单元测试
 
 测试核心逻辑：验证当底层 Provider 被 `replace()` 时，上层消费方是否自动以新依赖重新激活。
 
@@ -53,10 +53,10 @@ class GreeterComponentTest {
 
     @Test
     void providerReplacementRecreatesConsumer() {
-        // 1. 发布初始依赖 V1
+        // 发布初始依赖 V1
         Provided<String> prefix = runtime.provide(PREFIX, "Hello");
 
-        // 2. 装配并挂载消费方组件
+        // 装配并挂载消费方组件
         CopyOnWriteArrayList<Greeter> instances = new CopyOnWriteArrayList<>();
         BeanDefinition<NoConfig, Greeter> definition = Beans.component("greeter")
                 .with(Beans.required(PREFIX))
@@ -75,7 +75,7 @@ class GreeterComponentTest {
         assertEquals(1, instances.size());
         assertEquals("Hello Alice", instances.get(0).greet("Alice"));
 
-        // 3. 热替换依赖为 V2
+        // 热替换依赖为 V2
         Provided<String> nextPrefix = prefix.replace("Bonjour");
         nextPrefix.whenSettled().toCompletableFuture().join();
         handle.requireActive();
@@ -95,7 +95,7 @@ class GreeterComponentTest {
 
 ---
 
-## 3. 模式二：故障恢复与清理重试测试
+## 故障恢复与清理重试测试
 
 Knotra 的一大特色是：**清理失败不吞没，保留现场并支持幂等重试**。以下演示如何测试清理失败场景：
 
@@ -115,7 +115,7 @@ void cleanupFailureRetainsDiagnosticsAndRecoversOnRetry() {
     ComponentHandle<NoConfig> handle = Beans.mount(runtime, def);
     handle.requireActive();
 
-    // 1. 尝试销毁组件，由于 shouldFail=true，清理会失败并进入 FAILED 状态
+    // 尝试销毁组件，由于 shouldFail=true，清理会失败并进入 FAILED 状态
     handle.disposeAsync().toCompletableFuture().join();
     assertEquals(ComponentState.FAILED, handle.state());
 
@@ -124,7 +124,7 @@ void cleanupFailureRetainsDiagnosticsAndRecoversOnRetry() {
     assertTrue(snapshot.diagnostics().stream()
             .anyMatch(d -> d.code() == DiagnosticCode.CLEANUP_FAILED));
 
-    // 2. 修复故障并触发重试
+    // 修复故障并触发重试
     shouldFail.set(false);
     handle.retryAsync().toCompletableFuture().join();
 
@@ -135,7 +135,7 @@ void cleanupFailureRetainsDiagnosticsAndRecoversOnRetry() {
 
 ---
 
-## 4. 模式三：ClassLoader 卸载与 GC 回收验证测试
+## ClassLoader 卸载与 GC 回收验证测试
 
 为了确保动态加载的插件 JAR 在卸载后不会造成 Metaspace 内存泄漏，可以编写如下的 GC 断言测试：
 
@@ -145,7 +145,7 @@ void pluginClassLoaderIsGarbageCollectedAfterUnload() throws Exception {
     Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
             pluginsDir, runtime, Set.of("com.example.contract"));
 
-    // 1. 加载插件
+    // 加载插件
     ArtifactSnapshot artifact = adapter.loadArtifact(pluginJarPath);
     ClassLoader pluginClassLoader = getPluginClassLoader(adapter, artifact.artifactId());
 
@@ -153,11 +153,11 @@ void pluginClassLoaderIsGarbageCollectedAfterUnload() throws Exception {
     WeakReference<ClassLoader> weakRef = new WeakReference<>(pluginClassLoader);
     pluginClassLoader = null; // 释放强引用
 
-    // 2. 卸载插件 (排空并清理)
+    // 卸载插件 (排空并清理)
     adapter.unloadArtifact(artifact.artifactId());
     adapter.close();
 
-    // 3. 循环触发 System.gc() 并断言弱引用被回收
+    // 循环触发 System.gc() 并断言弱引用被回收
     boolean collected = false;
     for (int i = 0; i < 50; i++) {
         System.gc();
