@@ -8,7 +8,7 @@ import io.knotra.TransactionReceipt;
 
 import java.time.Duration;
 
-/** Canonical Advanced API transaction example; the API guide links here. */
+/** 权威 Advanced API 事务示例；API 指南文档链接至此。 */
 public final class TransactionExample {
 
     public record Result(long generation, boolean published, boolean revoked) {

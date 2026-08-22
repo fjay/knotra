@@ -8,8 +8,7 @@ import io.knotra.ContextHandle;
 import io.knotra.NoConfig;
 
 /**
- * Internal active factory view. Mounting is split into the two leaf classes so the public type
- * never presents a no-config mount as a configured mount.
+ * 内部活跃工厂视图。挂载拆分为两个叶子类，确保公开类型绝不将无配置挂载表现为有配置挂载。
  */
 abstract class ManagedFactory implements ArtifactFactoryHandle {
 

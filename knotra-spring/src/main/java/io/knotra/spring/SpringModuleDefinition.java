@@ -10,7 +10,7 @@ import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 
-/** Frozen Spring module definition with a stable component and factory identity. */
+/** 具有稳定组件与工厂身份标识的冻结 Spring 模块定义。 */
 public final class SpringModuleDefinition<C> implements ComponentFactory<C> {
 
     private final String componentId;

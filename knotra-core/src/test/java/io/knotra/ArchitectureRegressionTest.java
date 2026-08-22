@@ -31,7 +31,7 @@ final class ArchitectureRegressionTest {
         try {
             runtime.close();
         } catch (Exception ignored) {
-            // tests with intentionally failed cleanup retry through handles
+            // 故意包含清理失败的测试通过句柄进行重试
         }
     }
 

@@ -49,9 +49,8 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Generates an immutable {@link io.knotra.beans.BeanDefinition} factory for each
- * {@link KnotraBean}-annotated top-level class. Constructor dependency count follows the
- * declared constructor and is not limited by the hand-written Beans DSL arity.
+ * 为每个带有 {@link KnotraBean} 注解的顶级类生成不可变的 {@link io.knotra.beans.BeanDefinition} 工厂。
+ * 构造函数依赖项数量遵循声明的构造函数，不受手写 Beans DSL 参数数量上限的限制。
  */
 @SupportedAnnotationTypes("io.knotra.beans.annotation.KnotraBean")
 @SupportedSourceVersion(SourceVersion.RELEASE_21)

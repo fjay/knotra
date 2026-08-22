@@ -485,7 +485,7 @@ final class EventBusTest {
 
     @Test
     void capabilityRegistrationIsOwnedByActivation() throws Exception {
-        // The setup mount is already active and owns the single capability registration.
+        // setup 挂载已处于活跃状态并拥有单一能力注册。
 
         RuntimeSnapshot snapshot = runtime.advanced().snapshot();
         List<RuntimeSnapshot.RegistrationSnapshot> registrations = snapshot.registrations()

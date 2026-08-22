@@ -16,7 +16,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-/** Stable publication slot implementation. Structural operations are linearized per slot. */
+/** 稳定发布槽位实现。每个槽位的结构化操作均线性化执行。 */
 final class PublicationImpl<T> implements Publication<T> {
     private final DefaultKnotraRuntime runtime;
     private final CapabilityKey<T> key;

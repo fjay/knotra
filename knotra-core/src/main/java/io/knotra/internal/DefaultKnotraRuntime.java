@@ -148,8 +148,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     /**
-     * Build a stable report after propagation converged. A failed affected mount does not
-     * make the settlement future exceptional; callers inspect the outcomes instead.
+     * 在传播收敛后构建不可变的结算报告。受影响挂载的失败不会使结算 future 异常完成；
+     * 调用方应检查报告中的挂载结果。
      */
     private SettlementReport settlementReport(
             long generation,
@@ -1846,7 +1846,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     try {
                         emergencyRollbackActivation(runtime, activation);
                     } catch (Throwable ignored) {
-                        // The transition future below is still completed exceptionally.
+                        // 下方的过渡 future 仍会以异常状态完成。
                     }
                     postCommit = new PostCommitPlan(
                             List.of(),
@@ -2757,9 +2757,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     /**
-     * Operation-scoped transition aggregation. A parent mount becomes ACTIVE before its owned
-     * children are scheduled; the transaction/publication settlement follows the ownership closure
-     * without making children wait on the parent transition itself.
+     * 操作范围的过渡聚合。父挂载在其拥有的子组件被调度前进入 ACTIVE 状态；
+     * 事务/发布结算遵循所有权闭包，而无需让子组件等待父挂载自身的过渡。
      */
     private final class OperationSettlement {
         private final Set<String> affectedMounts =

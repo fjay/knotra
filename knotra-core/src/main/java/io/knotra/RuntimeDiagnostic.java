@@ -2,7 +2,7 @@ package io.knotra;
 
 import java.util.Objects;
 
-/** Structured runtime diagnostic with stable text and optional bounded failure detail. */
+/** 包含稳定文本和可选有界失败详情的结构化运行时诊断。 */
 public record RuntimeDiagnostic(
         DiagnosticCode code,
         String targetId,

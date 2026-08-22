@@ -517,7 +517,7 @@ final class EventBusQuiescenceTest {
         EventSubscription subscription = bus.subscribe(definition, listener);
 
         bus.dispatch(definition, eventType.cast(newInstance(eventType)));
-        // Close must be responsible for this still-active canonical binding.
+        // Close 必须负责处理此仍处于活跃状态的规范绑定。
         bus.close();
 
         WeakReference<EventBus> busReference = new WeakReference<>(bus);

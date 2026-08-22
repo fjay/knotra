@@ -3,7 +3,7 @@ package io.knotra.internal;
 import io.knotra.CapabilityKey;
 import io.knotra.ContextHandle;
 
-/** Typed pre-commit token returned inside a host transaction. */
+/** 宿主事务内部返回的预提交类型化 Token。 */
 final class StagedRegistrationImpl<T> implements io.knotra.StagedRegistration<T> {
     private final RegistrationHandleImpl registration;
     private final CapabilityKey<T> key;

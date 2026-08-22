@@ -2,7 +2,7 @@ package io.knotra;
 
 import java.util.Objects;
 
-/** Runtime static configuration. */
+/** 运行时静态配置。 */
 public record KnotraConfig(
         String runtimeId,
         int maxReconcileIterations,
@@ -33,7 +33,7 @@ public record KnotraConfig(
                 FailureDetailPolicy.defaults());
     }
 
-    /** Bounded policy for failure details retained by runtime diagnostics. */
+    /** 运行时诊断所保留失败详情的有界策略。 */
     public record FailureDetailPolicy(
             int maxCauses,
             int maxFrames,

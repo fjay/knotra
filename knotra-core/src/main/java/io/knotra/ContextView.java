@@ -2,7 +2,7 @@ package io.knotra;
 
 import java.util.Optional;
 
-/** Read-only capability view for one Context. */
+/** 单个 Context 的只读能力视图。 */
 public interface ContextView {
     String contextId();
 

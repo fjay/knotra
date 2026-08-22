@@ -64,7 +64,7 @@ public final class MountNotActiveException extends RuntimeException {
         return contextId;
     }
 
-    /** Null means unbounded; non-null means this bounded wait timed out. */
+    /** null 表示无界等待；非 null 表示本次有界等待发生超时。 */
     public Duration timeout() {
         return timeout;
     }

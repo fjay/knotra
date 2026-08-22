@@ -12,7 +12,7 @@ import io.knotra.TransactionRejectedException;
 import java.util.List;
 import java.util.Objects;
 
-/** Typed host registration for one committed generation. */
+/** 单个已提交代际的类型化宿主注册。 */
 final class RegistrationImpl<T> implements Registration<T> {
     private final RegistrationHandleImpl registration;
     private final CapabilityKey<T> key;

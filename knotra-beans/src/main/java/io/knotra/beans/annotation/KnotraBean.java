@@ -8,7 +8,7 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Marks a top-level POJO as an Activation-owned Knotra bean.
+ * 将顶级 POJO 标记为 Activation 托管的 Knotra Bean。
  */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.TYPE)

@@ -5,7 +5,7 @@ import io.knotra.ConfiguredMountHandle;
 import java.time.Duration;
 import java.util.concurrent.CompletionStage;
 
-/** Runtime handle for a mount whose configuration type is public. */
+/** 配置类型为公开类型的挂载运行时句柄。 */
 final class ConfiguredMountHandleImpl<C> extends MountHandleImpl
         implements ConfiguredMountHandle<C> {
     ConfiguredMountHandleImpl(DefaultKnotraRuntime runtime, String id, Identity identity) {

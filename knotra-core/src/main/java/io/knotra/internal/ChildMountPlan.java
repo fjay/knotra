@@ -1,11 +1,10 @@
 package io.knotra.internal;
 
 /**
- * A child mount staged by component start code.
+ * 组件启动代码暂存的子挂载计划。
  *
- * <p>The plan is created by {@link ActivationContextImpl}. The parent activation publishes it only
- * after successful commit; a failed activation discards both the provisional handle and prepared
- * component.</p>
+ * <p>该计划由 {@link ActivationContextImpl} 创建。父激活仅在成功提交后发布它；
+ * 失败的激活会同时丢弃临时句柄与已准备好的组件。</p>
  */
 final class ChildMountPlan {
     private final MountHandleImpl handle;

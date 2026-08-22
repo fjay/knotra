@@ -274,7 +274,7 @@ final class RegistrationPublicationTest {
                                 .awaitSettled(Duration.ofSeconds(10));
                         changes++;
                     } catch (java.util.concurrent.ExecutionException ignored) {
-                        // Publication-level races are expected to be rejected.
+                        // Publication 级别的并发竞争按预期被拒绝。
                     }
                 }
                 assertEquals(lanes, changes);

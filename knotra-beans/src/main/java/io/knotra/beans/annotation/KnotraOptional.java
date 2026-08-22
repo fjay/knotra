@@ -5,7 +5,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
-/** Declares an optional pinned dependency inferred from an exact Optional<T> parameter. */
+/** 声明从精确的 Optional<T> 参数推导的可选固定依赖。 */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.PARAMETER)
 public @interface KnotraOptional {

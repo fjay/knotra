@@ -364,7 +364,7 @@ final class KnotraBeanProcessorTest {
         return List.of(new CompilerKit.Source("demo.ConfiguredBean", source));
     }
 
-    /** The processor follows every constructor parameter, so it has no hand-written DSL arity limit. */
+    /** 注解处理器遵循构造函数的每一个参数，因此没有手写 DSL 参数数量上限的限制。 */
     private static List<CompilerKit.Source> sixDependencySources() {
         String source = """
                 package demo;

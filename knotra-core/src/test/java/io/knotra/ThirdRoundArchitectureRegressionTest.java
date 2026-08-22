@@ -26,7 +26,7 @@ final class ThirdRoundArchitectureRegressionTest {
         try {
             runtime.close();
         } catch (Exception ignored) {
-            // Failed cleanup tests intentionally leave a retryable terminal state.
+            // 清理失败测试有意保留可重试的终态。
         }
     }
 

@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-/** Immutable default Settlement implementation shared by kernel changes. */
+/** 内核结构变更共享的不可变默认 Settlement 实现。 */
 final class DefaultSettlement implements Settlement {
     private final long generation;
     private final CompletionStage<SettlementReport> settlement;

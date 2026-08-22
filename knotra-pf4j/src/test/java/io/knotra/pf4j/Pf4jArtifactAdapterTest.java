@@ -449,7 +449,7 @@ final class Pf4jArtifactAdapterTest {
                     try {
                         accepted = mount.toCompletableFuture().join();
                     } catch (CompletionException expected) {
-                        // Rejection is allowed; ownership is retained either way.
+                        // 允许拒绝；无论如何均保留所有权。
                     }
                     assertFalse(adapter.ownership(ARTIFACT_ID).isEmpty());
                     assertThrows(CompletionException.class, unload::join);
@@ -962,7 +962,7 @@ final class Pf4jArtifactAdapterTest {
         }
         try (OutputStream output = Files.newOutputStream(path);
              JarOutputStream jar = new JarOutputStream(output, manifest)) {
-            // Manifest-only fixtures are sufficient for repository resolution failures.
+            // 仅包含 Manifest 的 fixture 足以用于测试仓库解析失败。
         }
     }
 }

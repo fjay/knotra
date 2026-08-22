@@ -51,7 +51,7 @@ final class FailureInfoTest {
             try {
                 handle.requireActive(java.time.Duration.ofSeconds(5));
             } catch (MountNotActiveException expected) {
-                // The detail is asserted from the stable snapshot below.
+                // 在下方从稳定快照中断言失败详情。
             }
             RuntimeDiagnostic diagnostic = runtime.advanced().snapshot().diagnostics().stream()
                     .filter(item -> item.code() == DiagnosticCode.ACTIVATION_FAILED
@@ -90,7 +90,7 @@ final class FailureInfoTest {
             try {
                 runtime.close();
             } catch (RuntimeException expected) {
-                // A failed root cleanup may already have completed close exceptionally.
+                // 失败的根清理可能已经导致 close 异常完成。
             }
         }
     }
@@ -156,7 +156,7 @@ final class FailureInfoTest {
             try {
                 runtime.close();
             } catch (RuntimeException expected) {
-                // Failed root cleanup is reported by the assertions above.
+                // 上方断言已报告失败的根清理。
             }
         }
     }

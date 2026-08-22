@@ -17,7 +17,7 @@ import java.util.function.Consumer;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
-/** Stateless Component shell; every Activation owns a completely new Spring context. */
+/** 无状态组件外壳；每次 Activation 均拥有一个全新的 Spring 上下文。 */
 final class SpringModuleComponent<C> implements Component<C> {
 
     private final SpringModuleDefinition<C> definition;
@@ -41,7 +41,7 @@ final class SpringModuleComponent<C> implements Component<C> {
     public void start(ActivationContext context, C config) throws Exception {
         ClassLoader loader = effectiveClassLoader();
         AnnotationConfigApplicationContext spring = new AnnotationConfigApplicationContext();
-        // No bean, customizer, or refresh operation may run before cleanup is reversible.
+        // 在清理可逆前，不允许运行任何 Bean、自定义器或刷新操作。
         registerCleanup(context, spring, loader);
         spring.setClassLoader(loader);
         ClassLoader previousLoader = Thread.currentThread().getContextClassLoader();
@@ -94,7 +94,7 @@ final class SpringModuleComponent<C> implements Component<C> {
         }
         DefaultListableBeanFactory beanFactory =
                 (DefaultListableBeanFactory) spring.getBeanFactory();
-        // Registered singletons do not receive Spring initialization or destruction callbacks.
+        // 外部注册的单例不接收 Spring 初始化或销毁回调。
         beanFactory.registerSingleton(beanName, value);
     }
     private void registerDependency(
@@ -226,7 +226,7 @@ final class SpringModuleComponent<C> implements Component<C> {
             if (spring.isActive()) {
                 spring.close();
             } else {
-                // refresh() never completed; Spring-created early singletons still need cleanup.
+                // refresh() 未完成；Spring 创建的早期单例仍需要清理。
                 ((DefaultListableBeanFactory) spring.getBeanFactory()).destroySingletons();
             }
             return CompletableFuture.completedFuture(null);

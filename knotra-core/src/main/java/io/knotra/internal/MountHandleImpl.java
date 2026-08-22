@@ -7,11 +7,11 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletionStage;
 
-/** Shared runtime state for one stable mount identity. */
+/** 单个稳定挂载身份标识的共享运行时状态。 */
 abstract class MountHandleImpl implements MountHandle {
     final DefaultKnotraRuntime runtime;
     final String id;
-    // Mount identity is fixed at creation and survives removal from the active view.
+    // 挂载身份标识在创建时确定，从活跃视图中移除后依然保留。
     private final Identity identity;
 
     MountHandleImpl(DefaultKnotraRuntime runtime, String id, Identity identity) {
@@ -105,7 +105,7 @@ abstract class MountHandleImpl implements MountHandle {
         return "MountHandle[" + id + "]";
     }
 
-    /** Stable logical identity containing strings only; no Class, ClassLoader, or component value. */
+    /** 仅包含字符串的稳定逻辑身份标识；不持有 Class、ClassLoader 或组件实例。 */
     record Identity(
             String mountId,
             String componentId,

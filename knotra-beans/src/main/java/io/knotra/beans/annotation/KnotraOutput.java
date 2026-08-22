@@ -7,7 +7,7 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Declares one Capability output produced by the annotated bean instance.
+ * 声明被注解的 Bean 实例所生产的单个 Capability 输出能力。
  */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.TYPE)

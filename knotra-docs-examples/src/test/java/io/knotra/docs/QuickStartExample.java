@@ -12,7 +12,7 @@ import io.knotra.beans.Beans;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Canonical Simple API example; README snippets mirror this source. */
+/** 权威 Simple API 示例；README 中的代码片段均以此代码为真源。 */
 public final class QuickStartExample {
 
     public record Result(
@@ -60,9 +60,8 @@ public final class QuickStartExample {
         Duration timeout = Duration.ofSeconds(10);
         AtomicInteger rendererInstances = new AtomicInteger();
 
-        // try-with-resources keeps the canonical sample short; its close() blocks without a
-        // timeout. Production shutdown should await closeAsync() with a bounded get(timeout);
-        // see docs/Knotra 线程模型与生产实践.md.
+        // try-with-resources 用于保持示例精简；其 close() 会无界阻塞等待停机。
+        // 生产环境应调用 closeAsync() 并使用有界 get(timeout) 等待，详见 docs/Knotra 线程模型与生产实践.md。
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
             PublicationChange<Greeting> firstChange =
                     runtime.publish(Greeting.class, new ConstantGreeting("v1"));

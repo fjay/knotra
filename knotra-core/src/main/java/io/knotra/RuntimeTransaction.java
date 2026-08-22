@@ -1,6 +1,6 @@
 package io.knotra;
 
-/** Host structural transaction intent recorder, valid only inside a transact callback. */
+/** 宿主结构化事务意图记录器，仅在 transact 回调内部有效。 */
 public interface RuntimeTransaction {
     <T> StagedRegistration<T> provide(
             ContextHandle context,

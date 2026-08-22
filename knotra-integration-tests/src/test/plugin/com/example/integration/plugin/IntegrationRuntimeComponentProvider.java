@@ -21,9 +21,8 @@ import io.knotra.pf4j.spi.RuntimeComponentProvider;
 import org.pf4j.Extension;
 
 /**
- * Real PF4J fixture used only by the cross-module integration suite. It consumes host
- * capabilities (the Knotra event bus) and coordinates with the host exclusively through
- * the shared {@code com.example.integration.contract} package.
+ * 仅供跨模块集成测试套件使用的真实 PF4J 插件 fixture。它消费宿主能力（Knotra 事件总线），
+ * 并专门通过共享的 {@code com.example.integration.contract} 包与宿主协同。
  */
 @Extension
 public final class IntegrationRuntimeComponentProvider implements RuntimeComponentProvider {

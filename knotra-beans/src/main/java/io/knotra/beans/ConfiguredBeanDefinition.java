@@ -11,7 +11,7 @@ import io.knotra.MountOptions;
 import java.util.List;
 import java.util.Objects;
 
-/** Immutable, reusable definition of a configured Activation-owned bean. */
+/** 带类型化配置的 Activation 托管 Bean 的不可变可复用定义。 */
 public final class ConfiguredBeanDefinition<C, T> {
 
     private final BeanDefinitionSupport<C, T> support;

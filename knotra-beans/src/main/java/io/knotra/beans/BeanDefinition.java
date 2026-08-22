@@ -11,7 +11,7 @@ import io.knotra.MountOptions;
 import java.util.List;
 import java.util.Objects;
 
-/** Immutable, reusable definition of an Activation-owned bean without runtime configuration. */
+/** 无运行时配置的 Activation 托管 Bean 的不可变可复用定义。 */
 public final class BeanDefinition<T> {
 
     private final NoConfigBeanDefinitionSupport<T> support;

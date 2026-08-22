@@ -1,8 +1,7 @@
 package com.example.integration.plugin;
 
 /**
- * Plugin-private event type. It exists only inside the artifact; the host can only load
- * an independent copy through a separate class loader, never this exact class.
+ * 插件私有事件类型。它仅存在于 artifact 内部；宿主只能通过独立类加载器加载副本，绝无法直接加载此类。
  */
 public record PluginEvent(String message) {
 }

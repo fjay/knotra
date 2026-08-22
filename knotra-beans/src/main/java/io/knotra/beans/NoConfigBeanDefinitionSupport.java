@@ -5,7 +5,7 @@ import io.knotra.NoConfig;
 
 import java.util.List;
 
-/** Internal no-configuration factory used by the runtime's plain mount facade. */
+/** 供运行时普通挂载门面使用的内部无配置工厂。 */
 final class NoConfigBeanDefinitionSupport<T>
         extends BeanDefinitionSupport<NoConfig, T>
         implements MountFactory {

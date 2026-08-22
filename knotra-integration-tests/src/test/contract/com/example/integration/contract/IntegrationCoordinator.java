@@ -9,8 +9,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Host/plugin coordination contract. The class is loaded from the host class loader by
- * both sides, so its static state is shared across the artifact boundary.
+ * 宿主与插件协同契约。此类由双方均从宿主类加载器加载，因此其静态状态可跨 artifact 边界共享。
  */
 public final class IntegrationCoordinator {
 

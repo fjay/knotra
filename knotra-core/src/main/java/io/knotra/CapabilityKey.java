@@ -27,7 +27,7 @@ public final record CapabilityKey<T>(String name, Class<T> type) implements Comp
         return new CapabilityKey<>(name, type);
     }
 
-    /** Uses the contract type's binary name as the capability name. */
+    /** 使用契约类型的二进制名称作为能力名称。 */
     public static <T> CapabilityKey<T> of(Class<T> type) {
         return new CapabilityKey<>(type.getName(), type);
     }

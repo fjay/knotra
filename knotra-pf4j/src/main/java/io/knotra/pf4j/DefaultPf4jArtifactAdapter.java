@@ -397,7 +397,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             synchronized (stateLock) {
                 requireMountableLocked(handle);
             }
-            // The core transaction is submitted without the adapter memory lock; core owns startup.
+            // 核心事务在不持有适配器内存锁的情况下提交；核心内核控制启动。
             try {
                 component = runtime.advanced().transact(commit::apply).value();
             } catch (TransactionRejectedException failure) {
@@ -408,7 +408,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         failure.diagnostics());
             }
             synchronized (stateLock) {
-                // A committed core handle is recorded before deciding whether a concurrent drain won.
+                // 在判断并发排空是否胜出前，先记录已提交的核心句柄。
                 handle.artifact.directHandles.put(component.handleId(), component);
                 if (handle.artifact.acceptingMounts
                         && handle.artifact.state == ArtifactState.ACTIVE) {
@@ -422,7 +422,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             }
         }
 
-        // A mount that committed during drain keeps ownership until compensation completes.
+        // 在排空期间提交的挂载在补偿完成前保持所有权。
         H rejected = component;
         rejected.disposeAsync().whenComplete((ignored, disposalFailure) ->
                 endMount(handle.artifact));
@@ -1201,7 +1201,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         (left, right) -> right,
                         LinkedHashMap::new));
         synchronized (stateLock) {
-            // Runtime snapshot is authoritative; stale local records for disposed mounts are removed.
+            // 运行时快照具有权威性；已释放挂载的过期本地记录会被移除。
             artifact.directHandles.keySet().removeIf(handleId ->
                     artifact.directHandles.get(handleId) != null
                             && artifact.directHandles.get(handleId).state() == ComponentState.DISPOSED

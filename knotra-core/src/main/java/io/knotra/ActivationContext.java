@@ -1,7 +1,7 @@
 package io.knotra;
 
 import java.util.Optional;
-/** One-time activation context handed to a component's start callback. */
+/** 传递给组件启动回调的一次性激活上下文（ActivationContext）。 */
 public interface ActivationContext {
     <T> T require(CapabilityKey<T> key);
 

@@ -73,7 +73,7 @@ final class GuardedActivationContext implements ActivationContext {
             ComponentFactory<C> factory,
             C config,
             MountOptions options) {
-        // Ignore caller origin; artifact provenance is inherited by every child mount.
+        // 忽略调用方来源；artifact 出处归属会被每个子挂载继承。
         ComponentFactory<C> guarded = GuardedComponentFactory.wrap(
                 factory,
                 policy,

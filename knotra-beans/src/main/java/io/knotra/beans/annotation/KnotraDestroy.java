@@ -5,7 +5,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
-/** Selects the bean disposer. Async methods must return CompletionStage<Void>. */
+/** 指定 Bean 销毁方法。异步方法必须返回 CompletionStage<Void>。 */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.METHOD)
 public @interface KnotraDestroy {

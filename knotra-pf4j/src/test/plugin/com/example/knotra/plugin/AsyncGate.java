@@ -6,8 +6,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import com.example.knotra.contract.ControlledGate;
 
 /**
- * Gated cleanup contract. The plugin-side disposer waits on {@link #released()};
- * any host call to {@link #release()} opens the gate and lets cleanup finish.
+ * 门禁清理契约。插件端释放器等待 {@link #released()}；
+ * 任何宿主对 {@link #release()} 的调用都会开启门禁并允许清理完成。
  */
 final class AsyncGate implements ControlledGate {
 

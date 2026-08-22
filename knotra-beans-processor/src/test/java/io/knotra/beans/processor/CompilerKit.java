@@ -23,7 +23,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** JavaCompiler-based annotation processor test kit. */
+/** 基于 JavaCompiler 的注解处理器测试工具包。 */
 final class CompilerKit {
 
     record Compilation(

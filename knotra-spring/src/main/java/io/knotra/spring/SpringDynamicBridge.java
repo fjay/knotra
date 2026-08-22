@@ -23,14 +23,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Host-side accessor for a dynamic Knotra capability and its method-lease proxy.
+ * 动态 Knotra 能力及其方法租约代理的宿主端访问器。
  *
- * <p>The bridge component subscribes to {@code sourceKey} and publishes the Core-created lease
- * proxy under {@code bridgeKey}. Replacing the source does not restart the bridge or its Spring
- * child consumers; an in-flight call keeps its provider lease until completion. Use
- * {@link #withCurrent(DynamicOperation)} or {@link #withCurrentAsync(AsyncDynamicOperation)} to
- * pin one provider for a callback, or {@link #proxy()} when each interface method may independently
- * select the current provider.
+ * <p>桥接组件订阅 {@code sourceKey}，并在 {@code bridgeKey} 下发布 Core 创建的租约代理。
+ * 替换数据源不会重启桥接器或其 Spring 子容器消费方；在途调用在完成前保持其提供方租约。
+ * 使用 {@link #withCurrent(DynamicOperation)} 或 {@link #withCurrentAsync(AsyncDynamicOperation)} 为回调固定单个提供方，
+ * 或在每个接口方法可独立选择当前提供方时使用 {@link #proxy()}。</p>
  */
 public final class SpringDynamicBridge<T> implements AutoCloseable {
 
@@ -129,27 +127,25 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
     }
 
     /**
-     * Returns the {@code T} proxy with method-level provider leases.
+     * 返回具备方法级提供方租约的 {@code T} 代理。
      *
-     * <p>Each interface method invocation selects and leases a provider independently. Do not
-     * use this object when multiple method calls must observe one provider; use
-     * {@link #withCurrent(DynamicOperation)} instead.
+     * <p>每次接口方法调用都会独立选择并租用提供方。当多个方法调用必须观察同一个提供方时，
+     * 请勿使用此对象；请改用 {@link #withCurrent(DynamicOperation)}。</p>
      */
     public T proxy() {
         rejectClosed();
         return proxy;
     }
 
-    /** Returns whether the current dynamic capability has a provider. */
+    /** 返回当前动态能力是否存在可用提供方。 */
     public boolean available() {
         return !closed.get() && capability.available();
     }
 
     /**
-     * Runs a callback against one provider for the duration of that callback.
+     * 在回调执行期间针对单个提供方运行回调。
      *
-     * <p>The provider is pinned before the callback starts and its lease is retained until the
-     * callback returns. This is the safe way to make multiple observations as one provider.
+     * <p>在回调开始前固定提供方，并保持其租约直至回调返回。这是针对同一提供方进行多次观察的安全方式。</p>
      */
     public <R> R withCurrent(
             DynamicOperation<? super T, ? extends R> callback) {
@@ -159,10 +155,9 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
     }
 
     /**
-     * Runs an asynchronous callback against one provider until its completion stage settles.
+     * 针对单个提供方运行异步回调，直至其 completion stage 结算。
      *
-     * <p>The provider lease and Knotra's async stage drain semantics remain in effect after this
-     * method returns.
+     * <p>在此方法返回后，提供方租约与 Knotra 的异步 stage 排空语义仍然生效。</p>
      */
     public <R> CompletionStage<R> withCurrentAsync(
             AsyncDynamicOperation<? super T, R> callback) {

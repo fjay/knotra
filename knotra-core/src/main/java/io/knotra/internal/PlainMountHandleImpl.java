@@ -1,6 +1,6 @@
 package io.knotra.internal;
 
-/** Runtime handle for a mount whose configuration type is not public. */
+/** 无公开配置类型的普通挂载运行时句柄。 */
 final class PlainMountHandleImpl extends MountHandleImpl {
     PlainMountHandleImpl(DefaultKnotraRuntime runtime, String id, Identity identity) {
         super(runtime, id, identity);

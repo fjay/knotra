@@ -43,7 +43,7 @@ final class ConcurrencySnapshotGcTest {
         try {
             runtime.close();
         } catch (Exception ignored) {
-            // tests with intentionally failed cleanup retry close here
+            // 故意包含清理失败的测试在此处重试关闭
         }
     }
 
@@ -257,7 +257,7 @@ final class ConcurrencySnapshotGcTest {
         try {
             failed.requireActive(java.time.Duration.ofSeconds(5));
         } catch (MountNotActiveException expected) {
-            // Snapshot stability is asserted below.
+            // 在下方断言快照的稳定性。
         }
         var handle = mount("snapshot", (context, config) -> {
             context.lifecycle().onClose("entry", () -> {});

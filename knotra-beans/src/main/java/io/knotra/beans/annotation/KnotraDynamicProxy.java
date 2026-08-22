@@ -5,7 +5,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
-/** Declares a dynamic proxy dependency backed by a method-level provider lease. */
+/** 声明由方法级提供方租约支持的动态代理依赖。 */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.PARAMETER)
 public @interface KnotraDynamicProxy {
