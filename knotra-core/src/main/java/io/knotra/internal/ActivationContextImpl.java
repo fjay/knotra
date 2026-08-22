@@ -127,7 +127,8 @@ final class ActivationContextImpl implements ActivationContext {
         if (runtime.mountIdReserved(activation.owner.contextId, mountId)) {
             throw new IllegalArgumentException("mountId is already in use: " + mountId);
         }
-        ComponentHandleImpl<C> handle = runtime.createProvisionalHandle();
+        ComponentHandleImpl<C> handle = runtime.createProvisionalHandle(
+                activation.owner.contextId, mountId, prepared);
         childPlans.add(new ChildMountPlan<>(handle, mountId, prepared));
         return handle;
     }

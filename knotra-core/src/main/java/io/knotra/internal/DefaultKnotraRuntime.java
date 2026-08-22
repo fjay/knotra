@@ -432,17 +432,6 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         return data == null ? ContextState.DISPOSED : data.state();
     }
 
-    String componentMountId(String handleId) {
-        RuntimeView.ComponentData data = view.components.get(handleId);
-        return data == null ? "" : data.mountId();
-    }
-
-    String componentField(
-            String handleId,
-            Function<RuntimeView.ComponentData, String> field) {
-        RuntimeView.ComponentData data = view.components.get(handleId);
-        return data == null ? "" : field.apply(data);
-    }
 
     ComponentState componentState(String handleId) {
         RuntimeView.ComponentData data = view.components.get(handleId);
@@ -478,47 +467,88 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         if (timeout != null && (timeout.isZero() || timeout.isNegative())) {
             throw new IllegalArgumentException("timeout must be positive");
         }
-        ComponentState settled;
+        ComponentState settled = null;
+        boolean interrupted = false;
+        boolean timedOut = false;
+        Throwable settlementError = null;
         try {
-            if (timeout == null) {
-                settled = handle.whenSettled().toCompletableFuture().get();
-            } else {
-                settled = handle.whenSettled().toCompletableFuture()
-                        .get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-            }
+            CompletableFuture<ComponentState> future =
+                    handle.whenSettled().toCompletableFuture();
+            settled = timeout == null
+                    ? future.get()
+                    : future.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
-            throw notActive(handle, timeout, error);
+            interrupted = true;
         } catch (TimeoutException error) {
-            throw notActive(handle, timeout, null);
+            timedOut = true;
         } catch (ExecutionException | CompletionException error) {
-            throw notActive(handle, timeout, error);
+            settlementError = error;
         }
-        if (settled == ComponentState.ACTIVE) {
+
+        boolean settledNormally = !interrupted && !timedOut && settlementError == null;
+        if (settledNormally && settled == ComponentState.ACTIVE) {
             return handle;
         }
-        throw notActive(handle, timeout, null);
-    }
-
-    private <C> ComponentNotActiveException notActive(
-            ComponentHandleImpl<C> handle,
-            Duration timeout,
-            Throwable cause) {
-        String handleId = handle.handleId();
-        List<RuntimeDiagnostic> diagnostics = view.diagnostics.stream()
-                .filter(diagnostic -> handleId.equals(diagnostic.targetId()))
-                .toList();
-        return new ComponentNotActiveException(
-                handle.state(),
-                handleId,
+        // 单次协调观察：状态与诊断来自同一代际；中断标记已在上游恢复。
+        FailureSnapshot snapshot = failureSnapshot(handle.handleId());
+        if (snapshot.state() == ComponentState.ACTIVE) {
+            // 并发过渡刚刚完成；返回自身而不是抛出声称 ACTIVE 的 not-active 异常。
+            return handle;
+        }
+        ComponentState failureState = settledNormally ? settled : snapshot.state();
+        List<RuntimeDiagnostic> diagnostics = snapshot.state() == failureState
+                ? new ArrayList<>(snapshot.diagnostics())
+                : new ArrayList<>();
+        RuntimeDiagnostic detail = failureDetail(handle.handleId(), interrupted, settlementError);
+        if (detail != null) {
+            diagnostics.add(detail);
+        }
+        throw new ComponentNotActiveException(
+                failureState,
+                handle.handleId(),
                 handle.mountId(),
                 handle.componentId(),
                 handle.factoryId(),
                 handle.contextId(),
                 timeout,
-                diagnostics,
-                cause);
+                diagnostics);
     }
+
+    private FailureSnapshot failureSnapshot(String handleId) {
+        synchronized (coordinator) {
+            RuntimeView current = view;
+            List<RuntimeDiagnostic> diagnostics = current.diagnostics.stream()
+                    .filter(diagnostic -> handleId.equals(diagnostic.targetId()))
+                    .toList();
+            return new FailureSnapshot(componentState(handleId), diagnostics);
+        }
+    }
+
+    private RuntimeDiagnostic failureDetail(
+            String handleId,
+            boolean interrupted,
+            Throwable settlementError) {
+        if (interrupted) {
+            return new RuntimeDiagnostic(
+                    DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
+                    handleId,
+                    "wait interrupted before settlement");
+        }
+        if (settlementError != null) {
+            return new RuntimeDiagnostic(
+                    DiagnosticCode.ROLLBACK_FAILED,
+                    handleId,
+                    "settlement failed: " + LifecycleScopeImpl.safeError(settlementError));
+        }
+        return null;
+    }
+
+    private record FailureSnapshot(
+            ComponentState state,
+            List<RuntimeDiagnostic> diagnostics) {
+    }
+
     <C> CompletionStage<ComponentState> reconfigure(
             ComponentHandleImpl<C> handle,
             C config) {
@@ -639,8 +669,18 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         && component.mountId().equals(mountId));
     }
 
-    <C> ComponentHandleImpl<C> createProvisionalHandle() {
-        return new ComponentHandleImpl<>(this, Sequences.handle());
+    <C> ComponentHandleImpl<C> createProvisionalHandle(
+            String contextId,
+            String mountId,
+            PreparedComponent<C> prepared) {
+        return new ComponentHandleImpl<>(
+                this,
+                Sequences.handle(),
+                new ComponentHandleImpl.Identity(
+                        mountId,
+                        prepared.descriptor().componentId(),
+                        prepared.factoryId(),
+                        contextId));
     }
 
     private boolean applyIntent(
@@ -2754,7 +2794,12 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     options == null ? MountOptions.DEFAULT : options);
             ComponentHandleImpl<C> handle = new ComponentHandleImpl<>(
                     DefaultKnotraRuntime.this,
-                    Sequences.handle());
+                    Sequences.handle(),
+                    new ComponentHandleImpl.Identity(
+                            mountId,
+                            prepared.descriptor().componentId(),
+                            prepared.factoryId(),
+                            ((ContextHandleImpl) context).contextId()));
             provisionalConfigs.put(
                     handle.handleId(),
                     new ProvisionalConfig(prepared.config(), 1));

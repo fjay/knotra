@@ -102,6 +102,40 @@ final class SpringDynamicDependencyTest {
     }
 
     @Test
+    void dynamicProxyDeclarationsAcceptInterfaceCapability() {
+        assertNotNull(SpringModules.noConfig("proxy-iface-required")
+                .dynamicProxyRequired("api", API));
+        assertNotNull(SpringModules.noConfig("proxy-iface-optional")
+                .dynamicProxyOptional("api", API));
+    }
+
+    @Test
+    void dynamicProxyRequiredRejectsNonInterfaceCapabilityAtDeclaration() {
+        CapabilityKey<ApiValue> key =
+                CapabilityKey.of("spring-dynamic.api-value-required", ApiValue.class);
+
+        IllegalArgumentException rejected = assertThrows(
+                IllegalArgumentException.class,
+                () -> SpringModules.noConfig("proxy-class-required")
+                        .dynamicProxyRequired("api", key));
+        assertTrue(rejected.getMessage().contains("must be an interface"));
+        assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
+    }
+
+    @Test
+    void dynamicProxyOptionalRejectsNonInterfaceCapabilityAtDeclaration() {
+        CapabilityKey<ApiValue> key =
+                CapabilityKey.of("spring-dynamic.api-value-optional", ApiValue.class);
+
+        IllegalArgumentException rejected = assertThrows(
+                IllegalArgumentException.class,
+                () -> SpringModules.noConfig("proxy-class-optional")
+                        .dynamicProxyOptional("api", key));
+        assertTrue(rejected.getMessage().contains("must be an interface"));
+        assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
+    }
+
+    @Test
     void dynamicCapabilityProvidesProviderFixedCallbackAcrossReplacement() throws Exception {
         RegistrationHandle first = runtime.provide(API, new ApiValue("v1"));
         AtomicInteger contexts = new AtomicInteger();

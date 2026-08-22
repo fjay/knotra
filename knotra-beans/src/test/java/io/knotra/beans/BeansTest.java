@@ -637,6 +637,40 @@ final class BeansTest {
     }
 
     @Test
+    void dynamicProxyDeclarationsAcceptInterfaceCapabilities() {
+        CapabilityKey<Api> required = CapabilityKey.of("beans-proxy-required", Api.class);
+        CapabilityKey<Api> optional = CapabilityKey.of("beans-proxy-optional", Api.class);
+
+        BeanDependency<Api> requiredDependency = Beans.dynamicProxyRequired(required);
+        assertEquals(CapabilityBinding.DYNAMIC, requiredDependency.requirement().binding());
+        assertEquals(Mode.REQUIRED, requiredDependency.requirement().mode());
+
+        BeanDependency<Api> optionalDependency = Beans.dynamicProxyOptional(optional);
+        assertEquals(CapabilityBinding.DYNAMIC, optionalDependency.requirement().binding());
+        assertEquals(Mode.OPTIONAL, optionalDependency.requirement().mode());
+    }
+
+    @Test
+    void dynamicProxyRequiredRejectsNonInterfaceCapabilityAtDeclaration() {
+        CapabilityKey<ApiValue> key = CapabilityKey.of("beans-proxy-class-required", ApiValue.class);
+
+        IllegalArgumentException rejected = assertThrows(
+                IllegalArgumentException.class, () -> Beans.dynamicProxyRequired(key));
+        assertTrue(rejected.getMessage().contains("must be an interface"));
+        assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
+    }
+
+    @Test
+    void dynamicProxyOptionalRejectsNonInterfaceCapabilityAtDeclaration() {
+        CapabilityKey<ApiValue> key = CapabilityKey.of("beans-proxy-class-optional", ApiValue.class);
+
+        IllegalArgumentException rejected = assertThrows(
+                IllegalArgumentException.class, () -> Beans.dynamicProxyOptional(key));
+        assertTrue(rejected.getMessage().contains("must be an interface"));
+        assertTrue(rejected.getMessage().contains(ApiValue.class.getName()));
+    }
+
+    @Test
     void dynamicFactoriesExposeExplicitLeasedCallEntrypoint() throws Exception {
         CapabilityKey<Api> api = CapabilityKey.of("beans-explicit-dynamic", Api.class);
         AtomicReference<DynamicCapability<Api>> dynamic = new AtomicReference<>();

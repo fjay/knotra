@@ -19,7 +19,7 @@ graph TD
     end
 
     subgraph plugin_mod ["插件实现工程 (greeting-plugin)"]
-        P["插件实现: GreetingImpl.java<br/>(provided 依赖 contract & knotra-core)"]
+        P["插件实现: GreetingImpl.java<br/>(provided 依赖 contract、Knotra Core/Beans)"]
     end
 
     H -->|依赖| C
@@ -89,6 +89,23 @@ public final class GreetingContracts {
   <artifactId>my-greeting-plugin</artifactId>
   <version>1.0.0</version>
 
+  <properties>
+    <knotra.version>0.1.0-SNAPSHOT</knotra.version>
+  </properties>
+
+  <!-- 导入 BOM 统一 Knotra 与 PF4J 版本，依赖本身仍按 provided 声明 -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.knotra</groupId>
+        <artifactId>knotra-bom</artifactId>
+        <version>${knotra.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
   <dependencies>
     <!-- 共享合约：必须 provided -->
     <dependency>
@@ -98,23 +115,25 @@ public final class GreetingContracts {
       <scope>provided</scope>
     </dependency>
 
-    <!-- Knotra 核心与 SPI：必须 provided -->
+    <!-- Knotra Core、Beans 与 PF4J SPI：源码引用，宿主提供，必须 provided -->
     <dependency>
       <groupId>io.knotra</groupId>
       <artifactId>knotra-core</artifactId>
-      <version>0.1.0-SNAPSHOT</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.knotra</groupId>
+      <artifactId>knotra-beans</artifactId>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>io.knotra</groupId>
       <artifactId>knotra-pf4j-spi</artifactId>
-      <version>0.1.0-SNAPSHOT</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.pf4j</groupId>
       <artifactId>pf4j</artifactId>
-      <version>3.12.0</version>
       <scope>provided</scope>
     </dependency>
   </dependencies>

@@ -7,7 +7,7 @@ Knotra 是一个面向 Java 21+ 的 JVM 动态组件运行时。应用启动后�
 ![Java](https://img.shields.io/badge/Java-21%2B-orange)
 ![Maven](https://img.shields.io/badge/Maven-3.9%2B-blue)
 ![Version](https://img.shields.io/badge/version-0.1.0--SNAPSHOT-blue)
-![Tests](https://img.shields.io/badge/tests-325%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-336%20passing-brightgreen)
 
 > **项目状态**：`0.1.0-SNAPSHOT`。依赖 Java 21+ 与 Maven 3.9+。
 
@@ -217,4 +217,4 @@ graph TD
 mvn clean verify
 ```
 
-全工程包含 325 项严苛测试，覆盖真实 PF4J 插件构建与卸载、Spring 动态子容器重载、并发排空竞态、动态调用租约防撕裂以及 ClassLoader GC 回收验证。
+全工程包含 336 项严苛测试，覆盖真实 PF4J 插件构建与卸载、Spring 动态子容器重载、并发排空竞态、动态调用租约防撕裂以及 ClassLoader GC 回收验证。

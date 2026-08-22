@@ -167,10 +167,9 @@ graph TD
 ContextHandle usWorkspace = runtime.transact(tx ->
         tx.childContext(runtime.root(), "us-tenant")).value();
 
-// 在子上下文中注册局部能力以遮蔽根能力
-usWorkspace.context().ifPresent(ctx -> {
-    runtime.transact(tx -> tx.provide(ctx, CURRENCY_RATE, new UsdRateService()));
-});
+// 在子上下文中注册局部能力以遮蔽根能力（ContextHandle 可直接作为 provide 的目标）
+runtime.transact(tx ->
+        tx.provide(usWorkspace, CURRENCY_RATE, new UsdRateService()));
 
 // 递归释放子上下文及其名下所有组件
 usWorkspace.disposeAsync().toCompletableFuture().join();
@@ -305,8 +304,8 @@ try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver))
 RuntimeSnapshot snapshot = runtime.snapshot();
 
 snapshot.components().forEach(c -> {
-    System.out.printf("组件 [%s] 状态: %s, 运行代数: %d%n",
-            c.componentId(), c.state(), c.generation());
+    System.out.printf("组件 [%s] 状态: %s, 配置代际: %d%n",
+            c.componentId(), c.state(), c.configRevision());
 });
 
 snapshot.diagnostics().forEach(d -> {

@@ -56,7 +56,7 @@ graph TB
 
 ## Maven 依赖配置
 
-在多模块工程的 `pom.xml` 中引入 BOM 与对应模块：
+在多模块工程的 `pom.xml` 中先引入 BOM：
 
 ```xml
 <properties>
@@ -74,15 +74,23 @@ graph TB
     </dependency>
   </dependencies>
 </dependencyManagement>
+```
 
+普通 POJO 装配只需引入 `knotra-starter`：
+
+```xml
 <dependencies>
-  <!-- 普通 POJO 装配引入 starter -->
   <dependency>
     <groupId>io.knotra</groupId>
     <artifactId>knotra-starter</artifactId>
   </dependency>
+</dependencies>
+```
 
-  <!-- Spring 子容器与桥接引入 spring-starter -->
+需要 Spring 子容器与宿主桥接时，改用 `knotra-spring-starter`（已传递包含普通 Beans 能力，无需同时引入 `knotra-starter`）：
+
+```xml
+<dependencies>
   <dependency>
     <groupId>io.knotra</groupId>
     <artifactId>knotra-spring-starter</artifactId>

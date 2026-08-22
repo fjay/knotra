@@ -52,7 +52,7 @@ public final class Beans {
 
     /** 声明动态必需依赖：creator 收到方法级持有调用租约的 interface proxy。 */
     public static <T> BeanDependency<T> dynamicProxyRequired(CapabilityKey<T> key) {
-        Objects.requireNonNull(key, "key");
+        requireProxyInterface(key);
         return BeanDependency.of(
                 CapabilityRequirement.dynamicRequired(key),
                 context -> context.subscribe(key).proxy(key.type()));
@@ -60,7 +60,7 @@ public final class Beans {
 
     /** 声明动态可选依赖：creator 收到方法级持有调用租约的 interface proxy。 */
     public static <T> BeanDependency<T> dynamicProxyOptional(CapabilityKey<T> key) {
-        Objects.requireNonNull(key, "key");
+        requireProxyInterface(key);
         return BeanDependency.of(
                 CapabilityRequirement.dynamicOptional(key),
                 context -> context.subscribe(key).proxy(key.type()));
@@ -122,5 +122,13 @@ public final class Beans {
             throw new IllegalArgumentException("componentId must not be blank");
         }
         return trimmed;
+    }
+
+    private static void requireProxyInterface(CapabilityKey<?> key) {
+        Objects.requireNonNull(key, "key");
+        if (!key.type().isInterface()) {
+            throw new IllegalArgumentException(
+                    "dynamic proxy capability must be an interface: " + key.typeName());
+        }
     }
 }

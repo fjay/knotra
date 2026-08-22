@@ -3,8 +3,15 @@ package io.knotra;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -123,5 +130,104 @@ final class ProvidedHandleTest {
         assertEquals("expert", runtime.root().view().require(TEXT));
         runtime.revoke(registration);
         assertTrue(runtime.root().view().find(TEXT).isEmpty());
+    }
+
+    @Test
+    void concurrentSameHandleReplaceAndRevokeRacesHaveExactlyOneWinner() throws Exception {
+        int lanes = 4;
+        int rounds = 60;
+        ExecutorService executor = Executors.newFixedThreadPool(lanes);
+        try {
+            for (int round = 0; round < rounds; round++) {
+                CapabilityKey<String> key =
+                        CapabilityKey.of("replace-race-" + round, String.class);
+                Provided<String> first = runtime.provide(key, "first");
+                first.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+
+                CyclicBarrier barrier = new CyclicBarrier(lanes);
+                AtomicReference<String> winner = new AtomicReference<>("revoked");
+                AtomicReference<Provided<String>> winnerHandle = new AtomicReference<>();
+                List<Future<Object>> outcomes = new ArrayList<>();
+                for (int lane = 0; lane < lanes; lane++) {
+                    int laneId = lane;
+                    outcomes.add(executor.submit(() -> {
+                        barrier.await(10, TimeUnit.SECONDS);
+                        if (laneId == 0) {
+                            first.revoke();
+                            return null;
+                        }
+                        Provided<String> replacement = first.replace("lane-" + laneId);
+                        winner.compareAndSet("revoked", "lane-" + laneId);
+                        winnerHandle.compareAndSet(null, replacement);
+                        return replacement;
+                    }));
+                }
+
+                int successes = 0;
+                int rejections = 0;
+                for (Future<Object> outcome : outcomes) {
+                    try {
+                        outcome.get(10, TimeUnit.SECONDS);
+                        successes++;
+                    } catch (java.util.concurrent.ExecutionException error) {
+                        assertInstanceOf(TransactionRejectedException.class, error.getCause());
+                        rejections++;
+                    }
+                }
+                assertEquals(1, successes, "round " + round);
+                assertEquals(lanes - 1, rejections, "round " + round);
+
+                List<RuntimeSnapshot.RegistrationSnapshot> slot =
+                        runtime.snapshot().registrations().stream()
+                                .filter(registration ->
+                                        registration.capability().name().equals(key.name()))
+                                .toList();
+                if ("revoked".equals(winner.get())) {
+                    assertEquals(0, slot.size(), "round " + round);
+                    assertTrue(runtime.root().view().find(key).isEmpty());
+                } else {
+                    assertEquals(1, slot.size(), "round " + round);
+                    assertEquals(winner.get(), runtime.root().view().require(key));
+                    assertEquals(winnerHandle.get().registrationId(),
+                            slot.getFirst().registrationId());
+                }
+            }
+        } finally {
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void replacementSettlementSurvivesDeterministicDownstreamReactivationFailure() throws Exception {
+        AtomicInteger starts = new AtomicInteger();
+        var consumer = TestKit.mount(runtime, runtime.root(), "failing-consumer",
+                (context, config) -> {
+                    starts.incrementAndGet();
+                    if ("two".equals(context.require(TEXT))) {
+                        throw new IllegalStateException("cannot bind replacement");
+                    }
+                },
+                CapabilityRequirement.required(TEXT));
+
+        Provided<String> first = runtime.provide(TEXT, "one");
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
+        assertEquals(1, starts.get());
+
+        Provided<String> second = first.replace("two");
+        second.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        assertEquals(ComponentState.FAILED, consumer.state());
+        assertEquals(2, starts.get());
+        assertEquals("two", runtime.root().view().require(TEXT));
+
+        RuntimeSnapshot snapshot = runtime.snapshot();
+        assertTrue(snapshot.diagnostics().stream().anyMatch(diagnostic ->
+                diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
+                        && diagnostic.targetId().equals(consumer.handleId())),
+                () -> snapshot.toString());
+        assertTrue(snapshot.registrations().stream()
+                .filter(registration -> registration.capability().name().equals(TEXT.name()))
+                .allMatch(registration ->
+                        registration.registrationId().equals(second.registrationId())));
     }
 }

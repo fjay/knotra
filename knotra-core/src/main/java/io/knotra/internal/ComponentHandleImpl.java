@@ -13,10 +13,13 @@ import java.util.concurrent.CompletionStage;
 final class ComponentHandleImpl<C> implements ComponentHandle<C> {
     final DefaultKnotraRuntime runtime;
     final String id;
+    // 挂载身份在创建时确定且终生不变；组件从视图移除后句柄仍可报告稳定逻辑标识。
+    private final Identity identity;
 
-    ComponentHandleImpl(DefaultKnotraRuntime runtime, String id) {
+    ComponentHandleImpl(DefaultKnotraRuntime runtime, String id, Identity identity) {
         this.runtime = runtime;
         this.id = id;
+        this.identity = Objects.requireNonNull(identity, "identity");
     }
 
     @Override
@@ -26,22 +29,22 @@ final class ComponentHandleImpl<C> implements ComponentHandle<C> {
 
     @Override
     public String mountId() {
-        return runtime.componentMountId(id);
+        return identity.mountId();
     }
 
     @Override
     public String componentId() {
-        return runtime.componentField(id, component -> component.componentId());
+        return identity.componentId();
     }
 
     @Override
     public String factoryId() {
-        return runtime.componentField(id, component -> component.factoryId());
+        return identity.factoryId();
     }
 
     @Override
     public String contextId() {
-        return runtime.componentField(id, component -> component.contextId());
+        return identity.contextId();
     }
 
     @Override
@@ -111,5 +114,20 @@ final class ComponentHandleImpl<C> implements ComponentHandle<C> {
     @Override
     public String toString() {
         return "ComponentHandle[" + id + "]";
+    }
+
+    /** 只保存字符串的稳定逻辑身份，不引用 Class、ClassLoader 或组件实例。 */
+    record Identity(
+            String mountId,
+            String componentId,
+            String factoryId,
+            String contextId) {
+
+        Identity {
+            Objects.requireNonNull(mountId, "mountId");
+            Objects.requireNonNull(componentId, "componentId");
+            Objects.requireNonNull(factoryId, "factoryId");
+            Objects.requireNonNull(contextId, "contextId");
+        }
     }
 }

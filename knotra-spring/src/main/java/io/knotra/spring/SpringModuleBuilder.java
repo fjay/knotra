@@ -211,6 +211,7 @@ public final class SpringModuleBuilder<C> {
     public <T> SpringModuleBuilder<C> dynamicProxyRequired(
             String beanName,
             CapabilityKey<T> key) {
+        requireProxyInterface(key);
         return dependency(new SpringDependency<>(
                 key, beanName, SpringDependency.Binding.DYNAMIC_PROXY_REQUIRED));
     }
@@ -225,6 +226,7 @@ public final class SpringModuleBuilder<C> {
     public <T> SpringModuleBuilder<C> dynamicProxyOptional(
             String beanName,
             CapabilityKey<T> key) {
+        requireProxyInterface(key);
         return dependency(new SpringDependency<>(
                 key, beanName, SpringDependency.Binding.DYNAMIC_PROXY_OPTIONAL));
     }
@@ -351,6 +353,14 @@ public final class SpringModuleBuilder<C> {
                 requireId(componentId),
                 Objects.requireNonNull(configType, "configType"),
                 true);
+    }
+
+    private static void requireProxyInterface(CapabilityKey<?> key) {
+        Objects.requireNonNull(key, "key");
+        if (!key.type().isInterface()) {
+            throw new IllegalArgumentException(
+                    "dynamic proxy capability must be an interface: " + key.typeName());
+        }
     }
 
     private static String requireId(String componentId) {

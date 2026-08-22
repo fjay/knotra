@@ -7,7 +7,13 @@ import java.util.Objects;
 /**
  * 组件结算后不是 ACTIVE，或有界等待未在指定时间内收敛。
  *
- * <p>异常携带稳定句柄标识与目标诊断；不包含组件实例、Throwable、Class 或 ClassLoader。</p>
+ * <p>异常携带稳定句柄标识与目标诊断；为避免保留插件 artifact，不携带组件实例，
+ * 也不保留任何 Throwable、Class 或 ClassLoader 引用（包括 JDK 中断或超时异常）。
+ * 等待被中断时调用线程的中断标记会被保留并恢复；超时通过 {@link #timeout()} 表达；
+ * 中断与结算失败同时以稳定文本诊断编码。</p>
+ *
+ * <p>{@code requireActive} 只会在失败状态的快照不是 ACTIVE 时抛出本异常，
+ * 因此 {@link #state()} 不会报告 ACTIVE。</p>
  */
 public final class ComponentNotActiveException extends RuntimeException {
     private static final long serialVersionUID = 1L;
@@ -29,9 +35,8 @@ public final class ComponentNotActiveException extends RuntimeException {
             String factoryId,
             String contextId,
             Duration timeout,
-            List<RuntimeDiagnostic> diagnostics,
-            Throwable cause) {
-        super(message(handleId, mountId, state, timeout, diagnostics), cause);
+            List<RuntimeDiagnostic> diagnostics) {
+        super(message(handleId, mountId, state, timeout, diagnostics));
         Objects.requireNonNull(diagnostics, "diagnostics");
         this.state = state;
         this.handleId = handleId;

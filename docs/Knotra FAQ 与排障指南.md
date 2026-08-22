@@ -11,10 +11,10 @@
 ```java
 RuntimeSnapshot snapshot = runtime.snapshot();
 
-// 打印所有异常诊断码
+// 打印所有异常诊断码与目标
 snapshot.diagnostics().forEach(diag -> {
-    System.err.printf("[告警] 错误码: %s, 说明: %s, 关联路径: %s%n",
-            diag.code(), diag.message(), diag.path());
+    System.err.printf("[告警] 错误码: %s, 目标: %s, 说明: %s%n",
+            diag.code(), diag.targetId(), diag.message());
 });
 
 // 过滤处于异常或过渡状态的组件
@@ -74,14 +74,21 @@ stateDiagram-v2
 
 ### 组件挂载后保持 WAITING 状态
 
-检查快照中未就绪的依赖项：
+检查快照中该组件声明的依赖项（声明内容，不含实时满足状态）：
 
 ```java
 ComponentSnapshot comp = snapshot.components().get(0);
 comp.requirements().forEach(req -> {
-    System.out.printf("依赖 [%s], 类型: %s, 是否就绪: %s%n",
-            req.key().name(), req.kind(), req.satisfied());
+    System.out.printf("依赖 [%s], 类型: %s, 模式: %s, 绑定: %s%n",
+            req.capability().name(), req.capability().typeName(),
+            req.mode(), req.binding());
 });
+
+// 缺失的必需能力由 MISSING_CAPABILITY 诊断报告，targetId 为组件 handleId
+snapshot.diagnostics().stream()
+        .filter(diag -> diag.code() == DiagnosticCode.MISSING_CAPABILITY
+                && diag.targetId().equals(comp.handleId()))
+        .forEach(diag -> System.out.println("缺失能力: " + diag.message()));
 ```
 
 常见原因：
