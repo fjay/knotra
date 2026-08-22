@@ -185,12 +185,13 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
 | DSL | 注入值 | 语义 |
 |---|---|---|
-| `required` | `T` | 启动固定一代；提供方变化触发消费方重建 |
-| `optional` | `Optional<T>` | 提供方出现或消失触发重建 |
+| `fixed` | `T` | 启动固定一代；提供方变化触发消费方重建 |
+| `fixedOptional` | `Optional<T>` | 提供方出现或消失触发重建 |
 | `dynamic` | `T` 接口代理 | 提供方替换不重建消费方；每个方法独立租约 |
 | `dynamicOptional` | `T` 接口代理 | 首次启动也不要求提供方存在 |
 | `dynamicCapability` | `DynamicCapability<T>` | 显式租约，可 `call` / `callAsync` 固定 provider |
 | `dynamicCapabilityOptional` | `DynamicCapability<T>` | 显式租约，首次启动可不满足 |
+
 
 默认推荐：
 

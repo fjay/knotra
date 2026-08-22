@@ -146,12 +146,13 @@ handle.reconfigureAsync(new RenderConfig("Bonjour"))
 
 依赖选择：
 
-- `required`：启动时固定一代，提供方替换触发消费方重建。
-- `optional`：注入 `Optional<T>`，出现和消失都会触发重建。
+- `fixed`：启动时固定一代，提供方替换触发消费方重建。
+- `fixedOptional`：注入 `Optional<T>`，出现和消失都会触发重建。
 - `dynamic`：注入接口代理；默认 required 只约束首次启动，激活后提供方消失不会自动停用，方法调用会失败。
 - `dynamicOptional`：注入接口代理，首次启动也不要求提供方存在。
 - `dynamicCapability`：注入 `DynamicCapability<T>`，用于 `call` 或 `callAsync` 固定一个 provider 租约。
 - `dynamicCapabilityOptional`：同上，但不要求首次启动存在。
+
 
 详细 DSL、注解处理器和 Spring 集成见 [Beans 与 Spring 集成指南](<Knotra Beans 与 Spring 集成指南.md>)。
 

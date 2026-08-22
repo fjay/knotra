@@ -164,8 +164,9 @@ BeanDefinition<BatchSettlementJob> definition = Beans
 
 - 单次方法调用或无状态路由：`dynamic`。
 - 一次回调中多个观察必须一致：`dynamicCapability`。
-- 一个业务对象整个生命周期都要绑定一代：`required`。
-- 提供方可有可无且消费方可独立工作：`optional` / `dynamicOptional`。
+- 一个业务对象整个生命周期都要绑定一代：`fixed`。
+- 提供方可有可无且消费方可独立工作：`fixedOptional` / `dynamicOptional`。
+
 
 ## 双策略并行
 
