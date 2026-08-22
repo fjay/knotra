@@ -6,7 +6,7 @@
 
 ## 架构定位与职责划分
 
-Spring 容器是静态单例模型的代表：容器在应用启动时构建完整的 Bean 依赖图，运行期间不再轻易变动。当业务需要在线热替换某个实现、动态加载外部插件或局部重建故障模块时，原生 Spring 无法提供在途请求排空和依赖代际隔离的保证。
+Spring 容器是静态单例模型的代表：容器在应用启动时构建完整的 Bean 依赖图，运行期间 Bean 的引用和结构通常不再改变。当业务需要在线热替换某个实现、动态加载外部插件或局部重建故障模块时，原生 Spring 无法提供在途请求排空和依赖代际隔离的保证。
 
 Knotra 与 Spring 采用分层协作架构：
 
@@ -56,7 +56,7 @@ graph TB
 
 ## Maven 依赖配置
 
-在多模块工程的 `pom.xml` 中先引入 BOM：
+在多模块工程的 `pom.xml` 中引入 BOM 与对应模块：
 
 ```xml
 <properties>
@@ -74,23 +74,15 @@ graph TB
     </dependency>
   </dependencies>
 </dependencyManagement>
-```
 
-普通 POJO 装配只需引入 `knotra-starter`：
-
-```xml
 <dependencies>
+  <!-- 普通 POJO 装配引入 starter -->
   <dependency>
     <groupId>io.knotra</groupId>
     <artifactId>knotra-starter</artifactId>
   </dependency>
-</dependencies>
-```
 
-需要 Spring 子容器与宿主桥接时，改用 `knotra-spring-starter`（已传递包含普通 Beans 能力，无需同时引入 `knotra-starter`）：
-
-```xml
-<dependencies>
+  <!-- Spring 子容器与桥接引入 spring-starter -->
   <dependency>
     <groupId>io.knotra</groupId>
     <artifactId>knotra-spring-starter</artifactId>
@@ -104,15 +96,22 @@ graph TB
 
 无需引入 Spring 容器即可实现类型安全的依赖注入与动态热重载。
 
-### 编写业务类
+### 基础组件装配与挂载
 
 业务类保持标准的 Java 对象结构，无需实现 Knotra 专有接口：
 
 ```java
+package com.example.demo;
+
+import io.knotra.*;
+import io.knotra.beans.*;
+
+// 业务接口
 public interface Greeting {
     String greet(String name);
 }
 
+// 业务实现类
 public final class GreetingBean implements Greeting, AutoCloseable {
     @Override
     public String greet(String name) {
@@ -121,51 +120,106 @@ public final class GreetingBean implements Greeting, AutoCloseable {
 
     @Override
     public void close() {
-        // 只负责释放该 Bean 自身持有的资源
+        System.out.println("GreetingBean 资源已释放");
     }
 }
 ```
 
-### 声明定义与挂载
-
 通过 `Beans.component` DSL 声明依赖、构造方式以及对外暴露的能力：
 
 ```java
+package com.example.demo;
+
 import io.knotra.*;
 import io.knotra.beans.*;
 
-static final CapabilityKey<Greeting> GREETING =
-        CapabilityKey.of("app.greeting", Greeting.class);
+public class PojoDemo {
+    // 声明能力契约 Key
+    public static final CapabilityKey<Greeting> GREETING =
+            CapabilityKey.of("app.greeting", Greeting.class);
 
-BeanDefinition<NoConfig, GreetingBean> factory = Beans.component("greeting")
-        .create(GreetingBean::new)
-        .provide(GREETING)
-        .build();
+    public static void main(String[] args) {
+        // 定义组件工厂
+        BeanDefinition<NoConfig, GreetingBean> definition = Beans.component("greeting")
+                .create(GreetingBean::new)
+                .provide(GREETING)
+                .build();
 
-try (KnotraRuntime runtime = KnotraRuntime.create()) {
-    ComponentHandle<NoConfig> handle = Beans.mount(runtime, factory);
-    handle.requireActive();
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+            // 挂载组件并等待就绪
+            ComponentHandle<NoConfig> handle = Beans.mount(runtime, definition);
+            handle.requireActive();
+
+            Greeting greeting = runtime.root().view().require(GREETING);
+            System.out.println(greeting.greet("Knotra"));
+        }
+    }
 }
 ```
 
 ### 依赖注入：Required 与 Optional
 
-```java
-static final CapabilityKey<UserRepository> USERS =
-        CapabilityKey.of("app.users", UserRepository.class);
-static final CapabilityKey<Metrics> METRICS =
-        CapabilityKey.of("app.metrics", Metrics.class);
-static final CapabilityKey<UserService> USER_SERVICE =
-        CapabilityKey.of("app.user-service", UserService.class);
+当组件依赖外部服务时，先定义相关接口与对应的 `CapabilityKey`，再通过 `with(...)` 注入构造函数：
 
-BeanDefinition<NoConfig, UserService> userDef = Beans.component("user-service")
-        .with(
-                Beans.required(USERS),    // 必需依赖：缺失时组件保持 WAITING
-                Beans.optional(METRICS)   // 可选依赖：构造函数接收 Optional<Metrics>
-        )
-        .create((users, metrics) -> new UserService(users, metrics))
-        .provide(USER_SERVICE)
-        .build();
+```java
+package com.example.demo;
+
+import io.knotra.CapabilityKey;
+import java.util.Optional;
+
+// 依赖接口
+public interface UserRepository {
+    String findUserName(long id);
+}
+
+public interface Metrics {
+    void record(String metricName);
+}
+
+// 消费方业务类
+public final class UserService {
+    private final UserRepository userRepository;
+    private final Optional<Metrics> metrics;
+
+    public UserService(UserRepository userRepository, Optional<Metrics> metrics) {
+        this.userRepository = userRepository;
+        this.metrics = metrics;
+    }
+
+    public String getUserInfo(long id) {
+        metrics.ifPresent(m -> m.record("user.query"));
+        return "User: " + userRepository.findUserName(id);
+    }
+}
+```
+
+在装配层声明契约并完成构造器注入：
+
+```java
+package com.example.demo;
+
+import io.knotra.*;
+import io.knotra.beans.*;
+
+public class UserServiceAssembly {
+    public static final CapabilityKey<UserRepository> USERS =
+            CapabilityKey.of("app.users", UserRepository.class);
+    public static final CapabilityKey<Metrics> METRICS =
+            CapabilityKey.of("app.metrics", Metrics.class);
+    public static final CapabilityKey<UserService> USER_SERVICE =
+            CapabilityKey.of("app.user-service", UserService.class);
+
+    public static BeanDefinition<NoConfig, UserService> createDefinition() {
+        return Beans.component("user-service")
+                .with(
+                        Beans.required(USERS),    // 必需依赖：缺失时组件保持 WAITING
+                        Beans.optional(METRICS)   // 可选依赖：构造函数接收 Optional<Metrics>
+                )
+                .create((users, metrics) -> new UserService(users, metrics))
+                .provide(USER_SERVICE)
+                .build();
+    }
+}
 ```
 
 | 依赖声明语法 | 构造函数参数类型 | 提供方替换时的运行时行为 |
@@ -179,7 +233,7 @@ BeanDefinition<NoConfig, UserService> userDef = Beans.component("user-service")
 
 ### 动态依赖：调用时不重启消费方
 
-适用于无状态网关或高频请求路由：
+当注入无状态服务或高频调用的网关接口时，使用 `dynamicProxyRequired`。底层替换提供方时，消费方实例不会重建：
 
 ```mermaid
 sequenceDiagram
@@ -199,14 +253,52 @@ sequenceDiagram
     NewPay-->>OrderService: 支付成功 (OrderService 无需重启)
 ```
 
-```java
-static final CapabilityKey<PaymentGateway> PAYMENT =
-        CapabilityKey.of("app.payment", PaymentGateway.class);
+业务类与契约定义：
 
-BeanDefinition<NoConfig, CheckoutService> checkoutDef = Beans.component("checkout")
-        .with(Beans.dynamicProxyRequired(PAYMENT))
-        .create(CheckoutService::new)
-        .build();
+```java
+package com.example.demo;
+
+import io.knotra.CapabilityKey;
+
+public interface PaymentGateway {
+    String charge(String orderId, double amount);
+}
+
+public final class CheckoutService {
+    private final PaymentGateway paymentGateway; // 注入动态代理
+
+    public CheckoutService(PaymentGateway paymentGateway) {
+        this.paymentGateway = paymentGateway;
+    }
+
+    public void checkout(String orderId, double amount) {
+        paymentGateway.charge(orderId, amount);
+    }
+}
+```
+
+装配层注入动态代理：
+
+```java
+package com.example.demo;
+
+import io.knotra.*;
+import io.knotra.beans.*;
+
+public class CheckoutAssembly {
+    public static final CapabilityKey<PaymentGateway> PAYMENT_GATEWAY =
+            CapabilityKey.of("app.payment-gateway", PaymentGateway.class);
+    public static final CapabilityKey<CheckoutService> CHECKOUT_SERVICE =
+            CapabilityKey.of("app.checkout-service", CheckoutService.class);
+
+    public static BeanDefinition<NoConfig, CheckoutService> createDefinition() {
+        return Beans.component("checkout-service")
+                .with(Beans.dynamicProxyRequired(PAYMENT_GATEWAY))
+                .create(CheckoutService::new)
+                .provide(CHECKOUT_SERVICE)
+                .build();
+    }
+}
 ```
 
 ---
@@ -242,9 +334,18 @@ BeanDefinition<NoConfig, CheckoutService> checkoutDef = Beans.component("checkou
 ```java
 package com.example.service;
 
+import com.example.demo.Metrics;
+import com.example.demo.PaymentGateway;
+import com.example.demo.UserRepository;
 import io.knotra.beans.annotation.*;
 import java.util.Optional;
 
+// 业务接口
+public interface OrderService {
+    void processOrder(String orderId);
+}
+
+// 业务实现与注解标注
 @KnotraBean(id = "order-service")
 @KnotraOutput(name = "app.order-service", contract = OrderService.class)
 public final class DefaultOrderService implements OrderService {
@@ -257,10 +358,15 @@ public final class DefaultOrderService implements OrderService {
     DefaultOrderService(
             @KnotraRequire("app.users") UserRepository users,
             @KnotraOptional("app.metrics") Optional<Metrics> metrics,
-            @KnotraDynamicProxy("app.payment") PaymentGateway payment) {
+            @KnotraDynamicProxy("app.payment-gateway") PaymentGateway payment) {
         this.users = users;
         this.metrics = metrics;
         this.payment = payment;
+    }
+
+    @Override
+    public void processOrder(String orderId) {
+        payment.charge(orderId, 99.0);
     }
 
     @KnotraInit
@@ -278,9 +384,20 @@ public final class DefaultOrderService implements OrderService {
 编译期处理器会在同包下生成 `DefaultOrderService_KnotraFactory.java`，直接调用即可完成挂载：
 
 ```java
-DefaultOrderService_KnotraFactory factory = new DefaultOrderService_KnotraFactory();
-ComponentHandle<NoConfig> handle = Beans.mount(runtime, factory.definition());
-handle.requireActive();
+package com.example.service;
+
+import io.knotra.*;
+import io.knotra.beans.*;
+
+public class AnnotationDemo {
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+            DefaultOrderService_KnotraFactory factory = new DefaultOrderService_KnotraFactory();
+            ComponentHandle<NoConfig> handle = Beans.mount(runtime, factory.definition());
+            handle.requireActive();
+        }
+    }
+}
 ```
 
 ---
@@ -311,46 +428,108 @@ graph TB
     PS -->|expose 发布服务| KP["PAYMENT_SERVICE 供外部调用"]
 ```
 
-### 装配步骤
+### 完整装配示例
 
-#### 编写子模块的 Spring 配置类
+首先声明跨边界的契约接口与能力 Key：
+
+```java
+package com.example.contracts;
+
+import io.knotra.CapabilityKey;
+
+public interface UserRepository {
+    String findUserAddress(String userId);
+}
+
+public interface PaymentService {
+    String pay(String orderId, double amount);
+}
+
+public final class AppContracts {
+    public static final CapabilityKey<UserRepository> USER_REPOSITORY =
+            CapabilityKey.of("app.user-repository", UserRepository.class);
+    public static final CapabilityKey<PaymentService> PAYMENT_SERVICE =
+            CapabilityKey.of("app.payment-service", PaymentService.class);
+}
+```
+
+编写插件子模块内部的 Spring 配置与 Bean：
 
 ```java
 package com.example.plugin;
 
+import com.example.contracts.PaymentService;
+import com.example.contracts.UserRepository;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+public final class WechatPaymentService implements PaymentService {
+    private final UserRepository userRepository;
+
+    public WechatPaymentService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    public String pay(String orderId, double amount) {
+        String address = userRepository.findUserAddress("user-101");
+        return "WechatPay success for order " + orderId + " shipped to " + address;
+    }
+}
 
 @Configuration
 public class PluginSpringConfig {
 
+    // UserRepository 由 Knotra 从外部借入并作为 External Singleton 注册进容器
     @Bean
-    public PaymentService paymentService(UserRepository users) {
-        return new WechatPaymentService(users);
+    public PaymentService paymentService(UserRepository userRepository) {
+        return new WechatPaymentService(userRepository);
     }
 }
 ```
 
-#### 定义并挂载子容器组件
+宿主环境组装与运行：
 
 ```java
+package com.example.host;
+
+import com.example.contracts.*;
+import com.example.plugin.PluginSpringConfig;
+import io.knotra.*;
 import io.knotra.spring.SpringModules;
 
-ComponentFactory<NoConfig> pluginFactory = SpringModules.noConfig("payment-plugin")
-        .annotatedClasses(PluginSpringConfig.class)
-        .required("users", USER_REPOSITORY_KEY)
-        .expose(PAYMENT_SERVICE_KEY, "paymentService")
-        .build();
+public class SpringChildContextDemo {
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
-ComponentHandle<NoConfig> pluginHandle = runtime.mount("payment-plugin", pluginFactory);
-pluginHandle.requireActive();
+            // 1. 宿主提供基础能力
+            runtime.provide(AppContracts.USER_REPOSITORY, userId -> "北京市朝阳区");
+
+            // 2. 声明 Spring 子容器组件
+            ComponentFactory<NoConfig> pluginFactory = SpringModules.noConfig("payment-plugin")
+                    .annotatedClasses(PluginSpringConfig.class)
+                    // 从宿主借入 UserRepository 并以 "userRepository" 为名注入 Spring 容器
+                    .required("userRepository", AppContracts.USER_REPOSITORY)
+                    // 将 Spring 容器内名为 "paymentService" 的 Bean 暴露为 Knotra 能力
+                    .expose(AppContracts.PAYMENT_SERVICE, "paymentService")
+                    .build();
+
+            // 3. 挂载子容器并消费服务
+            ComponentHandle<NoConfig> pluginHandle = runtime.mount("payment-plugin", pluginFactory);
+            pluginHandle.requireActive();
+
+            PaymentService paymentService = runtime.root().view().require(AppContracts.PAYMENT_SERVICE);
+            System.out.println(paymentService.pay("ORD-999", 50.0));
+        }
+    }
+}
 ```
 
 运行时机制：
 - Knotra 为该组件独立创建 `AnnotationConfigApplicationContext`。
 - 将外部借入的 `UserRepository` 注册为 Spring 单例（External Singleton）。
 - 执行 `refresh()` 启动容器，并将内部创建的 `paymentService` 发布为 Knotra 能力。
-- 当外部依赖 `USER_REPOSITORY_KEY` 替换时，Knotra 会优雅关闭当前子容器并创建新代际。
+- 当外部依赖 `USER_REPOSITORY` 替换时，Knotra 会优雅关闭当前子容器并创建新代际。
 
 ---
 
@@ -360,23 +539,54 @@ pluginHandle.requireActive();
 
 在 Spring Boot 宿主应用中，Controller 与 Service 属于静态单例。通过 `SpringDynamicBridge` 可以向 Spring 宿主注入一个永久有效的动态代理：
 
+首先定义接口与契约 Key：
+
 ```java
+package com.example.bridge;
+
+import io.knotra.CapabilityKey;
+
+public interface NotificationGateway {
+    void sendNotification(String userId, String message);
+}
+
+public final class BridgeContracts {
+    // 动态插件实际注册的 Key
+    public static final CapabilityKey<NotificationGateway> DYNAMIC_NOTIFICATION =
+            CapabilityKey.of("plugin.notification", NotificationGateway.class);
+
+    // 暴露给 Spring 宿主使用的 Key
+    public static final CapabilityKey<NotificationGateway> SPRING_NOTIFICATION =
+            CapabilityKey.of("spring.notification", NotificationGateway.class);
+}
+```
+
+在 Spring 宿主配置中挂载桥接组件并将代理对象注册为 Spring Bean：
+
+```java
+package com.example.bridge;
+
+import io.knotra.KnotraRuntime;
+import io.knotra.spring.SpringDynamicBridge;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
 @Configuration
 public class HostSpringConfiguration {
 
     @Bean
-    public SpringDynamicBridge<PaymentGateway> paymentBridge(KnotraRuntime runtime) {
+    public SpringDynamicBridge<NotificationGateway> notificationBridge(KnotraRuntime runtime) {
         return SpringDynamicBridge.mount(
                 runtime,
-                "payment-bridge",
-                DYNAMIC_PAYMENT_KEY,      // 插件实际发布的契约 Key
-                SPRING_PAYMENT_KEY        // 暴露给 Spring 宿主的 Key
+                "notification-bridge",
+                BridgeContracts.DYNAMIC_NOTIFICATION,  // 来源动态 Key
+                BridgeContracts.SPRING_NOTIFICATION   // 目标宿主 Key
         );
     }
 
     @Bean
-    public PaymentGateway paymentGateway(SpringDynamicBridge<PaymentGateway> bridge) {
-        return bridge.proxy();
+    public NotificationGateway notificationGateway(SpringDynamicBridge<NotificationGateway> bridge) {
+        return bridge.proxy(); // 返回稳定的动态代理对象
     }
 }
 ```
@@ -384,15 +594,20 @@ public class HostSpringConfiguration {
 在宿主业务代码中正常注入使用：
 
 ```java
+package com.example.bridge;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
 @Service
-public class OrderController {
+public class OrderNotificationService {
 
     @Autowired
-    private PaymentGateway paymentGateway;
+    private NotificationGateway notificationGateway; // 注入动态代理
 
-    public void checkout(Order order) {
-        // 底层插件热替换时，调用自动路由至最新可用的提供方
-        paymentGateway.charge(order);
+    public void notifyCustomer(String orderId, String userId) {
+        // 底层插件热替换时，调用自动路由至当前最新可用的通知插件实现
+        notificationGateway.sendNotification(userId, "Your order " + orderId + " has shipped!");
     }
 }
 ```
@@ -423,9 +638,8 @@ graph TD
 - **多方法调用需使用显式租约**：动态代理仅保证单方法调用的原子路由。涉及多方法组合（如 `begin() -> process() -> commit()`）时，必须使用显式租约代码块：
   ```java
   bridge.withCurrent(gateway -> {
-      gateway.begin();
-      gateway.charge(order);
-      gateway.commit();
+      gateway.sendNotification("user-1", "msg 1");
+      gateway.sendNotification("user-2", "msg 2");
       return null;
   });
   ```

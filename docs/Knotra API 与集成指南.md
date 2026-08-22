@@ -45,19 +45,49 @@ graph TB
 创建运行时、发布服务并处理热替换：
 
 ```java
+package com.example.demo;
+
 import io.knotra.*;
 
-try (KnotraRuntime runtime = KnotraRuntime.create()) {
+// 1. 定义服务契约接口与实现
+public interface Tool {
+    String run(String input);
+}
 
-    // 定义服务契约 Key
-    CapabilityKey<Tool> TOOL = CapabilityKey.of("app.tool", Tool.class);
+public class DefaultTool implements Tool {
+    @Override
+    public String run(String input) {
+        return "v1: " + input;
+    }
+}
 
-    // 发布初始服务实现并获得类型化句柄
-    Provided<Tool> toolProvided = runtime.provide(TOOL, new DefaultTool());
+public class AdvancedTool implements Tool {
+    @Override
+    public String run(String input) {
+        return "v2: " + input;
+    }
+}
 
-    // 运行时原子替换提供方
-    Provided<Tool> v2 = toolProvided.replace(new AdvancedTool());
-    v2.whenSettled().toCompletableFuture().join();
+// 2. 运行闭环示例
+public class ApiLifecycleDemo {
+    public static final CapabilityKey<Tool> TOOL =
+            CapabilityKey.of("app.tool", Tool.class);
+
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+
+            // 发布初始服务实现并获得类型化句柄
+            Provided<Tool> toolProvided = runtime.provide(TOOL, new DefaultTool());
+
+            // 运行时原子替换提供方
+            Provided<Tool> v2 = toolProvided.replace(new AdvancedTool());
+            v2.whenSettled().toCompletableFuture().join();
+
+            // 验证最新提供方
+            Tool currentTool = runtime.root().view().require(TOOL);
+            System.out.println(currentTool.run("hello")); // 输出: v2: hello
+        }
+    }
 }
 ```
 
@@ -67,10 +97,38 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
 ## 原生组件与依赖绑定
 
-底层组件均通过实现 `ComponentFactory` 接口对外交付：
+底层组件均通过实现 `ComponentFactory` 接口对外交付。以下展示完整的组件定义、契约声明与挂载运行流程：
 
 ```java
+package com.example.demo;
+
+import io.knotra.*;
+
+// 工具箱对外暴露的接口
+public interface Box {
+    String open();
+}
+
+public final class ToolBox implements Box {
+    private final Tool tool;
+
+    public ToolBox(Tool tool) {
+        this.tool = tool;
+    }
+
+    @Override
+    public String open() {
+        return "ToolBox contains: " + tool.run("active");
+    }
+}
+
+// 声明组件工厂
 public final class ToolBoxFactory implements ComponentFactory<NoConfig> {
+    public static final CapabilityKey<Tool> TOOL =
+            CapabilityKey.of("app.tool", Tool.class);
+    public static final CapabilityKey<Box> BOX =
+            CapabilityKey.of("app.box", Box.class);
+
     @Override
     public Component<NoConfig> create() {
         return new Component<>() {
@@ -96,11 +154,28 @@ public final class ToolBoxFactory implements ComponentFactory<NoConfig> {
 }
 ```
 
-挂载组件并等待就绪：
+挂载组件并消费能力：
 
 ```java
-ComponentHandle<NoConfig> boxHandle = runtime.mount("tool-box", new ToolBoxFactory());
-boxHandle.requireActive();
+package com.example.demo;
+
+import io.knotra.*;
+
+public class MountDemo {
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+            // 先发布依赖
+            runtime.provide(ToolBoxFactory.TOOL, new DefaultTool());
+
+            // 挂载组件并等待就绪
+            ComponentHandle<NoConfig> boxHandle = runtime.mount("tool-box", new ToolBoxFactory());
+            boxHandle.requireActive();
+
+            Box box = runtime.root().view().require(ToolBoxFactory.BOX);
+            System.out.println(box.open());
+        }
+    }
+}
 ```
 
 ---
@@ -135,13 +210,29 @@ graph TD
 多个结构变更操作需要作为一个原子单元提交时，使用结构事务：
 
 ```java
-TransactionReceipt<Provided<Tool>> receipt = runtime.transact(tx -> {
-    tx.revoke(oldProvided);
-    tx.mount(runtime.root(), "worker", workerFactory);
-    return tx.provide(runtime.root(), TOOL, new AdvancedTool());
-});
+package com.example.demo;
 
-System.out.println("事务已提交，当前 generation = " + receipt.generation());
+import io.knotra.*;
+
+public class TransactionDemo {
+    public static final CapabilityKey<Tool> TOOL =
+            CapabilityKey.of("app.tool", Tool.class);
+
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+            Provided<Tool> oldProvided = runtime.provide(TOOL, new DefaultTool());
+
+            // 在单个结构事务中原子撤销旧注册、挂载新组件并发布新实现
+            TransactionReceipt<Provided<Tool>> receipt = runtime.transact(tx -> {
+                tx.revoke(oldProvided);
+                tx.mount(runtime.root(), "tool-box", new ToolBoxFactory());
+                return tx.provide(runtime.root(), TOOL, new AdvancedTool());
+            });
+
+            System.out.println("事务已提交，当前 generation = " + receipt.generation());
+        }
+    }
+}
 ```
 
 事务回调在调用线程执行校验与结构编制。如果存在配置不合法或依赖冲突，事务整体拒绝并抛出 `TransactionRejectedException`，绝不会产生部分提交的中间状态。
@@ -163,16 +254,42 @@ graph TD
 ```
 
 ```java
-// 创建子上下文
-ContextHandle usWorkspace = runtime.transact(tx ->
-        tx.childContext(runtime.root(), "us-tenant")).value();
+package com.example.demo;
 
-// 在子上下文中注册局部能力以遮蔽根能力（ContextHandle 可直接作为 provide 的目标）
-runtime.transact(tx ->
-        tx.provide(usWorkspace, CURRENCY_RATE, new UsdRateService()));
+import io.knotra.*;
 
-// 递归释放子上下文及其名下所有组件
-usWorkspace.disposeAsync().toCompletableFuture().join();
+public interface CurrencyService {
+    double getRate();
+}
+
+public class ContextShadowDemo {
+    public static final CapabilityKey<CurrencyService> CURRENCY_SERVICE =
+            CapabilityKey.of("app.currency", CurrencyService.class);
+
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+            // 根上下文注册公共汇率
+            runtime.provide(CURRENCY_SERVICE, () -> 7.0);
+
+            // 创建子上下文
+            ContextHandle usWorkspace = runtime.transact(tx ->
+                    tx.childContext(runtime.root(), "us-tenant")).value();
+
+            // 在子上下文中注册专属汇率以遮蔽根汇率
+            runtime.transact(tx ->
+                    tx.provide(usWorkspace, CURRENCY_SERVICE, () -> 1.0));
+
+            // 从根上下文读取
+            System.out.println("Root rate: " + runtime.root().view().require(CURRENCY_SERVICE).getRate()); // 7.0
+
+            // 从子上下文读取
+            System.out.println("US rate: " + usWorkspace.view().require(CURRENCY_SERVICE).getRate()); // 1.0
+
+            // 递归释放子上下文及其名下所有组件
+            usWorkspace.disposeAsync().toCompletableFuture().join();
+        }
+    }
+}
 ```
 
 ---
@@ -198,14 +315,35 @@ sequenceDiagram
 ```
 
 ```java
-// 托管同步资源
-DataSource ds = context.lifecycle().manage("db-pool", createDataSource());
+package com.example.demo;
 
-// 注册清理回调
-context.lifecycle().onClose("stop-worker", worker::shutdown);
+import io.knotra.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
-// 托管异步资源 (返回 CompletionStage)
-context.lifecycle().manageAsync("async-consumer", consumer);
+public class ResourceDemoComponent implements Component<NoConfig> {
+    @Override
+    public ComponentDescriptor descriptor() {
+        return ComponentDescriptor.empty();
+    }
+
+    @Override
+    public void start(ActivationContext context, NoConfig config) {
+        // 托管同步资源 (实现 AutoCloseable)
+        AutoCloseable connection = () -> System.out.println("关闭数据库连接");
+        context.lifecycle().manage("connection", connection);
+
+        // 注册普通清理回调 (Runnable)
+        context.lifecycle().onClose("stop-worker", () -> System.out.println("停止后台工作线程"));
+
+        // 托管异步资源 (返回 CompletionStage)
+        AsyncCloseable consumer = () -> {
+            System.out.println("开始异步排空消费者队列");
+            return CompletableFuture.completedFuture(null);
+        };
+        context.lifecycle().manageAsync("async-consumer", consumer);
+    }
+}
 ```
 
 ---
@@ -215,13 +353,34 @@ context.lifecycle().manageAsync("async-consumer", consumer);
 动态依赖在调用期间通过**调用租约（Call Lease）**保证执行安全：
 
 ```java
-DynamicCapability<PaymentGateway> gateway = context.subscribe(PAYMENT_GATEWAY);
+package com.example.demo;
 
-// 同步调用 (自动获取租约并释放)
-Receipt receipt = gateway.call(gw -> gw.charge(order));
+import io.knotra.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
-// 异步调用 (租约保持至 CompletionStage 终态)
-CompletionStage<Receipt> asyncReceipt = gateway.callAsync(gw -> gw.chargeAsync(order));
+public interface PaymentGateway {
+    String charge(String orderId);
+    CompletionStage<String> chargeAsync(String orderId);
+}
+
+public class DynamicLeaseDemo {
+    public static final CapabilityKey<PaymentGateway> PAYMENT_GATEWAY =
+            CapabilityKey.of("app.payment", PaymentGateway.class);
+
+    public void executePayment(ActivationContext context, String orderId) {
+        // 订阅动态能力
+        DynamicCapability<PaymentGateway> gateway = context.subscribe(PAYMENT_GATEWAY);
+
+        // 同步调用 (方法执行期间自动持有并释放租约)
+        String receipt = gateway.call(gw -> gw.charge(orderId));
+        System.out.println("Receipt: " + receipt);
+
+        // 异步调用 (租约保持至 CompletionStage 完成)
+        CompletionStage<String> asyncReceipt = gateway.callAsync(gw -> gw.chargeAsync(orderId));
+        asyncReceipt.thenAccept(r -> System.out.println("Async receipt: " + r));
+    }
+}
 ```
 
 当提供方被替换或下线时，系统先关闭准入闸门，等待全部在途租约归零后才执行旧实例的销毁清理，确保不会在方法执行中途拔出依赖。
@@ -243,19 +402,45 @@ graph LR
     end
 ```
 
+完整事件订阅与发布闭环：
+
 ```java
-runtime.mount("event-bus", new EventBusFactory()).requireActive();
-EventBus bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
+package com.example.demo;
 
-EventDefinition.Parallel<OrderCreatedEvent> ORDER_CREATED =
-        EventDefinition.parallel(OrderCreatedEvent.class);
+import io.knotra.*;
+import io.knotra.events.*;
+import java.util.concurrent.CompletableFuture;
 
-EventSubscription sub = bus.subscribe(ORDER_CREATED, event -> {
-    System.out.println("收到订单事件: " + event.orderId());
-    return CompletableFuture.completedFuture(null);
-});
+public record OrderCreatedEvent(String orderId, double amount) {}
 
-bus.dispatch(ORDER_CREATED, new OrderCreatedEvent("ORD-1001"));
+public class EventBusDemo {
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+
+            // 1. 挂载 EventBus 组件
+            runtime.mount("event-bus", new EventBusFactory()).requireActive();
+            EventBus bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
+
+            // 2. 声明事件契约 (Parallel 并发分发模式)
+            EventDefinition.Parallel<OrderCreatedEvent> ORDER_CREATED =
+                    EventDefinition.parallel(OrderCreatedEvent.class);
+
+            // 3. 订阅事件
+            EventSubscription sub = bus.subscribe(ORDER_CREATED, event -> {
+                System.out.println("收到订单创建事件: " + event.orderId() + ", 金额: " + event.amount());
+                return CompletableFuture.completedFuture(null);
+            });
+
+            // 4. 分发事件
+            bus.dispatch(ORDER_CREATED, new OrderCreatedEvent("ORD-1001", 99.9))
+                    .toCompletableFuture()
+                    .join();
+
+            // 5. 取消订阅
+            sub.closeAsync().toCompletableFuture().join();
+        }
+    }
+}
 ```
 
 ---
@@ -265,32 +450,68 @@ bus.dispatch(ORDER_CREATED, new OrderCreatedEvent("ORD-1001"));
 ### 加载外部插件
 
 ```java
-try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
-        Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
+package com.example.demo;
 
-    ArtifactSnapshot snapshot = adapter.loadArtifact(Path.of("plugins/custom-tool.jar"));
+import io.knotra.*;
+import io.knotra.pf4j.*;
+import java.nio.file.Path;
+import java.util.Set;
 
-    ArtifactFactoryHandle<NoConfig> toolFactory =
-            adapter.factories().resolve("custom-tool", NoConfig.class).orElseThrow();
+public class Pf4jDemo {
+    public static void main(String[] args) throws Exception {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
-    ComponentHandle<NoConfig> handle = toolFactory.mount(runtime.root(), "tool-instance");
-    handle.requireActive();
+            try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
+                    Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
 
-    adapter.unloadArtifact(snapshot.artifactId());
+                // 加载插件 JAR
+                ArtifactSnapshot snapshot = adapter.loadArtifact(Path.of("plugins/custom-tool.jar"));
+
+                // 从插件工厂目录中解析组件
+                ArtifactFactoryHandle<NoConfig> toolFactory =
+                        adapter.factories().resolve("custom-tool", NoConfig.class).orElseThrow();
+
+                // 挂载组件
+                ComponentHandle<NoConfig> handle = toolFactory.mount(runtime.root(), "tool-instance");
+                handle.requireActive();
+
+                // 卸载插件 (自动排空在途请求后卸载类加载器)
+                adapter.unloadArtifact(snapshot.artifactId());
+            }
+        }
+    }
 }
 ```
 
 ### 声明式期望树收敛（`knotra-loader`）
 
 ```java
-ComponentTree desired = ComponentTree.of(
-        ComponentEntry.of("metrics", FactoryRef.of("metrics")),
-        ComponentEntry.configured("tool", FactoryRef.of("tool", "1.0.0"), rawConfig)
-);
+package com.example.demo;
 
-try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver)) {
-    ReconcileResult result = loader.reconcile(desired);
-    result.requireConverged();
+import io.knotra.*;
+import io.knotra.loader.*;
+
+public class LoaderDemo {
+    public static void main(String[] args) {
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+
+            // 1. 构建工厂解析器 (Resolver)
+            ComponentFactoryResolver resolver = ClasspathFactoryResolver.builder()
+                    .add(FactoryRef.of("tool-box"), new ToolBoxFactory())
+                    .build();
+
+            // 2. 定义期望的组件树 (Desired ComponentTree)
+            ComponentTree desiredTree = ComponentTree.of(
+                    ComponentEntry.of("active-box", FactoryRef.of("tool-box"))
+            );
+
+            // 3. 挂载 Loader 并执行原子收敛
+            try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver)) {
+                ReconcileResult result = loader.reconcile(desiredTree);
+                result.requireConverged(); // 自动完成对比与挂载
+            }
+        }
+    }
 }
 ```
 
@@ -301,16 +522,25 @@ try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver))
 快照为不可变纯数据传输对象，可用于健康检查与监控指标采集：
 
 ```java
-RuntimeSnapshot snapshot = runtime.snapshot();
+package com.example.demo;
 
-snapshot.components().forEach(c -> {
-    System.out.printf("组件 [%s] 状态: %s, 配置代际: %d%n",
-            c.componentId(), c.state(), c.configRevision());
-});
+import io.knotra.*;
 
-snapshot.diagnostics().forEach(d -> {
-    System.out.printf("诊断码 [%s]: %s%n", d.code(), d.message());
-});
+public class SnapshotDemo {
+    public static void inspectRuntime(KnotraRuntime runtime) {
+        RuntimeSnapshot snapshot = runtime.snapshot();
+
+        snapshot.components().forEach(c -> {
+            System.out.printf("组件 [%s] 状态: %s, 运行代数: %d%n",
+                    c.componentId(), c.state(), c.generation());
+        });
+
+        snapshot.diagnostics().forEach(d -> {
+            System.out.printf("诊断码 [%s]: %s (关联路径: %s)%n",
+                    d.code(), d.message(), d.path());
+        });
+    }
+}
 ```
 
 ---
@@ -320,12 +550,28 @@ snapshot.diagnostics().forEach(d -> {
 推荐采用从外向内的逆序释放流程：
 
 ```java
-// 停止 Loader 期望树调度
-loader.closeAsync().toCompletableFuture().join();
+package com.example.demo;
 
-// 排空并卸载所有 PF4J 插件
-plugins.closeAsync().toCompletableFuture().join();
+import io.knotra.*;
+import io.knotra.loader.KnotraLoader;
+import io.knotra.pf4j.Pf4jArtifactAdapter;
 
-// 关闭核心运行时及残留组件
-runtime.closeAsync().toCompletableFuture().join();
+public class ShutdownDemo {
+    public static void shutdown(KnotraLoader loader, Pf4jArtifactAdapter plugins, KnotraRuntime runtime) {
+        // 1. 停止 Loader 期望树调度
+        if (loader != null) {
+            loader.closeAsync().toCompletableFuture().join();
+        }
+
+        // 2. 排空并卸载所有 PF4J 插件
+        if (plugins != null) {
+            plugins.closeAsync().toCompletableFuture().join();
+        }
+
+        // 3. 关闭核心运行时及残留组件
+        if (runtime != null) {
+            runtime.closeAsync().toCompletableFuture().join();
+        }
+    }
+}
 ```

@@ -34,13 +34,16 @@ package com.acme.logistics.contract;
 import io.knotra.CapabilityKey;
 import java.util.concurrent.CompletionStage;
 
+// 核心路由规划能力契约
 public interface RoutePlanner {
     CompletionStage<Route> plan(Parcel parcel);
 }
 
+// 业务数据模型
 public record Parcel(String id, String destination, double weightKg) {}
 public record Route(String carrier, String serviceLevel, double estimatedCost) {}
 
+// 契约常量
 public final class LogisticsContracts {
     public static final CapabilityKey<RoutePlanner> ROUTE_PLANNER =
             CapabilityKey.of("logistics.route-planner", RoutePlanner.class);
@@ -62,7 +65,7 @@ import io.knotra.beans.BeanDefinition;
 import io.knotra.NoConfig;
 
 public final class ParcelDispatcher implements AutoCloseable {
-    private final RoutePlanner routePlanner;
+    private final RoutePlanner routePlanner; // 注入动态代理
 
     public ParcelDispatcher(RoutePlanner routePlanner) {
         this.routePlanner = routePlanner;
@@ -78,27 +81,47 @@ public final class ParcelDispatcher implements AutoCloseable {
 
     @Override
     public void close() {
-        System.out.println("分发器已安全停止。");
+        System.out.println("分发器已安全停止接单。");
     }
 }
 ```
 
-装配分发器组件：
+装配分发器工厂：
 
 ```java
-BeanDefinition<NoConfig, ParcelDispatcher> dispatcherDef = Beans.component("dispatcher")
-        .with(Beans.dynamicProxyRequired(LogisticsContracts.ROUTE_PLANNER))
-        .create(ParcelDispatcher::new)
-        .build();
+package com.acme.logistics.core;
+
+import com.acme.logistics.contract.LogisticsContracts;
+import io.knotra.NoConfig;
+import io.knotra.beans.BeanDefinition;
+import io.knotra.beans.Beans;
+
+public final class LogisticsAssembly {
+    public static BeanDefinition<NoConfig, ParcelDispatcher> createDispatcherDefinition() {
+        return Beans.component("dispatcher")
+                // 声明动态代理依赖：Provider 替换时消费方不重启
+                .with(Beans.dynamicProxyRequired(LogisticsContracts.ROUTE_PLANNER))
+                .create(ParcelDispatcher::new)
+                .build();
+    }
+}
 ```
 
 ---
 
 ## 规则插件开发（PF4J）
 
-### 基础路由插件实现
+### 基础路由插件实现（V1）
 
 ```java
+package com.acme.logistics.plugin.v1;
+
+import com.acme.logistics.contract.Parcel;
+import com.acme.logistics.contract.Route;
+import com.acme.logistics.contract.RoutePlanner;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+
 public final class StandardRoutePlanner implements RoutePlanner {
     @Override
     public CompletionStage<Route> plan(Parcel parcel) {
@@ -108,9 +131,17 @@ public final class StandardRoutePlanner implements RoutePlanner {
 }
 ```
 
-### 智能路由插件升级版
+### 智能路由插件升级版（V2）
 
 ```java
+package com.acme.logistics.plugin.v2;
+
+import com.acme.logistics.contract.Parcel;
+import com.acme.logistics.contract.Route;
+import com.acme.logistics.contract.RoutePlanner;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+
 public final class SmartRoutePlanner implements RoutePlanner {
     @Override
     public CompletionStage<Route> plan(Parcel parcel) {
@@ -130,6 +161,11 @@ public final class SmartRoutePlanner implements RoutePlanner {
 ## 宿主热升级与排空演练
 
 ```java
+package com.acme.logistics.host;
+
+import com.acme.logistics.contract.*;
+import com.acme.logistics.core.LogisticsAssembly;
+import com.acme.logistics.core.ParcelDispatcher;
 import io.knotra.*;
 import io.knotra.beans.Beans;
 import io.knotra.pf4j.*;
@@ -140,14 +176,15 @@ public class LogisticsSystemDemo {
     public static void main(String[] args) throws Exception {
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
-            // 挂载消费分发器
-            ComponentHandle<NoConfig> dispatcher = Beans.mount(runtime, dispatcherDef);
-            dispatcher.requireActive();
+            // 1. 挂载消费分发器组件
+            ComponentHandle<NoConfig> dispatcherHandle = Beans.mount(
+                    runtime, LogisticsAssembly.createDispatcherDefinition());
+            dispatcherHandle.requireActive();
 
             try (Pf4jArtifactAdapter plugins = Pf4jArtifactAdapter.create(
                     Path.of("plugins"), runtime, Set.of("com.acme.logistics.contract"))) {
 
-                // 加载并启用 V1 插件
+                // 2. 加载并启用 V1 插件
                 ArtifactSnapshot v1 = plugins.loadArtifact(Path.of("plugins/route-v1.jar"));
 
                 ComponentHandle<NoConfig> routeHandle = plugins.factories()
@@ -158,7 +195,7 @@ public class LogisticsSystemDemo {
                 Parcel p1 = new Parcel("PKG-001", "北京", 25.0);
                 runtime.root().view().require(LogisticsContracts.ROUTE_PLANNER).plan(p1);
 
-                // 热升级为 V2 插件
+                // 3. 热升级为 V2 插件
                 ArtifactSnapshot v2 = plugins.loadArtifact(Path.of("plugins/route-v2.jar"));
 
                 // 卸载 V1 (自动排空在途请求后释放类加载器)
@@ -169,7 +206,7 @@ public class LogisticsSystemDemo {
                         .resolve("shanghai-smart-router", NoConfig.class).orElseThrow()
                         .mount(runtime.root(), "active-router");
 
-                // 发送新包裹，自动路由至 V2
+                // 4. 发送新包裹，自动路由至 V2
                 Parcel p2 = new Parcel("PKG-002", "北京", 25.0);
                 runtime.root().view().require(LogisticsContracts.ROUTE_PLANNER).plan(p2);
             }

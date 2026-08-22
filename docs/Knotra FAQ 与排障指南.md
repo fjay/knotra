@@ -9,21 +9,29 @@
 系统发生异常时，首先采集不可变运行时快照并定位非正常状态组件：
 
 ```java
-RuntimeSnapshot snapshot = runtime.snapshot();
+package com.example.troubleshoot;
 
-// 打印所有异常诊断码与目标
-snapshot.diagnostics().forEach(diag -> {
-    System.err.printf("[告警] 错误码: %s, 目标: %s, 说明: %s%n",
-            diag.code(), diag.targetId(), diag.message());
-});
+import io.knotra.*;
 
-// 过滤处于异常或过渡状态的组件
-snapshot.components().stream()
-        .filter(c -> c.state() != ComponentState.ACTIVE)
-        .forEach(c -> {
-            System.err.printf("[异常组件] ID: %s, 当前状态: %s, 目标: %s%n",
-                    c.componentId(), c.state(), c.goal());
+public class DiagnosticHelper {
+    public static void printDiagnostics(KnotraRuntime runtime) {
+        RuntimeSnapshot snapshot = runtime.snapshot();
+
+        // 打印所有异常诊断码
+        snapshot.diagnostics().forEach(diag -> {
+            System.err.printf("[告警] 错误码: %s, 说明: %s, 关联路径: %s%n",
+                    diag.code(), diag.message(), diag.path());
         });
+
+        // 过滤处于异常或过渡状态的组件
+        snapshot.components().stream()
+                .filter(c -> c.state() != ComponentState.ACTIVE)
+                .forEach(c -> {
+                    System.err.printf("[异常组件] ID: %s, 当前状态: %s, 目标: %s%n",
+                            c.componentId(), c.state(), c.goal());
+                });
+    }
+}
 ```
 
 ---
@@ -74,21 +82,33 @@ stateDiagram-v2
 
 ### 组件挂载后保持 WAITING 状态
 
-检查快照中该组件声明的依赖项（声明内容，不含实时满足状态）：
+检查快照中未就绪的依赖项：
 
 ```java
-ComponentSnapshot comp = snapshot.components().get(0);
-comp.requirements().forEach(req -> {
-    System.out.printf("依赖 [%s], 类型: %s, 模式: %s, 绑定: %s%n",
-            req.capability().name(), req.capability().typeName(),
-            req.mode(), req.binding());
-});
+package com.example.troubleshoot;
 
-// 缺失的必需能力由 MISSING_CAPABILITY 诊断报告，targetId 为组件 handleId
-snapshot.diagnostics().stream()
-        .filter(diag -> diag.code() == DiagnosticCode.MISSING_CAPABILITY
-                && diag.targetId().equals(comp.handleId()))
-        .forEach(diag -> System.out.println("缺失能力: " + diag.message()));
+import io.knotra.*;
+
+public class WaitingComponentInspector {
+    public static void inspect(KnotraRuntime runtime) {
+        RuntimeSnapshot snapshot = runtime.snapshot();
+        if (snapshot.components().isEmpty()) {
+            return;
+        }
+
+        ComponentSnapshot comp = snapshot.components().get(0);
+        comp.requirements().forEach(req -> {
+            System.out.printf("依赖 [%s], 模式: %s, 是否已绑定: %s%n",
+                    req.capability().name(), req.mode(), req.binding());
+        });
+
+        // 查找缺失能力诊断
+        snapshot.diagnostics().stream()
+                .filter(diag -> diag.code() == DiagnosticCode.MISSING_CAPABILITY
+                        && diag.targetId().equals(comp.handleId()))
+                .forEach(diag -> System.out.println("缺失能力: " + diag.message()));
+    }
+}
 ```
 
 常见原因：
@@ -103,13 +123,30 @@ snapshot.diagnostics().stream()
 `replace()` 的事务提交是同步的，但下游依赖方组件的重载由内核虚拟线程异步驱动。需要同步确认下游就绪时，必须等待收敛 Future：
 
 ```java
-Provided<Greeting> v2 = greeting.replace(new AdvancedGreeting());
+package com.example.troubleshoot;
 
-// 等待下游所有受影响组件重载收敛完毕
-v2.whenSettled().toCompletableFuture().join();
+import io.knotra.*;
+import io.knotra.beans.Beans;
 
-// 断言组件已达到 ACTIVE
-greeterHandle.requireActive();
+public class ReplaceWaitDemo {
+    public interface Greeting {
+        String greet(String name);
+    }
+
+    public static final CapabilityKey<Greeting> GREETING =
+            CapabilityKey.of("app.greeting", Greeting.class);
+
+    public static void replaceAndWait(KnotraRuntime runtime, ComponentHandle<NoConfig> greeterHandle, Provided<Greeting> greeting) {
+        // 原子替换并获取新句柄
+        Provided<Greeting> v2 = greeting.replace(name -> "v2: " + name);
+
+        // 等待下游所有受影响组件重载收敛完毕
+        v2.whenSettled().toCompletableFuture().join();
+
+        // 断言消费方组件已成功达到 ACTIVE 状态
+        greeterHandle.requireActive();
+    }
+}
 ```
 
 ---
@@ -124,11 +161,30 @@ greeterHandle.requireActive();
 动态代理允许服务临时缺失，业务侧应做容错降级：
 
 ```java
-try {
-    paymentProxy.pay(order);
-} catch (CapabilityUnavailableException e) {
-    // 降级处理：如写入重试队列或返回降级结果
-    fallbackQueue.enqueue(order);
+package com.example.troubleshoot;
+
+import io.knotra.CapabilityUnavailableException;
+
+public interface PaymentGateway {
+    String pay(String orderId);
+}
+
+public class PaymentServiceWithFallback {
+    private final PaymentGateway paymentProxy;
+
+    public PaymentServiceWithFallback(PaymentGateway paymentProxy) {
+        this.paymentProxy = paymentProxy;
+    }
+
+    public String checkout(String orderId) {
+        try {
+            return paymentProxy.pay(orderId);
+        } catch (CapabilityUnavailableException e) {
+            // 降级处理：如写入重试队列或返回降级状态
+            System.err.println("支付通道正在热切换中，进入重试队列: " + e.getMessage());
+            return "PENDING_RETRY";
+        }
+    }
 }
 ```
 
@@ -139,11 +195,24 @@ try {
 系统遵循保留现场原则，清理失败不会伪造成功，也不会重复释放已成功的资源。修复故障后直接发起重试：
 
 ```java
-handle.retryAsync()
-        .toCompletableFuture()
-        .join();
+package com.example.troubleshoot;
 
-System.out.println("重试后状态: " + handle.state());
+import io.knotra.ComponentHandle;
+import io.knotra.ComponentState;
+import io.knotra.NoConfig;
+
+public class RetryRecoveryDemo {
+    public static void recoverComponent(ComponentHandle<NoConfig> handle) {
+        if (handle.state() == ComponentState.FAILED) {
+            // 触发幂等重试
+            handle.retryAsync()
+                    .toCompletableFuture()
+                    .join();
+
+            System.out.println("重试后组件状态: " + handle.state());
+        }
+    }
+}
 ```
 
 ---

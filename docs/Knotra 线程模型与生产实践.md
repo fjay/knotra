@@ -75,23 +75,36 @@ Knotra 在执行组件 `start()`、EventBus 监听器、Spring 子容器启动�
 在应用停机或接收到终止信号时，推荐遵循标准的异步等待流程：
 
 ```java
-public void shutdownGracefully() {
-    try {
-        if (loader != null) {
-            loader.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
-        }
+package com.example.ops;
 
-        if (plugins != null) {
-            plugins.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
-        }
+import io.knotra.KnotraRuntime;
+import io.knotra.loader.KnotraLoader;
+import io.knotra.pf4j.Pf4jArtifactAdapter;
+import java.util.concurrent.TimeUnit;
 
-        if (runtime != null) {
-            runtime.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
-        }
+public class ProductionShutdownManager {
 
-        System.out.println("Knotra 运行时已安全退出。");
-    } catch (Exception e) {
-        System.err.println("优雅停机过程中发生异常，保留现场并记录快照。");
+    public static void shutdownGracefully(KnotraLoader loader, Pf4jArtifactAdapter plugins, KnotraRuntime runtime) {
+        try {
+            // 1. 关闭 Loader（停止接收新的期望配置）
+            if (loader != null) {
+                loader.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
+            }
+
+            // 2. 关闭 PF4J 插件适配器（排空在途请求并卸载插件）
+            if (plugins != null) {
+                plugins.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
+            }
+
+            // 3. 关闭 Knotra Runtime（清理核心 Context 与所有残留组件）
+            if (runtime != null) {
+                runtime.closeAsync().toCompletableFuture().get(30, TimeUnit.SECONDS);
+            }
+
+            System.out.println("Knotra 运行时已安全退出。");
+        } catch (Exception e) {
+            System.err.println("优雅停机过程中发生异常: " + e.getMessage());
+        }
     }
 }
 ```
@@ -103,21 +116,44 @@ public void shutdownGracefully() {
 Knotra 的 `RuntimeSnapshot` 为纯数据结构，可安全集成至 Prometheus 或 Micrometer 监控体系：
 
 ```java
-public void collectMetrics(MeterRegistry registry) {
-    RuntimeSnapshot snapshot = runtime.snapshot();
+package com.example.ops;
 
-    long activeCount = snapshot.components().stream()
-            .filter(c -> c.state() == ComponentState.ACTIVE).count();
-    long waitingCount = snapshot.components().stream()
-            .filter(c -> c.state() == ComponentState.WAITING).count();
-    long failedCount = snapshot.components().stream()
-            .filter(c -> c.state() == ComponentState.FAILED).count();
+import io.knotra.ComponentState;
+import io.knotra.KnotraRuntime;
+import io.knotra.RuntimeSnapshot;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 
-    Gauge.builder("knotra.components.active", () -> activeCount).register(registry);
-    Gauge.builder("knotra.components.waiting", () -> waitingCount).register(registry);
-    Gauge.builder("knotra.components.failed", () -> failedCount).register(registry);
+public class KnotraMetricsCollector {
 
-    Gauge.builder("knotra.diagnostics.count", () -> snapshot.diagnostics().size())
-            .register(registry);
+    public static void bindMetrics(KnotraRuntime runtime, MeterRegistry registry) {
+        // 统计活跃组件数
+        Gauge.builder("knotra.components.active", () -> {
+            RuntimeSnapshot snapshot = runtime.snapshot();
+            return snapshot.components().stream()
+                    .filter(c -> c.state() == ComponentState.ACTIVE)
+                    .count();
+        }).register(registry);
+
+        // 统计等待中组件数
+        Gauge.builder("knotra.components.waiting", () -> {
+            RuntimeSnapshot snapshot = runtime.snapshot();
+            return snapshot.components().stream()
+                    .filter(c -> c.state() == ComponentState.WAITING)
+                    .count();
+        }).register(registry);
+
+        // 统计失败组件数
+        Gauge.builder("knotra.components.failed", () -> {
+            RuntimeSnapshot snapshot = runtime.snapshot();
+            return snapshot.components().stream()
+                    .filter(c -> c.state() == ComponentState.FAILED)
+                    .count();
+        }).register(registry);
+
+        // 统计诊断告警数
+        Gauge.builder("knotra.diagnostics.count", () -> runtime.snapshot().diagnostics().size())
+                .register(registry);
+    }
 }
 ```
