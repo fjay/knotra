@@ -1,24 +1,23 @@
 # Knotra FAQ 与排障指南
 
-> **面向读者**：当您的组件卡在某个状态（如 `WAITING` 或 `FAILED`）、调用报错或插件卸载遇到问题时，本文提供“症状 ➔ 原因 ➔ 解决方案”的快速排查路径。
+> 面向运维与开发排障，提供针对组件卡顿、调用异常与类加载器泄漏的标准化处置路径。
 
 ---
 
-## 排障速查与快速定位
+## 排查入口与观察方法
 
-遇到任何异常情况，建议**打印运行时快照（Snapshot）**：
+系统发生异常时，首先采集不可变运行时快照并定位非正常状态组件：
 
 ```java
-// 获取当前系统快照
 RuntimeSnapshot snapshot = runtime.snapshot();
 
-// 检查是否存在错误诊断码 (Diagnostics)
+// 打印所有异常诊断码
 snapshot.diagnostics().forEach(diag -> {
     System.err.printf("[告警] 错误码: %s, 说明: %s, 关联路径: %s%n",
             diag.code(), diag.message(), diag.path());
 });
 
-// 检查哪些组件处于非 ACTIVE 状态
+// 过滤处于异常或过渡状态的组件
 snapshot.components().stream()
         .filter(c -> c.state() != ComponentState.ACTIVE)
         .forEach(c -> {
@@ -29,9 +28,9 @@ snapshot.components().stream()
 
 ---
 
-## 状态机速查表
+## 状态机速查
 
-### 组件状态（ComponentState）
+### 组件状态流转
 
 ```mermaid
 stateDiagram-v2
@@ -47,115 +46,107 @@ stateDiagram-v2
     FAILED --> DISPOSED : 销毁
 ```
 
-| 状态 | 通俗含义 | 常见原因 | 对应处理措施 |
+| 组件状态 | 状态语义 | 产生原因 | 应对措施 |
 |---|---|---|---|
-| **`WAITING`** | **在原地等候**（尚未启动） | 缺少必需依赖（`REQUIRED` 未满足）、存在依赖环、或配置不满足条件。 | 检查缺少哪个 `CapabilityKey`，调用 `runtime.provide()` 提供它。 |
-| **`STARTING`** | **正在启动中** | `start()` 逻辑耗时较长，或子组件正在启动。 | 检查 `start()` 中是否有长阻塞操作。 |
-| **`ACTIVE`** | **正常运行中** | 状态健康，正常提供服务。 | 无需处理。 |
-| **`STOPPING`** | **正在优雅停止** | 正在等待在途请求排空（Drain），或正在执行异步清理。 | 等待排空完成，或检查是否有未释放的连接阻塞。 |
-| **`FAILED`** | **启动/清理失败** | 业务初始化抛错，或 `close()` 清理时发生异常。现场已保留。 | 查看快照诊断信息，修复后调用 `handle.retryAsync()`。 |
-| **`DISPOSED`** | **已彻底销毁** | 终态，组件已从运行时完全卸载。 | 无。 |
+| **`WAITING`** | 等待依赖 | 必需依赖（REQUIRED）缺失、存在依赖环或配置不满足。 | 确认缺少的能力契约并发布对应提供方。 |
+| **`STARTING`** | 启动中 | 组件 `start()` 逻辑执行耗时或子挂载尚未就绪。 | 检查 `start()` 中是否存在长时间阻塞调用。 |
+| **`ACTIVE`** | 正常运行 | 组件启动成功且对外提供能力。 | 正常状态。 |
+| **`STOPPING`** | 正在停止 | 正在等待在途动态调用租约归零或异步清理未完成。 | 等待任务排空，或排查是否存在卡死连接。 |
+| **`FAILED`** | 失败保留 | 启动抛出异常或清理钩子执行失败。 | 查阅诊断原因，修复后调用 `retryAsync()`。 |
+| **`DISPOSED`** | 已销毁 | 组件及其名下资源已彻底卸载。 | 终态，无需处理。 |
 
 ---
 
-## 常见诊断码与解决方案
+## 常见诊断码与处置方案
 
-| 诊断码 (Enum) | 触发原因 (为什么报错) | 解决办法 (怎么修) |
+| 诊断码 (Enum) | 触发根因 | 处置措施 |
 |---|---|---|
-| **`MISSING_CAPABILITY`** | 组件声明了必需依赖（`required`），但当前 Context 树中找不到对应的 Provider。 | - 确认该依赖是否已通过 `runtime.provide()` 发布；<br/>- 确认 Key 的名称字符串和 `Class<T>` 是否完全一致。 |
-| **`BINDING_CYCLE`** | 组件之间存在循环依赖（例如 A 依赖 B，B 也依赖 A）。 | 调整架构，打破循环依赖，或将其中一方改为无状态的 `dynamicProxy` 动态依赖。 |
-| **`INVALID_CONFIG`** | 类型化配置对象为 `null`，或配置校验器（`normalizer`）抛出了校验异常。 | 检查传入的 Config 对象是否合法，确保 normalizer 返回非 null 的规范配置。 |
-| **`ACTIVATION_FAILED`** | 组件的 `start()` 方法或构造函数抛出了异常。 | 查看异常堆栈，修复业务代码错误后调用 `handle.retryAsync()` 重新激活。 |
-| **`CLEANUP_FAILED`** | 组件销毁时，某个已登记的清理钩子（如 `close()`）抛出了异常。 | 检查资源释放逻辑是否幂等；修复后调用 `handle.retryAsync()` 会自动重试失败的清理条目。 |
-| **`CAPABILITY_SLOT_OCCUPIED`** | 同一个 Context 内尝试重复注册相同名称的 Capability。 | 检查是否重复调用了 `provide()`；若想替换，请使用 `Provided.replace()`。 |
+| **`MISSING_CAPABILITY`** | 必需依赖未满足，当前上下文中找不到对应提供方。 | 检查该能力是否已通过 `provide` 发布，核对 Key 的名称与 Class 对象是否一致。 |
+| **`BINDING_CYCLE`** | 组件间存在循环依赖路径。 | 重构解耦，打破环路，或将其中一方调整为动态代理依赖。 |
+| **`INVALID_CONFIG`** | 类型化配置对象为 null 或配置校验器（normalizer）抛出校验异常。 | 检查传入的 Config 对象格式，修正 normalizer 规则。 |
+| **`ACTIVATION_FAILED`** | 组件的 `start()` 方法或构造函数执行时抛出异常。 | 查看异常根因并修复业务代码，随后调用 `handle.retryAsync()`。 |
+| **`CLEANUP_FAILED`** | 组件销毁时已登记的清理钩子抛出异常。 | 确保清理逻辑具备幂等性；修复后调用 `handle.retryAsync()` 重新执行失败条目。 |
+| **`CAPABILITY_SLOT_OCCUPIED`** | 同一个上下文内尝试重复发布同名能力。 | 避免重复调用 `provide()`；如需替换，使用 `Provided.replace()`。 |
 
 ---
 
-## 高频疑难问题解答（FAQ）
+## 常见场景排查
 
-### 为什么组件挂载后，一直是 `WAITING` 状态？
+### 组件挂载后保持 WAITING 状态
 
-**诊断方法**：
-检查快照中的 `requirements`：
+检查快照中未就绪的依赖项：
+
 ```java
 ComponentSnapshot comp = snapshot.components().get(0);
 comp.requirements().forEach(req -> {
-    System.out.printf("依赖 [%s], 类型: %s, 是否满足: %s%n",
+    System.out.printf("依赖 [%s], 类型: %s, 是否就绪: %s%n",
             req.key().name(), req.kind(), req.satisfied());
 });
 ```
 
-**可能原因**：
-- **依赖未发布**：该组件声明了 `Beans.required(KEY)`，但还没有任何地方调用 `runtime.provide(KEY, ...)`。
-- **Key 类型不匹配**：名称虽然一样，但宿主使用的是 `ClassA.class`，插件使用的是 `ClassB.class`（常见于 ClassLoader 隔离问题）。
-- **父子 Context 隔离**：子 Context 中的组件无法访问平级或子级 Context 中的注册，只能访问自己及祖先 Context 的注册。
+常见原因：
+- **依赖未发布**：组件声明了 `Beans.required(KEY)`，但环境中尚未存在对应的 `runtime.provide(KEY, ...)`。
+- **类加载器隔离导致类型不匹配**：虽然 Key 名称相同，但宿主与插件分别由不同 ClassLoader 加载了同名接口 Class。
+- **上下文层级隔离**：子上下文中的组件无法访问平级或子级上下文中的注册。
 
 ---
 
-### 调用 `Provided.replace()` 替换服务后，为什么下游没有立即生效？
+### 调用 replace 后下游组件未立即生效
 
-**解答**：
-- `replace()` 自身的**事务提交是同步的**（立即返回新的 `Provided<T>` 句柄）；
-- 但下游依赖该服务的消费方组件的**重载与收敛是异步虚拟线程执行的**（为了防止阻塞当前线程）。
+`replace()` 的事务提交是同步的，但下游依赖方组件的重载由内核虚拟线程异步驱动。需要同步确认下游就绪时，必须等待收敛 Future：
 
-**正确写法**：
-如果您的代码需要同步确认所有下游组件已经就绪，请等待收敛 Future：
 ```java
 Provided<Greeting> v2 = greeting.replace(new AdvancedGreeting());
 
-// 等待依赖收敛全部完成
+// 等待下游所有受影响组件重载收敛完毕
 v2.whenSettled().toCompletableFuture().join();
 
-// 确保下游组件已达到 ACTIVE
+// 断言组件已达到 ACTIVE
 greeterHandle.requireActive();
 ```
 
 ---
 
-### 为什么动态代理（Dynamic Proxy）调用抛出 `CapabilityUnavailableException`？
+### 动态代理调用抛出 CapabilityUnavailableException
 
-**可能原因**：
-- **当前没有任何 Provider**：该动态依赖未配置 Provider，或者旧 Provider 刚刚被撤销且尚未发布新 Provider。
-- **Provider 正在优雅停机中**：旧 Provider 已进入 `DRAINING` 状态，不再接受新请求。
+产生原因：
+- 目标能力当前没有任何可用的提供方（提供方已被撤销或尚未发布）。
+- 旧提供方已进入停机排空阶段（DRAINING），不再接受新请求。
 
-**正确处理模式**：
-动态依赖允许临时缺失，业务代码中建议对临时不可用做降级处理：
+处理模式：
+动态代理允许服务临时缺失，业务侧应做容错降级：
+
 ```java
 try {
     paymentProxy.pay(order);
 } catch (CapabilityUnavailableException e) {
-    // 降级处理：如写入重试队列，或返回“支付渠道正在升级中”
+    // 降级处理：如写入重试队列或返回降级结果
     fallbackQueue.enqueue(order);
 }
 ```
 
 ---
 
-### 组件清理失败变成 `FAILED` 状态，如何恢复？
+### 组件进入 FAILED 状态后的恢复
 
-**解答**：
-Knotra 遵循**“故障不吞没、现场全保留”**原则。当清理失败时，不会伪造成功，而是将状态置为 `FAILED`，成功释放的资源不会被重复释放。
+系统遵循保留现场原则，清理失败不会伪造成功，也不会重复释放已成功的资源。修复故障后直接发起重试：
 
-**恢复操作**：
 ```java
-// 显式触发重试，Knotra 会精准重试此前失败的那一条清理动作
 handle.retryAsync()
         .toCompletableFuture()
         .join();
 
-// 确认重试后进入 DISPOSED 或 ACTIVE
 System.out.println("重试后状态: " + handle.state());
 ```
 
 ---
 
-### 卸载 PF4J 插件后，Metaspace 内存没有下降，怀疑 ClassLoader 泄漏，怎么排查？
+### 卸载插件后 Metaspace 内存未释放的排查
 
-**排查清单**：
-- **静态变量引用**：宿主代码中是否有 `static List` 或静态缓存持有了插件中加载的对象？
-- **线程未终止**：插件内部是否自行创建了非守护线程（`new Thread()` 或 `ExecutorService`）且没有在 `close()` 中关闭？
-- **ThreadLocal 泄漏**：插件线程是否设置了 `ThreadLocal` 且未调用 `.remove()`？
-- **第三方框架缓存**：如 Jackson、Log4j 等全局缓存了插件的 Class 对象。
+检查清单：
+- **静态集合持有引用**：宿主代码中是否存在 `static Map` 或静态缓存持有了插件中加载的对象或 Class。
+- **后台线程未终止**：插件内部创建的线程池未在 `LifecycleScope` 中登记 `shutdown()`。
+- **ThreadLocal 未清理**：插件线程在使用完毕后未显式调用 `remove()`。
+- **第三方框架全局缓存**：JSON 序列化库或日志框架缓存了插件 Class。
 
-> **Knotra 的安全保证**：
-> Knotra 自身的 `Snapshot`、`ComponentHandle`、`Diagnostic` 均采用纯元数据设计，**绝对不会持有插件的 Class 或 ClassLoader 引用**。只要插件自身规范清理了线程与引用，插件 ClassLoader 会在卸载后被 JVM 垃圾回收（GC）。
+Knotra 的 `Snapshot`、`ComponentHandle` 与 `Diagnostic` 均为纯元数据结构，不持有任何插件 Class 或 ClassLoader 强引用。规范清理业务线程与引用后，插件类加载器可被垃圾回收。

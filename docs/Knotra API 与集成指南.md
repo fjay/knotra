@@ -1,30 +1,30 @@
 # Knotra API 与集成指南
 
-> **面向读者**：本文系统性介绍 Knotra `0.1.0-SNAPSHOT` 的核心架构、核心 API 契约与各扩展模块（Events、PF4J、Loader）。适合希望深入理解 Knotra 运行机制、或需要基于 Core API 进行底层定制与扩展的开发者。
+> 面向核心框架集成与底层扩展开发者，系统阐述 Knotra 的公共 API 契约、事务机制、依赖传播与扩展模块。
 
 ---
 
-## Knotra Core 架构全景
+## 内核架构全景
 
-Knotra 的核心目标是：**在 JVM 运行期间安全管理组件的替换、依赖重连与资源回收**。其核心分层模型如下：
+Knotra 的核心职责是在 JVM 运行期间安全调度组件的替换、依赖重建与资源回收。系统由三层核心结构组成：
 
 ```mermaid
 graph TB
     subgraph knotra_runtime ["KnotraRuntime 运行时"]
         direction TB
         RootContext["Root Context 根可见域"]
-        ChildContext["Child Context 子可见域/租户"]
+        ChildContext["Child Context 子可见域/租户隔离"]
         RootContext --> ChildContext
 
         subgraph sub_comp ["组件与挂载"]
             Handle["ComponentHandle 固定挂载点"]
             Activation["Activation 运行代际实例"]
-            Scope["LifecycleScope LIFO 资源清单"]
+            Scope["LifecycleScope 资源作用域 (LIFO)"]
             Handle --> Activation
             Activation --> Scope
         end
 
-        subgraph sub_cap ["能力与依赖"]
+        subgraph sub_cap ["能力与契约"]
             CapKey["CapabilityKey 服务契约"]
             Reg["Registration 服务提供记录"]
             CapKey --> Reg
@@ -32,44 +32,42 @@ graph TB
     end
 ```
 
-### 核心三层概念
-- **Context（上下文可见域）**：管理服务的可见范围。子 Context 能直接访问父 Context 的服务，也能注册同名服务来**遮蔽（Shadow）**父级服务。
-- **Capability（能力/服务契约）**：由 `(名称, Java Class)` 唯一定义。通过 `runtime.provide()` 发布，组件通过声明 Requirement 消费。
-- **Component 与 Activation（组件外壳与代际实例）**：
-  - `ComponentHandle` 是长期稳定的逻辑插座；
-  - `Activation` 是某一次运行的具体实例，拥有独立的依赖绑定集（BindingSet）和资源清单（LifecycleScope）。
+- **上下文（Context）**：管理能力可见范围的树状层级。子上下文可以继承父上下文的能力，也可以注册同名能力以实现租户级或环境级遮蔽（Shadowing）。
+- **能力（Capability）**：由唯一字符串名称与精确 Java `Class<T>` 唯一定义的服务契约。通过 `provide` 发布，通过 Requirement 声明消费。
+- **组件与代际（Component & Activation）**：
+  - `ComponentHandle` 是长期稳定的逻辑挂载句柄；
+  - `Activation` 是某一次运行的具体物理实例，持有独立的依赖绑定集（BindingSet）和资源作用域（LifecycleScope）。
 
 ---
 
-## 最小 Core 运行闭环
+## 核心运行闭环
 
-### 创建运行时与定义服务契约
+创建运行时、发布服务并处理热替换：
 
 ```java
 import io.knotra.*;
 
-// 创建 Runtime（可配置最大收敛迭代次数等）
 try (KnotraRuntime runtime = KnotraRuntime.create()) {
 
     // 定义服务契约 Key
     CapabilityKey<Tool> TOOL = CapabilityKey.of("app.tool", Tool.class);
 
-    // 发布 Provider 实现，获得类型化句柄 Provided<Tool>
+    // 发布初始服务实现并获得类型化句柄
     Provided<Tool> toolProvided = runtime.provide(TOOL, new DefaultTool());
 
-    // 在需要时热替换 Provider
+    // 运行时原子替换提供方
     Provided<Tool> v2 = toolProvided.replace(new AdvancedTool());
-    v2.whenSettled().toCompletableFuture().join(); // 等待收敛完成
+    v2.whenSettled().toCompletableFuture().join();
 }
 ```
 
+`runtime.provide` 同步提交注册并返回不可变的 `Provided<T>` 句柄。调用 `replace` 会在单个结构事务内撤销旧注册并发布新注册，返回新的 `Provided<T>` 句柄，旧句柄随之失效。
+
 ---
 
-## 组件与依赖绑定
+## 原生组件与依赖绑定
 
-### 手写原生 ComponentFactory
-
-通常推荐使用 `knotra-beans` DSL，但在底层，所有组件都实现为 `ComponentFactory`：
+底层组件均通过实现 `ComponentFactory` 接口对外交付：
 
 ```java
 public final class ToolBoxFactory implements ComponentFactory<NoConfig> {
@@ -78,20 +76,19 @@ public final class ToolBoxFactory implements ComponentFactory<NoConfig> {
         return new Component<>() {
             @Override
             public ComponentDescriptor descriptor() {
-                // 声明所需依赖
                 return ComponentDescriptor.of(
                         CapabilityRequirement.required(TOOL));
             }
 
             @Override
             public void start(ActivationContext context, NoConfig config) throws Exception {
-                // 获取依赖
+                // 读取本代固定依赖
                 Tool tool = context.require(TOOL);
 
-                // 登记资源清理钩子 (LIFO)
+                // 登记资源清理动作 (LIFO 释放)
                 context.lifecycle().onClose("cleanup", () -> System.out.println("释放工具箱资源"));
 
-                // 发布自身能力
+                // 对外发布组件能力
                 context.provide(BOX, new ToolBox(tool));
             }
         };
@@ -99,70 +96,65 @@ public final class ToolBoxFactory implements ComponentFactory<NoConfig> {
 }
 ```
 
-挂载组件：
+挂载组件并等待就绪：
+
 ```java
 ComponentHandle<NoConfig> boxHandle = runtime.mount("tool-box", new ToolBoxFactory());
-boxHandle.requireActive(); // 阻塞等待直到组件成功进入 ACTIVE 状态
+boxHandle.requireActive();
 ```
 
 ---
 
-### 两种依赖绑定模式对比
+## 依赖绑定模式对比
 
 ```mermaid
 graph TD
     subgraph mode_pinned ["PINNED 绑定模式 (默认)"]
-        P1["依赖 Provider 发生变更"] --> P2["销毁旧 Activation (清理资源)"]
-        P2 --> P3["注入新 Provider，创建新 Activation"]
-        P3 --> P4["消费方组件整机重载"]
+        P1["依赖提供方被替换"] --> P2["销毁旧 Activation 并释放资源"]
+        P2 --> P3["按新依赖重新执行 start()"]
+        P3 --> P4["消费方组件完成整机重建"]
     end
 
-    subgraph mode_dynamic ["DYNAMIC 绑定模式 (动态代理)"]
-        D1["依赖 Provider 发生变更"] --> D2["消费方组件不重启"]
-        D2 --> D3["下次方法调用自动路由到新 Provider"]
+    subgraph mode_dynamic ["DYNAMIC 绑定模式 (动态调用)"]
+        D1["依赖提供方被替换"] --> D2["消费方组件保持 ACTIVE"]
+        D2 --> D3["下次方法调用穿透至新提供方"]
     end
 ```
 
-| 特性 | **PINNED 绑定（默认）** | **DYNAMIC 绑定（动态调用）** |
+| 维度 | **PINNED 绑定（默认）** | **DYNAMIC 绑定（动态调用）** |
 |---|---|---|
-| **声明方式** | `CapabilityRequirement.required(KEY)` | `CapabilityRequirement.dynamicRequired(KEY)` |
+| **声明语法** | `CapabilityRequirement.required(KEY)` | `CapabilityRequirement.dynamicRequired(KEY)` |
 | **获取方式** | `context.require(KEY)` | `context.subscribe(KEY)` 或动态代理 |
-| **Provider 替换时** | **消费方自动重建**（重新执行 `start`） | **消费方保持 ACTIVE**，不发生重启 |
-| **适用场景** | 普通有状态对象、连接池、带有自身初始化的模块 | 无状态服务、外部网关、高频请求路由 |
+| **提供方替换行为** | 消费方自动重建（销毁并创建新 Activation） | 消费方保持存活，方法调用动态路由 |
+| **适用对象** | 有状态对象、连接池、带有本地缓存的服务 | 无状态服务、外部网关、高频请求路由 |
 
 ---
 
 ## 结构事务（RuntimeTransaction）
 
-当需要**原子执行多个操作**（例如：同时撤销旧服务、发布新服务、挂载新组件）时，使用结构事务：
+多个结构变更操作需要作为一个原子单元提交时，使用结构事务：
 
 ```java
 TransactionReceipt<Provided<Tool>> receipt = runtime.transact(tx -> {
-    // 撤销旧注册
     tx.revoke(oldProvided);
-    // 挂载新组件
     tx.mount(runtime.root(), "worker", workerFactory);
-    // 发布新服务
     return tx.provide(runtime.root(), TOOL, new AdvancedTool());
 });
 
-// 事务同步提交生效，receipt 包含生成代数与收敛 Future
 System.out.println("事务已提交，当前 generation = " + receipt.generation());
 ```
 
-> **事务特性**：
-> - 事务在调用线程同步完成校验与结构更新，**要么全部生效，要么全部回滚**。
-> - 若发生配置错误或冲突，抛出 `TransactionRejectedException`，不会留下半吊子脏状态。
+事务回调在调用线程执行校验与结构编制。如果存在配置不合法或依赖冲突，事务整体拒绝并抛出 `TransactionRejectedException`，绝不会产生部分提交的中间状态。
 
 ---
 
-## Context 层级与多租户遮蔽
+## 上下文隔离与租户遮蔽
 
-Context 可以形成树状层级结构，常用于**多租户定制**或**环境隔离**：
+上下文支持树状嵌套，常用于多租户与测试隔离：
 
 ```mermaid
 graph TD
-    Root["Root Context<br/>公共服务: CurrencyRate = 7.0"]
+    Root["Root Context<br/>公共能力: CurrencyRate = 7.0"]
     US["Context: us-tenant<br/>租户遮蔽: CurrencyRate = 1.0"]
     CN["Context: cn-tenant<br/>继承 Root: CurrencyRate = 7.0"]
 
@@ -171,50 +163,49 @@ graph TD
 ```
 
 ```java
-// 创建子 Context
+// 创建子上下文
 ContextHandle usWorkspace = runtime.transact(tx ->
         tx.childContext(runtime.root(), "us-tenant")).value();
 
-// 在子 Context 中注册专属实现（遮蔽根 Context 的同名服务）
+// 在子上下文中注册局部能力以遮蔽根能力
 usWorkspace.context().ifPresent(ctx -> {
-    // 该注册仅对 usWorkspace 及其子级可见
     runtime.transact(tx -> tx.provide(ctx, CURRENCY_RATE, new UsdRateService()));
 });
 
-// 释放子 Context（会自动递归释放其下所有组件与注册）
+// 递归释放子上下文及其名下所有组件
 usWorkspace.disposeAsync().toCompletableFuture().join();
 ```
 
 ---
 
-## 资源生命周期管理（`LifecycleScope`）
+## 资源作用域与生命周期（`LifecycleScope`）
 
-每个 `Activation` 都拥有一个严格按照 **后进先出（LIFO）** 顺序释放的 `LifecycleScope`：
+每个 `Activation` 拥有独立的 `LifecycleScope`，内部登记的资源严格按照后进先出（LIFO）顺序释放：
 
 ```mermaid
 sequenceDiagram
     participant Act as 组件 Activation
     participant Scope as LifecycleScope
-    participant R1 as 资源1: DB 连接池
+    participant R1 as 资源1: 连接池
     participant R2 as 资源2: 消息监听器
 
-    Note over Act,Scope: 启动阶段 (按顺序登记)
-    Act->>Scope: 登记 R1 (DB 连接池)
+    Note over Act,Scope: 启动阶段 (顺次登记)
+    Act->>Scope: 登记 R1 (连接池)
     Act->>Scope: 登记 R2 (消息监听器)
 
-    Note over Act,Scope: 销毁阶段 (严格逆序 LIFO 释放)
-    Scope->>R2: 先关闭消息监听器 (停止接单)
-    Scope->>R1: 再关闭 DB 连接池 (释放底层存储)
+    Note over Act,Scope: 销毁阶段 (逆序释放)
+    Scope->>R2: 先关闭消息监听器 (停止接入流量)
+    Scope->>R1: 再关闭连接池 (释放底层资源)
 ```
 
 ```java
-// 登记普通资源 (AutoCloseable)
+// 托管同步资源
 DataSource ds = context.lifecycle().manage("db-pool", createDataSource());
 
-// 登记普通清理钩子 (Runnable)
+// 注册清理回调
 context.lifecycle().onClose("stop-worker", worker::shutdown);
 
-// 登记异步清理资源 (AsyncCloseable: 返回 CompletionStage)
+// 托管异步资源 (返回 CompletionStage)
 context.lifecycle().manageAsync("async-consumer", consumer);
 ```
 
@@ -222,139 +213,120 @@ context.lifecycle().manageAsync("async-consumer", consumer);
 
 ## 动态调用租约（`DynamicCapability`）
 
-当使用动态依赖时，Knotra 在底层通过**调用租约（Call Lease）**机制，确保旧实现不会在执行中途被暴力拔出：
+动态依赖在调用期间通过**调用租约（Call Lease）**保证执行安全：
 
 ```java
 DynamicCapability<PaymentGateway> gateway = context.subscribe(PAYMENT_GATEWAY);
 
-// 单方法安全调用（自动获取租约并释放）
+// 同步调用 (自动获取租约并释放)
 Receipt receipt = gateway.call(gw -> gw.charge(order));
 
-// 异步方法调用（租约保持到 CompletableFuture 完成）
+// 异步调用 (租约保持至 CompletionStage 终态)
 CompletionStage<Receipt> asyncReceipt = gateway.callAsync(gw -> gw.chargeAsync(order));
 ```
 
-> **租约排空（Drain）保证**：
-> 当管理员替换 `PaymentGateway` 时，Knotra 会**先关闭旧实例的调用闸门**，等待所有已经开始的 `call` 任务执行完毕，然后才执行旧实例的 `close()` 清理。业务流量零报错。
+当提供方被替换或下线时，系统先关闭准入闸门，等待全部在途租约归零后才执行旧实例的销毁清理，确保不会在方法执行中途拔出依赖。
 
 ---
 
 ## 进程内事件总线（`knotra-events`）
 
-`knotra-events` 提供类型化、支持安全排空的事件总线，包含 5 种分发模式：
+提供支持类型安全与排空保障的事件总线：
 
 ```mermaid
 graph LR
-    subgraph event_modes ["事件分发模式"]
-        M1["Sync: 顺序同步分发"]
-        M2["Parallel: 并发异步分发"]
-        M3["Serial: 链式顺序消费 (返回 false 中断)"]
-        M4["Bail: 抢占式认领 (首个 true 认领并终止)"]
-        M5["Waterfall: 流水线管道 (前一输出作为后一输入)"]
+    subgraph event_modes ["分发模式"]
+        M1["Sync: 顺序同步调用"]
+        M2["Parallel: 并发异步调用"]
+        M3["Serial: 链式顺序消费 (false 中断)"]
+        M4["Bail: 抢占式认领 (首个 true 终止)"]
+        M5["Waterfall: 管道流水线 (前输出即后输入)"]
     end
 ```
 
-### 使用示例
-
 ```java
-// 挂载 EventBus 组件
 runtime.mount("event-bus", new EventBusFactory()).requireActive();
 EventBus bus = runtime.root().view().require(EventCapabilities.EVENT_BUS);
 
-// 定义事件契约
 EventDefinition.Parallel<OrderCreatedEvent> ORDER_CREATED =
         EventDefinition.parallel(OrderCreatedEvent.class);
 
-// 订阅事件 (自动绑定生命周期)
 EventSubscription sub = bus.subscribe(ORDER_CREATED, event -> {
     System.out.println("收到订单事件: " + event.orderId());
     return CompletableFuture.completedFuture(null);
 });
 
-// 分发事件
 bus.dispatch(ORDER_CREATED, new OrderCreatedEvent("ORD-1001"));
 ```
 
 ---
 
-## PF4J 插件与声明式 Loader
+## PF4J 插件与声明式期望树
 
-### 加载外部 JAR 插件
+### 加载外部插件
 
 ```java
-// 创建 PF4J 插件适配器
 try (Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
         Path.of("plugins"), runtime, Set.of("com.example.contract"))) {
 
-    // 动态加载插件 JAR
     ArtifactSnapshot snapshot = adapter.loadArtifact(Path.of("plugins/custom-tool.jar"));
 
-    // 解析并挂载插件中的组件
     ArtifactFactoryHandle<NoConfig> toolFactory =
             adapter.factories().resolve("custom-tool", NoConfig.class).orElseThrow();
 
     ComponentHandle<NoConfig> handle = toolFactory.mount(runtime.root(), "tool-instance");
     handle.requireActive();
 
-    // 卸载插件（自动先安全排空组件，再释放 ClassLoader）
     adapter.unloadArtifact(snapshot.artifactId());
 }
 ```
 
----
-
-### 声明式期望树自动收敛
-
-Loader 类似于 Kubernetes 的 Controller 机制：您只需声明“期望运行哪些组件”，Loader 自动比对当前状态并执行增删改：
+### 声明式期望树收敛（`knotra-loader`）
 
 ```java
-// 定义期望的组件树 (Desired Tree)
 ComponentTree desired = ComponentTree.of(
         ComponentEntry.of("metrics", FactoryRef.of("metrics")),
         ComponentEntry.configured("tool", FactoryRef.of("tool", "1.0.0"), rawConfig)
 );
 
-// 执行原子收敛 (Reconcile)
 try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver)) {
     ReconcileResult result = loader.reconcile(desired);
-    result.requireConverged(); // 自动完成挂载、更新或移除
+    result.requireConverged();
 }
 ```
 
 ---
 
-## 运行时快照与健康诊断（`RuntimeSnapshot`）
+## 运行时快照与观测（`RuntimeSnapshot`）
 
-通过快照可以无副作用地观测整个系统的运行状态：
+快照为不可变纯数据传输对象，可用于健康检查与监控指标采集：
 
 ```java
 RuntimeSnapshot snapshot = runtime.snapshot();
 
-// 查看所有组件状态
 snapshot.components().forEach(c -> {
     System.out.printf("组件 [%s] 状态: %s, 运行代数: %d%n",
             c.componentId(), c.state(), c.generation());
 });
 
-// 查看诊断信息
 snapshot.diagnostics().forEach(d -> {
-    System.out.printf("告警码 [%s]: %s%n", d.code(), d.message());
+    System.out.printf("诊断码 [%s]: %s%n", d.code(), d.message());
 });
 ```
 
 ---
 
-## 优雅关闭顺序
+## 停机关闭顺序
 
-在关闭应用时，建议遵循**从外到内**的关闭顺序：
+推荐采用从外向内的逆序释放流程：
 
 ```java
-// 先关闭 Loader (停止期望树调度)
+// 停止 Loader 期望树调度
 loader.closeAsync().toCompletableFuture().join();
 
-// 关闭 PF4J 插件管理器 (安全排空并卸载所有插件)
+// 排空并卸载所有 PF4J 插件
 plugins.closeAsync().toCompletableFuture().join();
 
-// 最后关闭 Runtime (释放核心资源)
+// 关闭核心运行时及残留组件
 runtime.closeAsync().toCompletableFuture().join();
 ```

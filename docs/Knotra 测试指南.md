@@ -1,23 +1,17 @@
 # Knotra 测试指南
 
-> **面向读者**：编写动态组件系统与插件系统时，传统的单测往往容易写出“时序竞态”或“假死测试”。本文提供一套标准、可靠的 Knotra 测试套路，覆盖普通 POJO、依赖热替换、故障恢复与 ClassLoader 内存回收测试。
+> 面向单元测试与集成测试编写，介绍状态断言、依赖热重载、清理重试与类加载器垃圾回收的验证模式。
 
 ---
 
-## Knotra 测试核心原则
+## 测试核心原则
 
-- **断言状态与代际，绝不断言调度时机**：
-  - 优先检查 `handle.state() == ACTIVE`、`handle.requireActive()`、`DiagnosticCode`、`generation`；绝不要用 `Thread.sleep(100)` 来猜组件什么时候启动完成。
-- **使用有界等待（Await）**：
-  - 等待异步收敛时，使用 `whenSettled().toCompletableFuture().get(5, TimeUnit.SECONDS)`。
-- **每个测试用例必须关闭 Runtime**：
-  - 在 `@AfterEach` 中调用 `runtime.close()`，确保测试之间彻底隔离，不泄漏虚拟线程与资源。
+- **断言状态与代际，绝不断言调度时机**：优先检查 `handle.state() == ACTIVE`、`handle.requireActive()`、`DiagnosticCode` 与 `generation`，避免使用 `Thread.sleep` 猜测执行时机。
+- **使用有界等待**：等待异步收敛时使用 `whenSettled().toCompletableFuture().get(5, TimeUnit.SECONDS)` 或 Awaitility。
+- **测试资源必须闭环释放**：在 `@AfterEach` 中调用 `runtime.close()`，确保测试用例之间环境隔离。
 
 ```bash
-# 运行全部测试
 mvn test
-
-# 运行全量验证（包含真实 PF4J 插件构建与卸载验证）
 mvn clean verify
 ```
 
@@ -25,7 +19,7 @@ mvn clean verify
 
 ## 普通 POJO 组件单元测试
 
-测试核心逻辑：验证当底层 Provider 被 `replace()` 时，上层消费方是否自动以新依赖重新激活。
+验证提供方被 `replace()` 替换时，消费方能否自动以新依赖完成代际重建：
 
 ```java
 import io.knotra.*;
@@ -53,10 +47,8 @@ class GreeterComponentTest {
 
     @Test
     void providerReplacementRecreatesConsumer() {
-        // 发布初始依赖 V1
         Provided<String> prefix = runtime.provide(PREFIX, "Hello");
 
-        // 装配并挂载消费方组件
         CopyOnWriteArrayList<Greeter> instances = new CopyOnWriteArrayList<>();
         BeanDefinition<NoConfig, Greeter> definition = Beans.component("greeter")
                 .with(Beans.required(PREFIX))
@@ -71,16 +63,15 @@ class GreeterComponentTest {
         ComponentHandle<NoConfig> handle = Beans.mount(runtime, definition);
         handle.requireActive();
 
-        // 验证初始状态
         assertEquals(1, instances.size());
         assertEquals("Hello Alice", instances.get(0).greet("Alice"));
 
-        // 热替换依赖为 V2
+        // 热替换底层依赖为 V2
         Provided<String> nextPrefix = prefix.replace("Bonjour");
         nextPrefix.whenSettled().toCompletableFuture().join();
         handle.requireActive();
 
-        // 验证消费方已自动以新依赖重新创建实例 (代际由 1 变为 2)
+        // 验证消费方自动重建并生成新实例
         assertEquals(2, instances.size());
         assertEquals("Bonjour Alice", instances.get(1).greet("Alice"));
     }
@@ -97,7 +88,7 @@ class GreeterComponentTest {
 
 ## 故障恢复与清理重试测试
 
-Knotra 的一大特色是：**清理失败不吞没，保留现场并支持幂等重试**。以下演示如何测试清理失败场景：
+验证清理异常时系统保留现场，并在修复后支持精准重试：
 
 ```java
 @Test
@@ -115,29 +106,27 @@ void cleanupFailureRetainsDiagnosticsAndRecoversOnRetry() {
     ComponentHandle<NoConfig> handle = Beans.mount(runtime, def);
     handle.requireActive();
 
-    // 尝试销毁组件，由于 shouldFail=true，清理会失败并进入 FAILED 状态
+    // 触发销毁，模拟清理失败
     handle.disposeAsync().toCompletableFuture().join();
     assertEquals(ComponentState.FAILED, handle.state());
 
-    // 验证快照中记录了 CLEANUP_FAILED 诊断码
     RuntimeSnapshot snapshot = runtime.snapshot();
     assertTrue(snapshot.diagnostics().stream()
             .anyMatch(d -> d.code() == DiagnosticCode.CLEANUP_FAILED));
 
-    // 修复故障并触发重试
+    // 修复问题后触发重试
     shouldFail.set(false);
     handle.retryAsync().toCompletableFuture().join();
 
-    // 验证重试后成功进入终态 DISPOSED
     assertEquals(ComponentState.DISPOSED, handle.state());
 }
 ```
 
 ---
 
-## ClassLoader 卸载与 GC 回收验证测试
+## 类加载器卸载与垃圾回收测试
 
-为了确保动态加载的插件 JAR 在卸载后不会造成 Metaspace 内存泄漏，可以编写如下的 GC 断言测试：
+在 CI 中验证卸载插件后，其 ClassLoader 能被 JVM 正常回收，防止 Metaspace 内存泄漏：
 
 ```java
 @Test
@@ -145,19 +134,18 @@ void pluginClassLoaderIsGarbageCollectedAfterUnload() throws Exception {
     Pf4jArtifactAdapter adapter = Pf4jArtifactAdapter.create(
             pluginsDir, runtime, Set.of("com.example.contract"));
 
-    // 加载插件
     ArtifactSnapshot artifact = adapter.loadArtifact(pluginJarPath);
     ClassLoader pluginClassLoader = getPluginClassLoader(adapter, artifact.artifactId());
 
-    // 使用弱引用监听 ClassLoader
+    // 通过弱引用监听类加载器生命周期
     WeakReference<ClassLoader> weakRef = new WeakReference<>(pluginClassLoader);
-    pluginClassLoader = null; // 释放强引用
+    pluginClassLoader = null; // 释放局部强引用
 
-    // 卸载插件 (排空并清理)
+    // 卸载插件
     adapter.unloadArtifact(artifact.artifactId());
     adapter.close();
 
-    // 循环触发 System.gc() 并断言弱引用被回收
+    // 触发垃圾回收并轮询断言
     boolean collected = false;
     for (int i = 0; i < 50; i++) {
         System.gc();
@@ -168,6 +156,6 @@ void pluginClassLoaderIsGarbageCollectedAfterUnload() throws Exception {
         Thread.sleep(50);
     }
 
-    assertTrue(collected, "插件 ClassLoader 必须在卸载后被 JVM GC 回收，防止 Metaspace OOM！");
+    assertTrue(collected, "插件 ClassLoader 必须在卸载后被 JVM GC 回收，防止 Metaspace OOM。");
 }
 ```
