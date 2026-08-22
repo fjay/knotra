@@ -72,54 +72,54 @@ final class SimpleApiEndToEndTest {
         assertEquals(PublicationState.PUBLISHED, publication.state());
         SettlementReport firstReport = first.awaitSettled(Duration.ofSeconds(10));
         assertTrue(firstReport.generation() >= 0);
-        assertFalse(firstReport.allActive(),
+        assertFalse(firstReport.hasAffectedMounts());
+        assertFalse(firstReport.allAffectedActive(),
                 "an empty affected set is explicitly not an all-active health claim");
 
-        BeanDefinition<DynamicGatewayRenderer> dynamicRenderer = Beans
+        MountHandle rendererHandle = Beans
                 .component("dynamic-gateway-renderer")
                 .with(Beans.dynamic(Gateway.class))
                 .create(DynamicGatewayRenderer::new)
-                .provideAs(RenderedGreeting.class, renderer -> renderer)
-                .build();
-        MountHandle rendererHandle = dynamicRenderer.mount(runtime);
+                .provideAs(RenderedGreeting.class)
+                .mount(runtime);
         rendererHandle.requireActive(Duration.ofSeconds(10));
 
-        BeanDefinition<FixedGatewayConsumer> fixedConsumer = Beans
+        MountHandle fixedHandle = Beans
                 .component("fixed-gateway-consumer")
-                .with(Beans.required(Gateway.class))
+                .with(Beans.fixed(Gateway.class))
                 .create(FixedGatewayConsumer::new)
-                .build();
-        MountHandle fixedHandle = fixedConsumer.mount(runtime);
+                .mount(runtime);
         fixedHandle.requireActive(Duration.ofSeconds(10));
 
-        assertEquals("gateway: one", runtime.root().view().require(RenderedGreeting.class).render());
+        assertEquals("gateway: one", runtime.require(RenderedGreeting.class).render());
 
         PublicationChange<Gateway> second = publication.update(new ConstantGateway("two"));
         SettlementReport secondReport = second.awaitSettled(Duration.ofSeconds(10));
         assertTrue(second.whenSettled().toCompletableFuture().isDone());
         assertEquals(PublicationOperation.UPDATE, second.operation());
-        assertNotEquals(first.registration().registrationId(), second.registration().registrationId());
+        assertTrue(first.generation() < second.generation());
+        assertTrue(secondReport.hasAffectedMounts());
         assertTrue(secondReport.hasFailedMounts(), () -> secondReport.toString());
-        assertFalse(secondReport.allActive());
+        assertFalse(secondReport.allAffectedActive());
         assertEquals(ComponentState.FAILED, fixedHandle.state());
         rendererHandle.requireActive(Duration.ofSeconds(10));
-        assertEquals("gateway: two", runtime.root().view().require(RenderedGreeting.class).render());
+        assertEquals("gateway: two", runtime.require(RenderedGreeting.class).render());
 
         PublicationChange<Gateway> third = publication.update(new ConstantGateway("three"));
         SettlementReport thirdReport = third.awaitSettled(Duration.ofSeconds(10));
         assertEquals(PublicationOperation.UPDATE, third.operation());
-        assertNotEquals(second.registration().registrationId(), third.registration().registrationId());
+        assertTrue(second.generation() < third.generation());
         assertTrue(secondReport.generation() < thirdReport.generation());
         rendererHandle.requireActive(Duration.ofSeconds(10));
-        assertEquals("gateway: three", runtime.root().view().require(RenderedGreeting.class).render());
+        assertEquals("gateway: three", runtime.require(RenderedGreeting.class).render());
 
         PublicationChange<Gateway> removed = publication.unpublish();
         SettlementReport removedReport = removed.awaitSettled(Duration.ofSeconds(10));
         assertEquals(PublicationOperation.UNPUBLISH, removed.operation());
-        assertNull(removed.registration());
         assertTrue(thirdReport.generation() < removedReport.generation());
         assertEquals(PublicationState.UNPUBLISHED, publication.state());
-        assertTrue(runtime.root().view().find(Gateway.class).isEmpty());
+        assertTrue(runtime.find(Gateway.class).isEmpty());
         assertSame(removed, publication.unpublish());
     }
+
 }

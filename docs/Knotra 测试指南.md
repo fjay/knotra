@@ -83,7 +83,7 @@ PublicationChange<Greeting> change = publication.update(new BrokenGreeting());
 SettlementReport report = change.awaitSettled(Duration.ofSeconds(5));
 
 assertTrue(report.hasFailedMounts());
-assertFalse(report.allActive());
+assertFalse(report.allAffectedActive());
 assertEquals(
         ComponentState.FAILED,
         report.failedMounts().getFirst().state());
@@ -97,10 +97,12 @@ assertTrue(report.failedMounts().stream()
 
 反向断言同样重要：
 
+- 影响集为空时，`hasAffectedMounts()` 是 false。
 - 影响集为空时，`hasFailedMounts()` 是 false。
-- 影响集为空时，`allActive()` 仍是 false。
+- 影响集为空时，`allAffectedActive()` 仍是 false。
 - 动态代理消费方不重建，可能不出现在影响集。
 - 对具体挂载使用 `handle.requireActive(Duration.ofSeconds(5))`。
+
 
 ## Advanced 事务测试
 

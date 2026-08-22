@@ -8,8 +8,10 @@ import io.knotra.MountFactory;
 import io.knotra.MountHandle;
 import io.knotra.DiagnosticCode;
 import io.knotra.KnotraRuntime;
+import io.knotra.Publication;
 import io.knotra.Registration;
 import io.knotra.TransactionRejectedException;
+
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -218,7 +220,7 @@ final class SpringModuleTest {
             throws Exception {
         ExternalProvider first = new ExternalProvider("v1");
         ExternalProvider second = new ExternalProvider("v2");
-        Registration<Provider> registration = runtime.publish(PROVIDER, first).registration();
+        Publication<Provider> publication = runtime.publish(PROVIDER, first).publication();
 
         AtomicInteger contextCount = new AtomicInteger();
         MountFactory factory = SpringModules.noConfig("required-spring")
@@ -233,7 +235,8 @@ final class SpringModuleTest {
         assertSame(first, firstSnapshot.provider());
         assertEquals(1, contextCount.get());
 
-        registration.replace(second).awaitSettled(Duration.ofSeconds(10));
+        publication.update(second).awaitSettled(Duration.ofSeconds(10));
+
 
         ServiceSnapshot secondSnapshot = runtime.root().view().require(SERVICE);
         assertNotSame(firstSnapshot, secondSnapshot);

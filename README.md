@@ -101,41 +101,34 @@ public record ConstantGreeting(String version) implements Greeting {
 
 ```java
 try (KnotraRuntime runtime = KnotraRuntime.create()) {
+    // 1. 发布 v1 实现
     PublicationChange<Greeting> firstChange =
             runtime.publish(Greeting.class, new ConstantGreeting("v1"));
     Publication<Greeting> greeting = firstChange.publication();
+    firstChange.awaitSettled(Duration.ofSeconds(10));
 
-    SettlementReport firstReport = firstChange.awaitSettled(Duration.ofSeconds(10));
-
-    BeanDefinition<GreetingRenderer> definition = Beans
+    // 2. 挂载动态依赖 Greeting 的渲染组件
+    MountHandle renderer = Beans
             .component("greeting-renderer")
             .with(Beans.dynamic(Greeting.class))
             .create((Greeting current) -> new GreetingRenderer(current))
-            .provideAs(RenderedGreeting.class, renderer -> renderer)
-            .build();
-
-    MountHandle renderer = definition.mount(runtime);
+            .provideAs(RenderedGreeting.class)
+            .mount(runtime);
     renderer.requireActive(Duration.ofSeconds(10));
 
-    String first = runtime.root().view()
-            .require(RenderedGreeting.class)
-            .render("Knotra");
+    // 3. 第一次调用
+    String first = runtime.require(RenderedGreeting.class).render("Knotra");
 
-    PublicationChange<Greeting> secondChange =
-            greeting.update(new ConstantGreeting("v2"));
-    SettlementReport report = secondChange.awaitSettled(Duration.ofSeconds(10));
+    // 4. 热替换为 v2 实现（不重启组件）
+    SettlementReport report = greeting.update(new ConstantGreeting("v2"))
+            .awaitSettled(Duration.ofSeconds(10));
 
     if (report.hasFailedMounts()) {
         throw new IllegalStateException(report.failedMounts().toString());
     }
-    if (report.allActive()) {
-        // 非空影响集里的所有挂载都是 ACTIVE。
-    }
 
-    renderer.requireActive(Duration.ofSeconds(10));
-    String second = runtime.root().view()
-            .require(RenderedGreeting.class)
-            .render("Knotra");
+    // 5. 第二次调用（透明路由到 v2）
+    String second = runtime.require(RenderedGreeting.class).render("Knotra");
 }
 ```
 
@@ -149,14 +142,16 @@ renderer instances: 1
 
 这段代码的关键语义：
 
-- `runtime.publish(...)` 返回这一次发布的 `PublicationChange<T>`，不要把它当成长期句柄保存。
-- `change.publication()` 返回稳定发布槽位 `Publication<T>`，后续 `update(...)` 都从它发起。
-- `Beans.dynamic(Class<T>)` 注入动态代理。提供方从 v1 换到 v2 时，消费方 Bean 不重建，仍是同一个实例。
-- `awaitSettled(Duration)` 表示本次发布操作的传播和 drain 已收敛，并递归等待本次操作触发的 owned children；不表示所有下游一定成功。
-- `hasFailedMounts()` 为 `false` 只表示本次影响集中没有 FAILED。
-- `allActive()` 只有在影响集非空且全部 ACTIVE 时才为 `true`。空影响集返回 `false`；本例的动态代理消费方不需要重建，因此通常不在影响集中。
-- `renderer.requireActive(Duration.ofSeconds(10))` 才是在等待“这个具体挂载当前 ACTIVE”，失败会抛出含诊断的 `MountNotActiveException`。
-- 示例用 try-with-resources 保持简洁；它调用的 `close()` 会无界等待停机收敛。生产代码应等待 `runtime.closeAsync()` 并使用有界 `get(timeout)`，见[线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)。
+- `runtime.publish(...)` 发布能力并返回 `PublicationChange<T>`；`change.publication()` 返回稳定发布槽位 `Publication<T>`。
+- `Beans.dynamic(Class<T>)` 注入动态接口代理。提供方从 v1 换到 v2 时，消费方 Bean 实例不需要重启或重建，透明路由到最新实现。
+- `Beans.component(...).mount(runtime)` 直接完成构建与挂载，返回 `MountHandle`。
+- `runtime.require(Class<T>)` / `runtime.find(Class<T>)` 提供根上下文能力的直接便捷访问。
+- `greeting.update(...)` 原地更新发布槽位，返回 `PublicationChange<T>`，可调用 `awaitSettled(timeout)` 观察受影响挂载的结算。
+- `report.hasFailedMounts()` 与 `report.allAffectedActive()` 精确报告本次结构变更影响的挂载状态。
+- `renderer.requireActive(Duration.ofSeconds(10))` 显式等待挂载点进入 ACTIVE 活跃状态，非活跃时抛出含诊断的 `MountNotActiveException`。
+- 示例使用 try-with-resources 保持精简；它调用的 `close()` 会无界等待停机收敛。生产环境应调用 `runtime.closeAsync()` 并使用有界 `get(timeout)` 等待停机，详见 [线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)。
+
+
 
 ---
 

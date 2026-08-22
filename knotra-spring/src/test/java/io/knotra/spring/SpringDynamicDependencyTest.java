@@ -6,7 +6,8 @@ import io.knotra.MountHandle;
 import io.knotra.ComponentState;
 import io.knotra.DynamicCapability;
 import io.knotra.KnotraRuntime;
-import io.knotra.Registration;
+import io.knotra.Publication;
+
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -75,8 +76,8 @@ final class SpringDynamicDependencyTest {
 
     @Test
     void dynamicProviderReplacementDoesNotRebuildSpringContext() throws Exception {
-        Registration<Api> first = runtime.publish(API, new ApiValue("v1"))
-                .registration();
+        Publication<Api> publication = runtime.publish(API, new ApiValue("v1"))
+                .publication();
         AtomicInteger contexts = new AtomicInteger();
 
         MountFactory factory = SpringModules.noConfig("dynamic-proxy-child")
@@ -91,7 +92,7 @@ final class SpringDynamicDependencyTest {
         assertEquals("v1", firstSnapshot.value());
         assertEquals(1, contexts.get());
 
-        replaceProvider(first, "v2");
+        publication.update(new ApiValue("v2")).awaitSettled(Duration.ofSeconds(10));
 
         assertActive(handle);
         ApiSnapshot secondSnapshot = runtime.root().view().require(API_SNAPSHOT);
@@ -140,8 +141,8 @@ final class SpringDynamicDependencyTest {
 
     @Test
     void dynamicCapabilityProvidesProviderFixedCallbackAcrossReplacement() throws Exception {
-        Registration<Api> first = runtime.publish(API, new ApiValue("v1"))
-                .registration();
+        Publication<Api> publication = runtime.publish(API, new ApiValue("v1"))
+                .publication();
         AtomicInteger contexts = new AtomicInteger();
 
         MountFactory factory =
@@ -154,15 +155,18 @@ final class SpringDynamicDependencyTest {
         MountHandle handle =
                 runtime.mount("dynamic-capability-child", factory);
         assertActive(handle);
-        CapabilitySnapshot snapshot =
+        CapabilitySnapshot firstSnapshot =
                 runtime.root().view().require(CAPABILITY_SNAPSHOT);
-        assertEquals("v1", snapshot.value());
+        assertEquals("v1", firstSnapshot.value());
+        assertEquals(1, contexts.get());
 
-        replaceProvider(first, "v2");
+        publication.update(new ApiValue("v2")).awaitSettled(Duration.ofSeconds(10));
 
         assertActive(handle);
-        assertSame(snapshot, runtime.root().view().require(CAPABILITY_SNAPSHOT));
-        assertEquals("v2", snapshot.value());
+        CapabilitySnapshot secondSnapshot =
+                runtime.root().view().require(CAPABILITY_SNAPSHOT);
+        assertSame(firstSnapshot, secondSnapshot);
+        assertEquals("v2", secondSnapshot.value());
         assertEquals(1, contexts.get());
 
         handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -214,13 +218,10 @@ final class SpringDynamicDependencyTest {
         proxyHandle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
-    private void replaceProvider(Registration<Api> previous, String value) {
-        previous.replace(new ApiValue(value)).awaitSettled(Duration.ofSeconds(10));
-    }
-
     private static void assertActive(MountHandle handle) throws Exception {
         ComponentState state = handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ComponentState.ACTIVE, state, () -> handle.componentId());
     }
 }
+

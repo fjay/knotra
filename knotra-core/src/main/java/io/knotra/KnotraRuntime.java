@@ -1,12 +1,13 @@
 package io.knotra;
 
+import java.util.Optional;
 import java.util.function.Function;
 import java.util.concurrent.CompletionStage;
 
 /**
  * Knotra 运行时核心门面（Simple API）。
  *
- * <p>提供日常业务最常用的能力发布（Publication）、根上下文组件挂载（Mount）与优雅停机入口。
+ * <p>提供日常业务最常用的能力发布（Publication）、能力查找（require / find）、根上下文组件挂载（Mount）与优雅停机入口。
  * 高级事务、代际快照、子上下文管理与显式注销等底层能力请通过 {@link #advanced()} 访问。</p>
  */
 public interface KnotraRuntime extends AutoCloseable {
@@ -20,8 +21,29 @@ public interface KnotraRuntime extends AutoCloseable {
     /** 访问高级运行时接口，用于结构化事务、精确注销与快照查询。 */
     AdvancedRuntime advanced();
 
+    /** 在根上下文中获取必须存在的能力实例。 */
+    default <T> T require(CapabilityKey<T> key) {
+        return root().view().require(key);
+    }
+
+    /** 基于类型在根上下文中获取必须存在的能力实例。 */
+    default <T> T require(Class<T> type) {
+        return root().view().require(type);
+    }
+
+    /** 在根上下文中查询可选能力实例。 */
+    default <T> Optional<T> find(CapabilityKey<T> key) {
+        return root().view().find(key);
+    }
+
+    /** 基于类型在根上下文中查询可选能力实例。 */
+    default <T> Optional<T> find(Class<T> type) {
+        return root().view().find(type);
+    }
+
     /** 在根上下文中发布指定键的能力，返回本次操作的变更对象与结算观察器。 */
     default <T> PublicationChange<T> publish(CapabilityKey<T> key, T value) {
+
         return publish(root(), key, value);
     }
 

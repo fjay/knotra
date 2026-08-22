@@ -27,6 +27,13 @@ public record SettlementReport(
     }
 
     /**
+     * 判断本次操作是否有受影响的挂载点。
+     */
+    public boolean hasAffectedMounts() {
+        return !mountOutcomes.isEmpty();
+    }
+
+    /**
      * 判断本次受影响的挂载点中是否存在处于 {@code FAILED} 状态的挂载。
      * 空影响集返回 false。
      */
@@ -35,13 +42,14 @@ public record SettlementReport(
     }
 
     /**
-     * 判断本次受影响的挂载点是否非空且全部处于 {@code ACTIVE} 活跃状态。
-     * 处于 WAITING、FAILED 或 DISPOSED 均不视作 allActive。
+     * 判断本次受影响的挂载点是否存在且全部处于 {@code ACTIVE} 活跃状态。
+     * 若受影响挂载集为空，或者存在处于 WAITING、FAILED 或 DISPOSED 状态的挂载，则返回 false。
      */
-    public boolean allActive() {
-        return !mountOutcomes.isEmpty()
+    public boolean allAffectedActive() {
+        return hasAffectedMounts()
                 && mountOutcomes.stream().allMatch(outcome -> outcome.state() == ComponentState.ACTIVE);
     }
+
 
     /** 获取所有处于 FAILED 失败状态的挂载结果列表。 */
     public List<MountOutcome> failedMounts() {

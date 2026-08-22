@@ -1,7 +1,5 @@
 package io.knotra;
 
-import java.util.Optional;
-
 /**
  * 稳定的能力发布逻辑插槽。
  *
@@ -27,9 +25,6 @@ public interface Publication<T> {
     /** 当前发布插槽的状态。 */
     PublicationState state();
 
-    /** 获取当前代际对应的注册凭证（若已撤销或置换则返回 empty）。 */
-    Optional<Registration<T>> currentRegistration();
-
     /**
      * 更新插槽中的能力提供实例，原子发布新一代注册并返回本次操作变更。
      *
@@ -41,3 +36,4 @@ public interface Publication<T> {
     /** 主动撤销该发布插槽，撤销为终态且幂等。 */
     PublicationChange<T> unpublish();
 }
+

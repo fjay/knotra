@@ -62,12 +62,12 @@ final class RegistrationPublicationTest {
 
         PublicationChange<String> second = publication.update("two");
         assertSame(publication, second.publication());
-        assertNotEquals(published.registration(), second.registration());
+        assertNotEquals(published.generation(), second.generation());
         second.awaitSettled(Duration.ofSeconds(10));
         assertEquals("two", runtime.root().view().require(TEXT));
 
         PublicationChange<String> removed = publication.unpublish();
-        assertNull(removed.registration());
+        assertEquals(PublicationOperation.UNPUBLISH, removed.operation());
         removed.awaitSettled(Duration.ofSeconds(10));
         assertTrue(runtime.root().view().find(TEXT).isEmpty());
         assertSame(removed, publication.unpublish());
@@ -91,11 +91,15 @@ final class RegistrationPublicationTest {
     @Test
     void publicationIsDisplacedByExternalRevokeAndRejectsLaterUpdate() throws Exception {
         Publication<String> publication = runtime.publish(TEXT, "one").publication();
-        runtime.advanced().revoke(publication.currentRegistration().orElseThrow())
-                .awaitSettled(Duration.ofSeconds(10));
+        String regId = runtime.advanced().snapshot().registrations().stream()
+                .filter(r -> r.capability().name().equals(TEXT.name()))
+                .findFirst().orElseThrow().registrationId();
+        runtime.advanced().revoke(() -> regId).awaitSettled(Duration.ofSeconds(10));
         assertEquals(PublicationState.DISPLACED, publication.state());
         assertThrows(TransactionRejectedException.class, () -> publication.update("two"));
     }
+
+
 
     @Test
     void publicationSettlementReportsFailedMountWithoutExceptionalCompletion() throws Exception {
@@ -115,12 +119,13 @@ final class RegistrationPublicationTest {
         SettlementReport report = second.awaitSettled(Duration.ofSeconds(10));
         assertTrue(second.whenSettled().toCompletableFuture().isDone());
         assertTrue(report.hasFailedMounts());
-        assertFalse(report.allActive());
+        assertFalse(report.allAffectedActive());
         assertEquals(ComponentState.FAILED, consumer.state());
         assertTrue(report.failedMounts().stream()
                 .anyMatch(outcome -> outcome.handleId().equals(consumer.handleId())));
         assertEquals("two", runtime.root().view().require(TEXT));
     }
+
 
     @Test
     void stagedRegistrationIsTypedAndDoesNotImpersonateACommittedRegistration() throws Exception {
@@ -274,7 +279,6 @@ final class RegistrationPublicationTest {
                 }
                 assertEquals(lanes, changes);
                 assertEquals(PublicationState.PUBLISHED, publication.state());
-                assertTrue(publication.currentRegistration().isPresent());
             } finally {
                 executor.shutdown();
                 assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
@@ -285,23 +289,28 @@ final class RegistrationPublicationTest {
     @Test
     void externalReplacementDisplacesPublicationTerminally() throws Exception {
         Publication<String> publication = runtime.publish(TEXT, "one").publication();
-        Registration<String> current = publication.currentRegistration().orElseThrow();
-        Registration<String> replacement = current.replace("two");
+        String regId = runtime.advanced().snapshot().registrations().stream()
+                .filter(r -> r.capability().name().equals(TEXT.name()))
+                .findFirst().orElseThrow().registrationId();
+        TransactionReceipt<StagedRegistration<String>> replacement = runtime.advanced().transact(transaction -> {
+            transaction.revoke(() -> regId);
+            return transaction.provide(runtime.root(), TEXT, "two");
+        });
         replacement.awaitSettled(Duration.ofSeconds(10));
 
         assertEquals(PublicationState.DISPLACED, publication.state());
-        assertTrue(publication.currentRegistration().isEmpty());
         assertThrows(TransactionRejectedException.class, () -> publication.update("three"));
         assertThrows(TransactionRejectedException.class, publication::unpublish);
-        replacement.revoke().awaitSettled(Duration.ofSeconds(10));
+        runtime.advanced().revoke(replacement.value()).awaitSettled(Duration.ofSeconds(10));
     }
+
 
     @Test
     void childContextDisposeDisplacesPublicationWithoutRebuild() throws Exception {
         ContextHandle child = runtime.advanced().childContext(runtime.root(), "dispose-publication");
-        Publication<String> publication = runtime.publish(child, TEXT, "child").publication();
-        publication.currentRegistration().orElseThrow()
-                .awaitSettled(Duration.ofSeconds(10));
+        PublicationChange<String> change = runtime.publish(child, TEXT, "child");
+        Publication<String> publication = change.publication();
+        change.awaitSettled(Duration.ofSeconds(10));
 
         runtime.advanced().transact(transaction -> {
             transaction.dispose(child);
@@ -309,7 +318,6 @@ final class RegistrationPublicationTest {
         }).awaitSettled(Duration.ofSeconds(10));
 
         assertEquals(PublicationState.DISPLACED, publication.state());
-        assertTrue(publication.currentRegistration().isEmpty());
         assertThrows(TransactionRejectedException.class, () -> publication.update("next"));
         assertThrows(TransactionRejectedException.class, publication::unpublish);
     }
@@ -319,15 +327,14 @@ final class RegistrationPublicationTest {
         KnotraRuntime closed = KnotraRuntime.create();
         Publication<String> publication;
         try {
-            publication = closed.publish(TEXT, "value").publication();
-            publication.currentRegistration().orElseThrow()
-                    .awaitSettled(Duration.ofSeconds(10));
+            PublicationChange<String> change = closed.publish(TEXT, "value");
+            publication = change.publication();
+            change.awaitSettled(Duration.ofSeconds(10));
         } finally {
             closed.close();
         }
 
         assertEquals(PublicationState.DISPLACED, publication.state());
-        assertTrue(publication.currentRegistration().isEmpty());
         assertThrows(TransactionRejectedException.class, () -> publication.update("next"));
         assertThrows(TransactionRejectedException.class, publication::unpublish);
     }
@@ -369,7 +376,6 @@ final class RegistrationPublicationTest {
                 unpublishChange.get().awaitSettled(Duration.ofSeconds(10));
 
                 assertEquals(PublicationState.UNPUBLISHED, publication.state());
-                assertTrue(publication.currentRegistration().isEmpty());
             } finally {
                 executor.shutdown();
                 assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));

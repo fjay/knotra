@@ -19,8 +19,8 @@ public final class QuickStartExample {
             String firstValue,
             String secondValue,
             Publication<Greeting> publication,
-            boolean firstReportAllActive,
-            boolean secondReportAllActive,
+            boolean firstReportAllAffectedActive,
+            boolean secondReportAllAffectedActive,
             int rendererInstances) {
     }
 
@@ -70,21 +70,18 @@ public final class QuickStartExample {
 
             SettlementReport firstReport = firstChange.awaitSettled(timeout);
             check(!firstReport.hasFailedMounts(), "first publication must not fail a mount");
-            check(!firstReport.allActive(),
+            check(!firstReport.allAffectedActive(),
                     "an empty affected set is not an all-active health claim");
 
-            BeanDefinition<GreetingRenderer> rendererDefinition = Beans
+            MountHandle renderer = Beans
                     .component("greeting-renderer")
                     .with(Beans.dynamic(Greeting.class))
                     .create((Greeting greeting) -> new GreetingRenderer(greeting, rendererInstances))
-                    .provideAs(RenderedGreeting.class, renderer -> renderer)
-                    .build();
-
-            MountHandle renderer = rendererDefinition.mount(runtime);
+                    .provideAs(RenderedGreeting.class)
+                    .mount(runtime);
             renderer.requireActive(timeout);
 
-            String firstValue = runtime.root().view()
-                    .require(RenderedGreeting.class)
+            String firstValue = runtime.require(RenderedGreeting.class)
                     .render("Knotra");
 
             PublicationChange<Greeting> secondChange =
@@ -92,27 +89,26 @@ public final class QuickStartExample {
             SettlementReport secondReport = secondChange.awaitSettled(timeout);
 
             check(!secondReport.hasFailedMounts(), "renderer settlement must not fail");
-            check(!secondReport.allActive(), "a dynamic proxy is not activation-affected by replacement");
+            check(!secondReport.allAffectedActive(), "a dynamic proxy is not activation-affected by replacement");
             check(secondChange.publication() == publication,
                     "Publication must stay stable across updates");
-            check(secondChange.registration().registrationId()
-                            != firstChange.registration().registrationId(),
-                    "each update must create a new Registration");
+            check(secondChange.generation() > firstChange.generation(),
+                    "each update must advance the runtime generation");
             renderer.requireActive(timeout);
 
-            String secondValue = runtime.root().view()
-                    .require(RenderedGreeting.class)
+            String secondValue = runtime.require(RenderedGreeting.class)
                     .render("Knotra");
 
             return new Result(
                     firstValue,
                     secondValue,
                     publication,
-                    firstReport.allActive(),
-                    secondReport.allActive(),
+                    firstReport.allAffectedActive(),
+                    secondReport.allAffectedActive(),
                     rendererInstances.get());
         }
     }
+
 
     public static void main(String[] args) {
         Result result = run();

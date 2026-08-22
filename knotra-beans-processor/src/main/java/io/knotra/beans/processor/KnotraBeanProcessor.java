@@ -5,11 +5,13 @@ import io.knotra.beans.annotation.KnotraConfig;
 import io.knotra.beans.annotation.KnotraConstructor;
 import io.knotra.beans.annotation.KnotraDestroy;
 import io.knotra.beans.annotation.KnotraDynamicProxy;
+import io.knotra.beans.annotation.KnotraFixed;
 import io.knotra.beans.annotation.KnotraInit;
 import io.knotra.beans.annotation.KnotraNormalizeConfig;
 import io.knotra.beans.annotation.KnotraOptional;
 import io.knotra.beans.annotation.KnotraOutput;
 import io.knotra.beans.annotation.KnotraRequire;
+
 
 import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.Messager;
@@ -343,12 +345,16 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             VariableElement parameter,
             TypeMirror configType,
             boolean noConfig) {
+        AnnotationMirror fixedMirror = mirror(parameter, KnotraFixed.class.getCanonicalName());
         AnnotationMirror requireMirror = mirror(parameter, KnotraRequire.class.getCanonicalName());
         AnnotationMirror optionalMirror = mirror(parameter, KnotraOptional.class.getCanonicalName());
         AnnotationMirror dynamicMirror = mirror(parameter, KnotraDynamicProxy.class.getCanonicalName());
         AnnotationMirror configMirror = mirror(parameter, KnotraConfig.class.getCanonicalName());
 
         int declarations = 0;
+        if (fixedMirror != null) {
+            declarations++;
+        }
         if (requireMirror != null) {
             declarations++;
         }
@@ -363,7 +369,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         }
         if (declarations != 1) {
             error(parameter, "every constructor parameter must have exactly one of "
-                    + "@KnotraRequire, @KnotraOptional, @KnotraDynamicProxy, or @KnotraConfig");
+                    + "@KnotraFixed, @KnotraRequire, @KnotraOptional, @KnotraDynamicProxy, or @KnotraConfig");
             return null;
         }
 
@@ -390,7 +396,10 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
 
         AnnotationMirror dependencyMirror;
         ParameterKind kind;
-        if (requireMirror != null) {
+        if (fixedMirror != null) {
+            dependencyMirror = fixedMirror;
+            kind = ParameterKind.REQUIRED;
+        } else if (requireMirror != null) {
             dependencyMirror = requireMirror;
             kind = ParameterKind.REQUIRED;
         } else if (optionalMirror != null) {
@@ -400,6 +409,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             dependencyMirror = dynamicMirror;
             kind = ParameterKind.DYNAMIC;
         }
+
 
         Map<String, AnnotationValue> annotationValues = values(dependencyMirror);
         String name = stringValue(annotationValues.get("value"), "");

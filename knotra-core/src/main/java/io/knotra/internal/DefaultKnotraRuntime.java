@@ -2928,8 +2928,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             } else if (registration instanceof RegistrationHandleImpl internal) {
                 handle = internal;
             } else {
-                handle = null;
+                handle = registrationHandles.get(registration.registrationId());
             }
+
             if (handle == null || handle.runtime != DefaultKnotraRuntime.this) {
                 throw new IllegalArgumentException(
                         "registration handle does not belong to this runtime");

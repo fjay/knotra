@@ -72,13 +72,10 @@ final class PublicationImpl<T> implements Publication<T> {
         }
     }
 
-    @Override
-    public Optional<Registration<T>> currentRegistration() {
+    Registration<T> currentInternal() {
         synchronized (this) {
             refreshDisplacementLocked();
-            return state == PublicationState.PUBLISHED
-                    ? Optional.ofNullable(current)
-                    : Optional.empty();
+            return state == PublicationState.PUBLISHED ? current : null;
         }
     }
 
@@ -169,11 +166,6 @@ final class PublicationImpl<T> implements Publication<T> {
         @Override
         public Publication<T> publication() {
             return publication;
-        }
-
-        @Override
-        public Registration<T> registration() {
-            return operation == PublicationOperation.UNPUBLISH ? null : registration;
         }
 
         @Override

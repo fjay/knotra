@@ -47,6 +47,22 @@ final class ApiSurfaceTest {
                         || method.getName().equals("revoke")));
         assertTrue(Arrays.stream(KnotraRuntime.class.getMethods())
                 .anyMatch(method -> method.getName().equals("advanced")));
+        assertTrue(Arrays.stream(KnotraRuntime.class.getMethods())
+                .anyMatch(method -> method.getName().equals("require")
+                        && Arrays.equals(method.getParameterTypes(), new Class<?>[]{Class.class})));
+        assertTrue(Arrays.stream(KnotraRuntime.class.getMethods())
+                .anyMatch(method -> method.getName().equals("find")
+                        && Arrays.equals(method.getParameterTypes(), new Class<?>[]{Class.class})));
+        assertTrue(Arrays.stream(Publication.class.getMethods())
+                .noneMatch(method -> method.getName().equals("currentRegistration")));
+        assertTrue(Arrays.stream(PublicationChange.class.getMethods())
+                .noneMatch(method -> method.getName().equals("registration")));
+        assertTrue(Arrays.stream(SettlementReport.class.getMethods())
+                .anyMatch(method -> method.getName().equals("allAffectedActive")));
+        assertTrue(Arrays.stream(SettlementReport.class.getMethods())
+                .anyMatch(method -> method.getName().equals("hasAffectedMounts")));
+        assertTrue(Arrays.stream(SettlementReport.class.getMethods())
+                .noneMatch(method -> method.getName().equals("allActive")));
         Arrays.stream(KnotraRuntime.class.getMethods())
                 .filter(method -> method.getName().equals("mount")
                         && method.getParameterTypes().length >= 2
@@ -63,6 +79,7 @@ final class ApiSurfaceTest {
                             method.toString());
                 });
     }
+
 
     @Test
     void mountHandleSplitsPlainMountsFromConfiguredMounts() {

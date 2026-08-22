@@ -55,6 +55,7 @@ final class DocsVocabularyTest {
         List<String> forbidden = List.of(
                 "io.knotra.AdvancedRuntime",
                 "io.knotra.RuntimeTransaction",
+                "io.knotra.Registration",
                 "io.knotra.RegistrationHandle",
                 "io.knotra.NoConfig",
                 "io.knotra.ComponentFactory",
@@ -64,6 +65,7 @@ final class DocsVocabularyTest {
                 .map(identifier -> "QuickStartExample contains " + identifier)
                 .toList();
         assertTrue(failures.isEmpty(), "\n" + String.join("\n", failures));
+
         assertTrue(text.contains("closeAsync()"),
                 "QuickStartExample must document the bounded closeAsync production alternative next to try-with-resources");
     }

@@ -6,6 +6,8 @@ import io.knotra.ComponentFactory;
 import io.knotra.ConfiguredMountHandle;
 import io.knotra.KnotraRuntime;
 
+import io.knotra.MountOptions;
+
 import java.util.List;
 import java.util.Objects;
 
@@ -56,6 +58,19 @@ public final class ConfiguredBeanDefinition<C, T> {
             C config) {
         return Beans.mount(runtime, this, mountId, config);
     }
+
+    public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, C config, MountOptions options) {
+        return mount(runtime, componentId(), config, options);
+    }
+
+    public ConfiguredMountHandle<C> mount(
+            KnotraRuntime runtime,
+            String mountId,
+            C config,
+            MountOptions options) {
+        return Beans.mount(runtime, this, mountId, config, options);
+    }
+
 
     ComponentFactory<C> asFactory() {
         return support;

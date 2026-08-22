@@ -142,9 +142,10 @@ A1 payable=370 rule=threshold-300
 A2 payable=340 rule=tiered-gold
 ```
 
-`report.allActive()` 可能为 false，因为动态代理结算服务不需要重建，影响集可能为空。这不是故障；确认具体结算服务可用要用 `checkout.requireActive(Duration.ofSeconds(10))`。
+`report.allAffectedActive()` 可能为 false，因为动态代理结算服务不需要重建，影响集可能为空。这不是故障；确认具体结算服务可用要用 `checkout.requireActive(Duration.ofSeconds(10))`。
 
 ## 固定代际消费方
+
 
 订单风控或批量计费如果必须保证整批订单使用同一策略，应使用 fixed dependency：
 

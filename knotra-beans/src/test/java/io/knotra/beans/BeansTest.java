@@ -804,6 +804,46 @@ final class BeansTest {
         assertFalse(quickStart.contains("NoConfig"));
     }
 
+    @Test
+    void happyPathDslAllowsDirectMountAndProvideAsClassAndRuntimeRequire() throws Exception {
+        interface Greeting {
+            String message();
+        }
+        record ConstantGreeting(String message) implements Greeting {}
+        interface RenderedGreeting {
+            String render(String name);
+        }
+        record GreetingRenderer(Greeting greeting) implements RenderedGreeting {
+            @Override
+            public String render(String name) {
+                return greeting.message() + " " + name;
+            }
+        }
+
+        var greeting = runtime
+                .publish(Greeting.class, new ConstantGreeting("Hello"))
+                .publication();
+
+        MountHandle renderer = Beans
+                .component("greeting-renderer")
+                .with(Beans.fixed(Greeting.class))
+                .create(GreetingRenderer::new)
+                .provideAs(RenderedGreeting.class)
+                .mount(runtime);
+
+        renderer.requireActive(WAIT);
+
+        assertEquals("Hello Knotra",
+                runtime.require(RenderedGreeting.class).render("Knotra"));
+
+        greeting.update(new ConstantGreeting("Hi"))
+                .awaitSettled(WAIT);
+
+        assertEquals("Hi Knotra",
+                runtime.require(RenderedGreeting.class).render("Knotra"));
+    }
+
+
     private ComponentState settle(MountHandle handle) throws Exception {
         return handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }

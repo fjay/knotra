@@ -12,11 +12,5 @@ public interface PublicationChange<T> extends Settlement {
 
     /** 获取操作所关联的稳定发布插槽。 */
     Publication<T> publication();
-
-    /**
-     * 获取本次操作创建的新一代注册凭据。
-     *
-     * <p>仅在 {@code PUBLISH} 或 {@code UPDATE} 操作时非空；{@code UNPUBLISH} 操作时固定返回 {@code null}。</p>
-     */
-    Registration<T> registration();
 }
+

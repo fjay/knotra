@@ -5,8 +5,9 @@ final class SettlementReportTest {
     @org.junit.jupiter.api.Test
     void emptyWaitingAndDisposedAffectedSetsHaveExplicitSemantics() {
         SettlementReport empty = new SettlementReport(0, java.util.List.of(), java.util.List.of());
+        org.junit.jupiter.api.Assertions.assertFalse(empty.hasAffectedMounts());
         org.junit.jupiter.api.Assertions.assertFalse(empty.hasFailedMounts());
-        org.junit.jupiter.api.Assertions.assertFalse(empty.allActive());
+        org.junit.jupiter.api.Assertions.assertFalse(empty.allAffectedActive());
 
         RuntimeDiagnostic diagnostic = new RuntimeDiagnostic(
                 DiagnosticCode.MISSING_CAPABILITY, "mount", "waiting");
@@ -15,16 +16,18 @@ final class SettlementReportTest {
                 java.util.List.of(new SettlementReport.MountOutcome(
                         "mount", "mount", ComponentState.WAITING, java.util.List.of(diagnostic))),
                 java.util.List.of());
+        org.junit.jupiter.api.Assertions.assertTrue(waiting.hasAffectedMounts());
         org.junit.jupiter.api.Assertions.assertFalse(waiting.hasFailedMounts());
-        org.junit.jupiter.api.Assertions.assertFalse(waiting.allActive());
+        org.junit.jupiter.api.Assertions.assertFalse(waiting.allAffectedActive());
 
         SettlementReport disposed = new SettlementReport(
                 2,
                 java.util.List.of(new SettlementReport.MountOutcome(
                         "mount", "mount", ComponentState.DISPOSED, java.util.List.of())),
                 java.util.List.of());
+        org.junit.jupiter.api.Assertions.assertTrue(disposed.hasAffectedMounts());
         org.junit.jupiter.api.Assertions.assertFalse(disposed.hasFailedMounts());
-        org.junit.jupiter.api.Assertions.assertFalse(disposed.allActive());
+        org.junit.jupiter.api.Assertions.assertFalse(disposed.allAffectedActive());
     }
 
     @org.junit.jupiter.api.Test
@@ -53,17 +56,18 @@ final class SettlementReportTest {
                     },
                     CapabilityRequirement.required(affected));
 
-            Publication<String> publication = runtime.publish(affected, "one").publication();
-            publication.currentRegistration().orElseThrow()
-                    .awaitSettled(java.time.Duration.ofSeconds(10));
+            PublicationChange<String> pubChange = runtime.publish(affected, "one");
+            Publication<String> publication = pubChange.publication();
+            pubChange.awaitSettled(java.time.Duration.ofSeconds(10));
             org.junit.jupiter.api.Assertions.assertEquals(
                     ComponentState.ACTIVE, TestKit.settle(consumer).call());
 
             SettlementReport report = publication.update("two")
                     .awaitSettled(java.time.Duration.ofSeconds(10));
 
+            org.junit.jupiter.api.Assertions.assertTrue(report.hasAffectedMounts());
             org.junit.jupiter.api.Assertions.assertTrue(report.hasFailedMounts());
-            org.junit.jupiter.api.Assertions.assertFalse(report.allActive());
+            org.junit.jupiter.api.Assertions.assertFalse(report.allAffectedActive());
             org.junit.jupiter.api.Assertions.assertEquals(
                     java.util.List.of(consumer.handleId()),
                     report.mountOutcomes().stream().map(SettlementReport.MountOutcome::handleId).toList());
@@ -76,6 +80,7 @@ final class SettlementReportTest {
             runtime.close();
         }
     }
+
 
     @org.junit.jupiter.api.Test
     void mountDisposalHistoryIsNotAccumulatedByTheRuntimeKernel() throws Exception {

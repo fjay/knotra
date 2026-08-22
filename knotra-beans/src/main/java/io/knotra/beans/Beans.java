@@ -6,7 +6,9 @@ import io.knotra.ConfiguredMountHandle;
 import io.knotra.DynamicCapability;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountHandle;
+import io.knotra.MountOptions;
 import io.knotra.NoConfig;
+
 
 import java.util.List;
 import java.util.Objects;
@@ -681,6 +683,14 @@ public final class Beans {
             return provide(CapabilityKey.of(type));
         }
 
+        public <P> OutputStage<T> provideAs(Class<P> type) {
+            return provideAs(type, type::cast);
+        }
+
+        public <P> OutputStage<T> provideAs(CapabilityKey<P> key) {
+            return provideAs(key, key.type()::cast);
+        }
+
         public <P> OutputStage<T> provideAs(
                 CapabilityKey<P> key,
                 OutputMapper<? super T, ? extends P> mapper) {
@@ -715,6 +725,22 @@ public final class Beans {
         public BeanDefinition<T> build() {
             return new BeanDefinition<>(BeanStage.mountFactory(stage));
         }
+
+        public MountHandle mount(KnotraRuntime runtime) {
+            return build().mount(runtime);
+        }
+
+        public MountHandle mount(KnotraRuntime runtime, String mountId) {
+            return build().mount(runtime, mountId);
+        }
+
+        public MountHandle mount(KnotraRuntime runtime, MountOptions options) {
+            return build().mount(runtime, options);
+        }
+
+        public MountHandle mount(KnotraRuntime runtime, String mountId, MountOptions options) {
+            return build().mount(runtime, mountId, options);
+        }
     }
 
     public static final class ConfigOutputStage<C, T> {
@@ -730,6 +756,14 @@ public final class Beans {
 
         public ConfigOutputStage<C, T> provide(Class<T> type) {
             return provide(CapabilityKey.of(type));
+        }
+
+        public <P> ConfigOutputStage<C, T> provideAs(Class<P> type) {
+            return provideAs(type, type::cast);
+        }
+
+        public <P> ConfigOutputStage<C, T> provideAs(CapabilityKey<P> key) {
+            return provideAs(key, key.type()::cast);
         }
 
         public <P> ConfigOutputStage<C, T> provideAs(
@@ -770,29 +804,66 @@ public final class Beans {
         public ConfiguredBeanDefinition<C, T> build() {
             return new ConfiguredBeanDefinition<>(stage.build());
         }
+
+        public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, C config) {
+            return build().mount(runtime, config);
+        }
+
+        public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, String mountId, C config) {
+            return build().mount(runtime, mountId, config);
+        }
+
+        public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, C config, MountOptions options) {
+            return build().mount(runtime, config, options);
+        }
+
+        public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, String mountId, C config, MountOptions options) {
+            return build().mount(runtime, mountId, config, options);
+        }
     }
 
     /** 声明必需的固定依赖项（启动时必须就绪，提供方被替换将导致 Bean 重新激活）。 */
-    public static <T> BeanDependency<T> required(CapabilityKey<T> key) {
+    public static <T> BeanDependency<T> fixed(CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         return BeanDependency.of(CapabilityRequirement.required(key), context -> context.require(key));
     }
 
     /** 基于类型声明必需的固定依赖项。 */
-    public static <T> BeanDependency<T> required(Class<T> type) {
-        return required(CapabilityKey.of(type));
+    public static <T> BeanDependency<T> fixed(Class<T> type) {
+        return fixed(CapabilityKey.of(type));
     }
 
     /** 声明可选的固定依赖项。 */
-    public static <T> BeanDependency<Optional<T>> optional(CapabilityKey<T> key) {
+    public static <T> BeanDependency<Optional<T>> fixedOptional(CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         return BeanDependency.of(CapabilityRequirement.optional(key), context -> context.find(key));
     }
 
     /** 基于类型声明可选的固定依赖项。 */
-    public static <T> BeanDependency<Optional<T>> optional(Class<T> type) {
-        return optional(CapabilityKey.of(type));
+    public static <T> BeanDependency<Optional<T>> fixedOptional(Class<T> type) {
+        return fixedOptional(CapabilityKey.of(type));
     }
+
+    /** 声明必需的固定依赖项（启动时必须就绪，提供方被替换将导致 Bean 重新激活）。 */
+    public static <T> BeanDependency<T> required(CapabilityKey<T> key) {
+        return fixed(key);
+    }
+
+    /** 基于类型声明必需的固定依赖项。 */
+    public static <T> BeanDependency<T> required(Class<T> type) {
+        return fixed(type);
+    }
+
+    /** 声明可选的固定依赖项。 */
+    public static <T> BeanDependency<Optional<T>> optional(CapabilityKey<T> key) {
+        return fixedOptional(key);
+    }
+
+    /** 基于类型声明可选的固定依赖项。 */
+    public static <T> BeanDependency<Optional<T>> optional(Class<T> type) {
+        return fixedOptional(type);
+    }
+
 
     /**
      * 声明必需的动态接口代理依赖项。
@@ -908,6 +979,24 @@ public final class Beans {
         return runtime.mount(mountId, definition.asFactory());
     }
 
+    public static <T> MountHandle mount(
+            KnotraRuntime runtime,
+            BeanDefinition<T> definition,
+            MountOptions options) {
+        return mount(runtime, definition, definition.componentId(), options);
+    }
+
+    public static <T> MountHandle mount(
+            KnotraRuntime runtime,
+            BeanDefinition<T> definition,
+            String mountId,
+            MountOptions options) {
+        Objects.requireNonNull(runtime, "runtime");
+        Objects.requireNonNull(definition, "definition");
+        Objects.requireNonNull(mountId, "mountId");
+        return runtime.mount(mountId, definition.asFactory(), options);
+    }
+
     public static <C, T> ConfiguredMountHandle<C> mount(
             KnotraRuntime runtime,
             ConfiguredBeanDefinition<C, T> definition,
@@ -925,6 +1014,27 @@ public final class Beans {
         Objects.requireNonNull(mountId, "mountId");
         return runtime.mount(mountId, definition.asFactory(), config);
     }
+
+    public static <C, T> ConfiguredMountHandle<C> mount(
+            KnotraRuntime runtime,
+            ConfiguredBeanDefinition<C, T> definition,
+            C config,
+            MountOptions options) {
+        return mount(runtime, definition, definition.componentId(), config, options);
+    }
+
+    public static <C, T> ConfiguredMountHandle<C> mount(
+            KnotraRuntime runtime,
+            ConfiguredBeanDefinition<C, T> definition,
+            String mountId,
+            C config,
+            MountOptions options) {
+        Objects.requireNonNull(runtime, "runtime");
+        Objects.requireNonNull(definition, "definition");
+        Objects.requireNonNull(mountId, "mountId");
+        return runtime.mount(mountId, definition.asFactory(), config, options);
+    }
+
 
     static String requireComponentId(String componentId) {
         Objects.requireNonNull(componentId, "componentId");

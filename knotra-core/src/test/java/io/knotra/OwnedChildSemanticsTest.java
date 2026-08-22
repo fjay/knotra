@@ -269,7 +269,7 @@ final class OwnedChildSemanticsTest {
                 .map(SettlementReport.MountOutcome::state).orElseThrow(), report::toString);
         assertEquals(ComponentState.ACTIVE, report.outcome(child.get().handleId())
                 .map(SettlementReport.MountOutcome::state).orElseThrow(), report::toString);
-        assertTrue(report.allActive());
+        assertTrue(report.allAffectedActive());
     }
 
     @Test
@@ -298,7 +298,7 @@ final class OwnedChildSemanticsTest {
         SettlementReport report = receipt.settlement().whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertTrue(report.hasFailedMounts(), report::toString);
-        assertFalse(report.allActive());
+        assertFalse(report.allAffectedActive());
         assertEquals(ComponentState.ACTIVE, report.outcome(receipt.value().handleId())
                 .map(SettlementReport.MountOutcome::state).orElseThrow());
         assertEquals(ComponentState.FAILED, report.outcome(child.get().handleId())
@@ -321,7 +321,7 @@ final class OwnedChildSemanticsTest {
                         (context, config) -> {
                             starts.incrementAndGet();
                             MountHandle child = context.mountChild(
-                                    "child-" + starts.get(),
+                                     "child-" + starts.get(),
                                     TestKit.factory("child", new TestKit.Scripted<>(
                                             ComponentDescriptor.named("child"),
                                             (childContext, childConfig) -> { })),
@@ -354,8 +354,9 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE,
                 report.outcome(secondChild.get().handleId())
                         .map(SettlementReport.MountOutcome::state).orElseThrow());
-        assertFalse(report.allActive(), report::toString);
+        assertFalse(report.allAffectedActive(), report::toString);
     }
+
 
     private ComponentFactory<NoConfig> childFactory(
             String mountId,

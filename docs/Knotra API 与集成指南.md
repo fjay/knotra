@@ -42,27 +42,26 @@ CapabilityKey<PaymentGateway> BACKUP =
 
 运行时生命周期内，同名能力绑定唯一的精确 Java 类型。不同 ClassLoader 加载出的同名 `Class` 不是同一个合约。
 
-### Publication 与 Registration
+### Publication 与 Simple API
 
-`Publication<T>` 是稳定逻辑槽位，`Registration<T>` 是一个已提交代际：
+`Publication<T>` 是稳定逻辑槽位：
 
 ```java
 PublicationChange<Greeting> first = runtime.publish(Greeting.class, new StandardGreeting());
 Publication<Greeting> publication = first.publication();
 
 PublicationChange<Greeting> second = publication.update(new FastGreeting());
-Registration<Greeting> current = second.registration();
 ```
 
-不要长期持有第一次的 `PublicationChange<T>`。它只描述 PUBLISH、UPDATE 或 UNPUBLISH 这一次操作。并发 update 在 Publication 上线性化，但每个调用者都等待自己返回的 change，不会误等后来者。`registration()` 只在 PUBLISH 和 UPDATE 后返回本次新注册；`unpublish()` 返回的 change 中 `registration()` 为 `null`，不会暴露被移除的旧代际。
+不要长期持有第一次的 `PublicationChange<T>`。它只描述 PUBLISH、UPDATE 或 UNPUBLISH 这一次操作。并发 update 在 Publication 上线性化，每个调用者都等待自己返回的 change，不会误等后来者。
 
 Publication 状态：
 
-- `PUBLISHED`：槽位有当前注册。
+- `PUBLISHED`：槽位有当前有效发布。
 - `UNPUBLISHED`：主动撤销，终态；再次 unpublish 幂等，不会自动重新发布。
-- `DISPLACED`：外部替换、Context 释放或 Runtime 关闭移除了当前注册，槽位不再接受 update。
+- `DISPLACED`：外部替换、Context 释放或 Runtime 关闭移除了当前发布，槽位不再接受 update。
 
-需要精确撤销某一代时才使用 Advanced API 的 `Registration<T>`：
+需要精确控制与撤销具体某一代时才使用 Advanced API 的 `Registration<T>`：
 
 ```java
 Registration<Greeting> registration =
@@ -93,13 +92,15 @@ SettlementReport report = change.awaitSettled(Duration.ofSeconds(10));
 
 `SettlementReport` 是操作范围报告：
 
-- `hasFailedMounts()`：影响集中是否存在 FAILED。
+- `hasAffectedMounts()`：本次操作是否存在受影响的挂载点。
+- `hasFailedMounts()`：影响集中是否存在 FAILED 状态挂载。
 - `failedMounts()`：列出失败挂载和诊断。
-- `allActive()`：影响集非空且全部 ACTIVE 才为 true。
+- `allAffectedActive()`：影响集非空且全部处于 ACTIVE 状态才为 true。
 - `outcome(handleId)`：查询某个受影响挂载。
 - `diagnostics()`：只包含本次相关诊断，不混入全局无关诊断。
 
-空影响集没有失败挂载，因此 `hasFailedMounts()` 是 false；但它不是健康声明，`allActive()` 仍是 false。动态代理消费方可能无需重建，因此提供方替换的影响集可以为空。
+空影响集没有受影响挂载，因此 `hasAffectedMounts()` 为 false，`hasFailedMounts()` 为 false，`allAffectedActive()` 为 false。动态代理消费方无需重建时，提供方替换的影响集可以为空。
+
 
 要等待某个具体挂载 ACTIVE，使用：
 

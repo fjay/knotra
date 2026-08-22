@@ -51,9 +51,9 @@ if (report.hasFailedMounts()) {
 }
 ```
 
-### hasFailedMounts 为 false，为什么 allActive 也是 false？
+### hasFailedMounts 为 false，为什么 allAffectedActive 也是 false？
 
-`allActive()` 要求影响集非空且全部 ACTIVE。影响集为空时没有失败挂载，但不构成“全部 ACTIVE”的健康证明。动态代理消费方无需重建时，提供方更新的影响集可能为空。
+`allAffectedActive()` 要求受影响挂载集非空且全部处于 ACTIVE 状态。若本次变更没有受影响的挂载（例如更新了仅被动态代理依赖的能力，消费方无需重建），则 `hasAffectedMounts()` 为 false，`allAffectedActive()` 也是 false。
 
 ### report 正常，怎么确认我的挂载可用？
 
@@ -69,9 +69,10 @@ handle.requireActive(Duration.ofSeconds(10));
 
 检查 `publication.state()`：
 
-- `UNPUBLISHED`：主动撤销是终态，需要重新创建 Publication；`unpublish()` 返回的 change 中 `registration()` 为 null。
-- `DISPLACED`：外部 revoke、同 key 外部替换、Context 释放或 Runtime close 移除了当前注册。
-- `PUBLISHED`：仍可更新。
+- `UNPUBLISHED`：主动撤销是终态，需要重新创建 Publication。
+- `DISPLACED`：外部 revoke、同 key 外部替换、Context 释放或 Runtime close 移除了当前能力槽位。
+- `PUBLISHED`：仍可正常更新。
+
 
 并发 update 只有一个线性化结果，但每个成功调用都会得到自己的 `PublicationChange`。不要共享一个 change 对象等待不同操作。
 
