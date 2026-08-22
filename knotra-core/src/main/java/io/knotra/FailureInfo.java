@@ -6,7 +6,12 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
 
-/** Immutable failure detail containing only stable text and timestamps. */
+/**
+ * 不可变的结构化异常诊断信息。
+ *
+ * <p>设计原则：严格仅包含稳定的文本字符串与时间戳，严禁强引用任何 {@link Throwable}、{@link Class}
+ * 或 {@link ClassLoader}，彻底杜绝动态插件卸载时的类加载器泄漏风险。</p>
+ */
 public record FailureInfo(
         FailurePhase phase,
         String exceptionType,
@@ -15,7 +20,7 @@ public record FailureInfo(
         List<String> stackTrace,
         Instant occurredAt) {
 
-    /** Stable marker used by diagnostics that have no underlying failure detail. */
+    /** 结构化诊断专用的空失败详情哨兵常量。 */
     public static final FailureInfo EMPTY = new FailureInfo(
             FailurePhase.SETTLEMENT,
             "",

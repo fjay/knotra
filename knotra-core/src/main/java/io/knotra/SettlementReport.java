@@ -6,11 +6,10 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Immutable operation-scoped settlement report for one committed structural change.
+ * 单次已提交结构变更操作作用域内的不可变结算报告。
  *
- * <p>Normal completion means propagation and drain converged. A mount in the affected set may still
- * be FAILED: that outcome is represented here rather than by failing the settlement future. Diagnostics
- * belong to the affected mounts, never to an unrelated global snapshot.</p>
+ * <p>报告正常完成代表本次变更的依赖级联、子组件启动与旧代际排空已经平稳收敛。
+ * 报告仅涵盖受本次操作影响的挂载点及其相关诊断，不掺杂全局无关状态。</p>
  */
 public record SettlementReport(
         long generation,
@@ -28,28 +27,30 @@ public record SettlementReport(
     }
 
     /**
-     * Returns whether any affected mount ended in FAILED.
-     * An empty affected set has no failed mounts.
+     * 判断本次受影响的挂载点中是否存在处于 {@code FAILED} 状态的挂载。
+     * 空影响集返回 false。
      */
     public boolean hasFailedMounts() {
         return !failedMounts().isEmpty();
     }
 
     /**
-     * Returns true only when at least one mount was affected and every one is ACTIVE.
-     * WAITING, FAILED, and DISPOSED are therefore not "all active".
+     * 判断本次受影响的挂载点是否非空且全部处于 {@code ACTIVE} 活跃状态。
+     * 处于 WAITING、FAILED 或 DISPOSED 均不视作 allActive。
      */
     public boolean allActive() {
         return !mountOutcomes.isEmpty()
                 && mountOutcomes.stream().allMatch(outcome -> outcome.state() == ComponentState.ACTIVE);
     }
 
+    /** 获取所有处于 FAILED 失败状态的挂载结果列表。 */
     public List<MountOutcome> failedMounts() {
         return mountOutcomes.stream()
                 .filter(outcome -> outcome.state() == ComponentState.FAILED)
                 .toList();
     }
 
+    /** 根据挂载句柄 ID 获取具体的挂载结算结果。 */
     public Optional<MountOutcome> outcome(String handleId) {
         Objects.requireNonNull(handleId, "handleId");
         return mountOutcomes.stream()

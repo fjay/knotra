@@ -4,7 +4,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 
-/** A mount did not become ACTIVE, or a bounded activation wait did not converge. */
+/**
+ * 当通过 {@code requireActive()} 断言挂载状态失败、或有界等待超时组件未达 {@code ACTIVE} 状态时抛出的异常。
+ */
 public final class MountNotActiveException extends RuntimeException {
     private static final long serialVersionUID = 1L;
 

@@ -3,14 +3,14 @@ package io.knotra;
 import java.util.Objects;
 
 /**
- * SPI adapter type for a component mount that has no public configuration contract.
+ * 无公开配置契约组件的挂载工厂 SPI 适配类型。
  *
- * <p>The simple runtime mount overloads use this marker type so NoConfig remains an advanced/SPI
- * concern. Advanced transaction callers may still use {@code ComponentFactory<NoConfig>} directly;
- * use {@link #adapt(ComponentFactory)} when bridging such a factory into the simple facade.</p>
+ * <p>Simple API 的挂载重载直接接收该类型，使日常业务开发免受 {@link NoConfig} 占位泛型的干扰。
+ * 底层或高级工厂实现可通过 {@link #adapt(ComponentFactory)} 便捷桥接。</p>
  */
 public interface MountFactory extends ComponentFactory<NoConfig> {
 
+    /** 将常规的 ComponentFactory&lt;NoConfig&gt; 包装适配为 MountFactory。 */
     static MountFactory adapt(ComponentFactory<NoConfig> factory) {
         Objects.requireNonNull(factory, "factory");
         return new MountFactory() {

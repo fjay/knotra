@@ -9,11 +9,10 @@ import org.springframework.context.annotation.AnnotationConfigApplicationContext
 import java.util.function.Consumer;
 
 /**
- * Immutable builder for an Activation-owned Spring child context without public configuration.
+ * 无公开配置契约的 Spring 子容器模块不可变构建器。
  *
- * <p>Each fluent method delegates to {@link SpringModuleBuilder} and rewraps the result so the
- * chain keeps the no-config static type. {@link #build()} yields a {@link MountFactory} for the
- * simple runtime mount facade; {@code NoConfig} never appears in user code.</p>
+ * <p>提供链式注入上游 Knotra 能力为 Spring Bean、以及将 Spring 内部 Bean 导出为 Knotra Capability 的完整 DSL。
+ * {@link #build()} 方法直接产出 {@link MountFactory}，无缝适配 Simple API 的挂载入口。</p>
  */
 public final class SpringNoConfigModuleBuilder {
 

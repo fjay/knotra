@@ -13,16 +13,26 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Type-safe DSL for adapting ordinary Java objects to Activation-owned beans.
+ * 将普通 Java 对象适配为受 Knotra 激活生命周期托管的类型安全 Bean DSL。
  *
- * <p>All builder stages are immutable. Definitions can be built once and mounted repeatedly.</p>
+ * <p>所有 Builder 阶段均为不可变（Immutable），一次构建生成的 {@link BeanDefinition} 可重复挂载。</p>
  */
 public final class Beans {
 
     private Beans() {
     }
 
-    public enum LifecycleMode { AUTO, UNMANAGED, CUSTOM_SYNC, CUSTOM_ASYNC }
+    /** Bean 的生命周期托管模式。 */
+    public enum LifecycleMode {
+        /** 自动模式：若对象实现了 AutoCloseable 则自动注册关闭钩子。 */
+        AUTO,
+        /** 非托管模式：不注册任何生命周期回调。 */
+        UNMANAGED,
+        /** 自定义同步销毁模式。 */
+        CUSTOM_SYNC,
+        /** 自定义异步销毁模式。 */
+        CUSTOM_ASYNC
+    }
 
     @FunctionalInterface
     public interface Creator0<T> {
@@ -762,30 +772,33 @@ public final class Beans {
         }
     }
 
+    /** 声明必需的固定依赖项（启动时必须就绪，提供方被替换将导致 Bean 重新激活）。 */
     public static <T> BeanDependency<T> required(CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         return BeanDependency.of(CapabilityRequirement.required(key), context -> context.require(key));
     }
 
+    /** 基于类型声明必需的固定依赖项。 */
     public static <T> BeanDependency<T> required(Class<T> type) {
         return required(CapabilityKey.of(type));
     }
 
+    /** 声明可选的固定依赖项。 */
     public static <T> BeanDependency<Optional<T>> optional(CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         return BeanDependency.of(CapabilityRequirement.optional(key), context -> context.find(key));
     }
 
+    /** 基于类型声明可选的固定依赖项。 */
     public static <T> BeanDependency<Optional<T>> optional(Class<T> type) {
         return optional(CapabilityKey.of(type));
     }
 
     /**
-     * Required dynamic interface dependency.
+     * 声明必需的动态接口代理依赖项。
      *
-     * <p>The requirement is checked only for the bean's first activation. Once active, a missing
-     * provider keeps the bean ACTIVE and method calls fail; replacing the provider does not recreate
-     * the bean. Each proxy method independently holds a provider lease.</p>
+     * <p>仅在组件首次启动激活时校验提供方是否存在；一旦处于 ACTIVE 状态，提供方缺失或热替换不会重启该 Bean，
+     * 每次方法调用会自动获取提供方租约并透明路由。</p>
      */
     public static <T> BeanDependency<T> dynamic(CapabilityKey<T> key) {
         requireProxyInterface(key);
@@ -794,11 +807,12 @@ public final class Beans {
                 context -> context.subscribe(key).proxy(key.type()));
     }
 
+    /** 基于接口类型声明必需的动态代理依赖项。 */
     public static <T> BeanDependency<T> dynamic(Class<T> type) {
         return dynamic(CapabilityKey.of(type));
     }
 
-    /** Optional dynamic interface proxy; use {@link #dynamic} for required startup semantics. */
+    /** 声明可选的动态接口代理依赖项。 */
     public static <T> BeanDependency<T> dynamicOptional(CapabilityKey<T> key) {
         requireProxyInterface(key);
         return BeanDependency.of(
@@ -806,16 +820,15 @@ public final class Beans {
                 context -> context.subscribe(key).proxy(key.type()));
     }
 
+    /** 基于接口类型声明可选的动态代理依赖项。 */
     public static <T> BeanDependency<T> dynamicOptional(Class<T> type) {
         return dynamicOptional(CapabilityKey.of(type));
     }
 
     /**
-     * Required explicit dynamic capability dependency.
+     * 声明显式的必需动态能力句柄依赖项（DynamicCapability）。
      *
-     * <p>REQUIRED affects only first activation. After the bean is ACTIVE, a missing provider does
-     * not deactivate it; subsequent calls fail. Use {@code call} or {@code callAsync} when several
-     * operations must be fixed to the same provider lease.</p>
+     * <p>供需要在一个原子租约（Lease）内连续调用多次方法的高级场景使用。</p>
      */
     public static <T> BeanDependency<DynamicCapability<T>> dynamicCapability(
             CapabilityKey<T> key) {
@@ -825,17 +838,12 @@ public final class Beans {
                 context -> context.subscribe(key));
     }
 
+    /** 基于类型声明显式的必需动态能力句柄依赖项。 */
     public static <T> BeanDependency<DynamicCapability<T>> dynamicCapability(Class<T> type) {
         return dynamicCapability(CapabilityKey.of(type));
     }
 
-    /**
-     * Optional explicit dynamic capability dependency.
-     *
-     * <p>An optional dynamic dependency never blocks activation. Provider disappearance likewise
-     * leaves an ACTIVE bean ACTIVE; calls fail until a provider is available. Explicit calls can
-     * hold one provider lease across multiple methods.</p>
-     */
+    /** 声明显式的可选动态能力句柄依赖项。 */
     public static <T> BeanDependency<DynamicCapability<T>> dynamicCapabilityOptional(
             CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
@@ -844,15 +852,18 @@ public final class Beans {
                 context -> context.subscribe(key));
     }
 
+    /** 基于类型声明显式的可选动态能力句柄依赖项。 */
     public static <T> BeanDependency<DynamicCapability<T>> dynamicCapabilityOptional(
             Class<T> type) {
         return dynamicCapabilityOptional(CapabilityKey.of(type));
     }
 
+    /** 创建无配置 Bean 定义的流式构建器。 */
     public static Builder0 component(String componentId) {
         return new Builder0(requireComponentId(componentId));
     }
 
+    /** 创建带类型化配置的 Bean 定义流式构建器。 */
     public static <C> ConfigBuilder0<C> component(String componentId, Class<C> configType) {
         return new ConfigBuilder0<>(requireComponentId(componentId), configType);
     }

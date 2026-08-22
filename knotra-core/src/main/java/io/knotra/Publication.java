@@ -3,22 +3,41 @@ package io.knotra;
 import java.util.Optional;
 
 /**
- * A stable capability publication slot. The slot tracks registrations; it never stores their value.
+ * 稳定的能力发布逻辑插槽。
  *
- * <p>DISPLACED is terminal: an external replacement, context disposal, or runtime close removes the
- * current registration without silently creating a new one. A publication can only be updated while
- * PUBLISHED, and UNPUBLISHED is idempotent for later unpublish calls.</p>
+ * <p>Publication 跟踪能力注册的演进历史，自身不直接缓存实例对象。
+ * 插槽具备明确的生命周期状态转换规则：
+ * <ul>
+ *   <li>{@code PUBLISHED}：活跃状态，支持重复调用 {@link #update(Object)} 进行原子热更新。</li>
+ *   <li>{@code UNPUBLISHED}：主动撤销终态，不可再更新。</li>
+ *   <li>{@code DISPLACED}：被外部替换或上下文销毁淘汰的终态。</li>
+ * </ul>
+ * </p>
+ *
+ * @param <T> 能力接口类型
  */
 public interface Publication<T> {
+
+    /** 所发布能力的类型化唯一标识键。 */
     CapabilityKey<T> key();
 
+    /** 关联的上下文节点句柄。 */
     ContextHandle context();
 
+    /** 当前发布插槽的状态。 */
     PublicationState state();
 
+    /** 获取当前代际对应的注册凭证（若已撤销或置换则返回 empty）。 */
     Optional<Registration<T>> currentRegistration();
 
+    /**
+     * 更新插槽中的能力提供实例，原子发布新一代注册并返回本次操作变更。
+     *
+     * @param value 新的能力实例
+     * @return 包含本次操作结果与结算等待的变更对象
+     */
     PublicationChange<T> update(T value);
 
+    /** 主动撤销该发布插槽，撤销为终态且幂等。 */
     PublicationChange<T> unpublish();
 }
