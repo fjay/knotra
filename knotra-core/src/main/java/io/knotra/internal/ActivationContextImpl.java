@@ -2,6 +2,8 @@ package io.knotra.internal;
 
 import io.knotra.ActivationContext;
 import io.knotra.CapabilityKey;
+import io.knotra.CapabilityRequirement;
+import io.knotra.DynamicCapability;
 import io.knotra.ComponentFactory;
 import io.knotra.ComponentHandle;
 import io.knotra.ContextInfo;
@@ -44,11 +46,37 @@ final class ActivationContextImpl implements ActivationContext {
             throw new IllegalArgumentException(
                     "capability is not declared by component: " + key.name());
         }
+        if (binding.binding() ==
+                CapabilityRequirement.CapabilityBinding.DYNAMIC) {
+            throw new IllegalArgumentException(
+                    "dynamic capability must be accessed through subscribe: " + key.name());
+        }
         if (!binding.present()) {
             return Optional.empty();
         }
         return Optional.ofNullable(key.type().cast(
                 activation.capturedValues.get(key.name())));
+    }
+
+    @Override
+    public <T> DynamicCapability<T> subscribe(CapabilityKey<T> key) {
+        ensureOpen();
+        ensureNotStale();
+        Objects.requireNonNull(key, "key");
+        CapabilityRequirement requirement = activation.owner.prepared.descriptor()
+                .requirement(key)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "capability is not declared by component: " + key.name()));
+        if (!requirement.key().equals(key)) {
+            throw new IllegalArgumentException(
+                    "capability declaration type mismatch: " + key.name());
+        }
+        if (requirement.binding() ==
+                CapabilityRequirement.CapabilityBinding.DYNAMIC) {
+            return new DynamicCapabilityImpl<>(runtime, activation, key);
+        }
+        throw new IllegalArgumentException(
+                "subscribe is only valid for dynamic capability: " + key.name());
     }
 
     @Override
@@ -65,7 +93,7 @@ final class ActivationContextImpl implements ActivationContext {
         if (activation.stagedRegistrations.containsKey(key.name())) {
             throw new IllegalArgumentException("capability already staged: " + key.name());
         }
-        activation.stage(key, value, activation.owner.contextId);
+        activation.stage(key, value);
     }
 
     @Override

@@ -42,6 +42,10 @@
                                         <exclude>io.knotra:knotra-pf4j-spi</exclude>
                                         <exclude>io.knotra:knotra-pf4j</exclude>
                                         <exclude>io.knotra:knotra-loader</exclude>
+                                        <exclude>io.knotra:knotra-beans</exclude>
+                                        <exclude>io.knotra:knotra-beans-processor</exclude>
+                                        <exclude>io.knotra:knotra-spring</exclude>
+                                        <exclude>org.springframework:*</exclude>
                                     </excludes>
                                 </bannedDependencies>
                             </rules>

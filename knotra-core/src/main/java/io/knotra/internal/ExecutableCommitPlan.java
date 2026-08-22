@@ -19,6 +19,7 @@ final class ExecutableCommitPlan {
     final Set<String> removedComponents = new LinkedHashSet<>();
     final Set<String> resetAutoRestart = new LinkedHashSet<>();
     final Set<String> contextDisposals = new LinkedHashSet<>();
+    final Map<String, ProviderLeaseRuntime> retiredRegistrations = new HashMap<>();
     record ConfigUpdate(Object config, long revision) {
     }
 }

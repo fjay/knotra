@@ -4,26 +4,29 @@ import io.knotra.ActivationContext;
 import io.knotra.ActivationState;
 import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
+import io.knotra.CapabilityUnavailableException;
+import io.knotra.ComponentFactory;
 import io.knotra.ComponentGoal;
 import io.knotra.ComponentHandle;
-import io.knotra.ComponentFactory;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.ContextInfo;
 import io.knotra.ContextState;
 import io.knotra.DiagnosticCode;
+import io.knotra.DynamicCapabilityClosedException;
 import io.knotra.KnotraConfig;
 import io.knotra.KnotraRuntime;
 import io.knotra.LifecycleState;
 import io.knotra.MountOptions;
-import io.knotra.TransactionReceipt;
-import io.knotra.TransactionRejectedException;
 import io.knotra.RegistrationHandle;
 import io.knotra.RuntimeDiagnostic;
-import io.knotra.RuntimeTransaction;
 import io.knotra.RuntimeSnapshot;
+import io.knotra.RuntimeTransaction;
+import io.knotra.TransactionReceipt;
+import io.knotra.TransactionRejectedException;
 
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -35,6 +38,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -43,6 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 
 /**
@@ -152,6 +157,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         long committedGeneration;
         Set<String> postCommitDirty = new LinkedHashSet<>();
         Set<String> contextDisposals = new LinkedHashSet<>();
+        List<CompletableFuture<Void>> registrationDrains = List.of();
         synchronized (coordinator) {
             if (closing.get()) {
                 throw new TransactionRejectedException(List.of(new RuntimeDiagnostic(
@@ -185,6 +191,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 RuntimeView next = draft.publishOnce();
                 view = next;
                 commitExecutable(next, recorder.intents, executable);
+                registrationDrains = retireCommittedRegistrations(executable);
                 committedGeneration = next.generation;
                 postCommitDirty.addAll(dirty);
                 contextDisposals.addAll(executable.contextDisposals);
@@ -199,6 +206,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 ? CompletableFuture.completedFuture(null)
                 : CompletableFuture.allOf(componentSettlements.toArray(CompletableFuture[]::new));
         List<CompletableFuture<?>> settlements = new ArrayList<>(componentSettlements);
+        settlements.addAll(registrationDrains);
         for (String contextId : outermostContextDisposals(contextDisposals)) {
             settlements.add(settleContextDisposal(contextId, componentSettlement));
         }
@@ -247,6 +255,97 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     <T> T requireInContext(String contextId, CapabilityKey<T> key) {
         return findInContext(contextId, key).orElseThrow(() ->
                 new IllegalStateException("capability is not available: " + key.name()));
+    }
+
+    boolean isDynamicAvailable(ActivationRuntime activation, CapabilityKey<?> key) {
+        synchronized (coordinator) {
+            if (activation.dynamicCalls.isClosed()
+                    || !dynamicConsumerActiveLocked(activation)) {
+                return false;
+            }
+            RuntimeView current = view;
+            return current.resolve(activation.owner.contextId, key).isPresent();
+        }
+    }
+
+    <T> DynamicLease<T> acquireDynamic(ActivationRuntime activation, CapabilityKey<T> key) {
+        Objects.requireNonNull(key, "key");
+        synchronized (coordinator) {
+            if (!activation.dynamicCalls.tryAcquire()) {
+                throw new DynamicCapabilityClosedException(
+                        "dynamic capability activation is closed: " + key.name());
+            }
+            boolean consumerActive = dynamicConsumerActiveLocked(activation);
+            RuntimeView.RegistrationData registration =
+                    consumerActive ? view.resolve(activation.owner.contextId, key).orElse(null) : null;
+            if (registration == null
+                    || registration.leases().isRetired()
+                    || !registration.leases().tryAcquire()) {
+                activation.dynamicCalls.release();
+                throw new CapabilityUnavailableException(
+                        "dynamic capability is not available: " + key.name());
+            }
+            Object value = registration.value();
+            if (!key.type().isInstance(value)) {
+                registration.leases().release();
+                activation.dynamicCalls.release();
+                throw new IllegalStateException(
+                        "capability registration type mismatch: " + key.name());
+            }
+            return new DynamicLease<>(
+                    key.type().cast(value),
+                    registration.leases(),
+                    activation.dynamicCalls);
+        }
+    }
+
+    private boolean dynamicConsumerActiveLocked(ActivationRuntime activation) {
+        RuntimeView current = view;
+        RuntimeView.ComponentData component =
+                current.components.get(activation.owner.handleId);
+        if (component == null || !activation.activationId.equals(component.currentActivationId())) {
+            return false;
+        }
+        RuntimeView.ActivationData data = current.activations.get(activation.activationId);
+        return data != null && RuntimeView.activationTracksGraph(data.state());
+    }
+
+    RuntimeException uncheckedDynamicCallback(Throwable error) {
+        if (error instanceof RuntimeException runtimeError) {
+            return runtimeError;
+        }
+        if (error instanceof CompletionException completion
+                && completion.getCause() instanceof RuntimeException runtimeError) {
+            return runtimeError;
+        }
+        return new CompletionException(error);
+    }
+
+    RuntimeException uncheckedInvocation(InvocationTargetException error) {
+        Throwable cause = error.getCause();
+        if (cause == null) {
+            return new CompletionException(error);
+        }
+        if (cause instanceof RuntimeException runtimeError) {
+            return runtimeError;
+        }
+        if (cause instanceof Error fatal) {
+            throw fatal;
+        }
+        return new CompletionException(cause);
+    }
+
+    record DynamicLease<T>(
+            T provider,
+            ProviderLeaseRuntime providerLease,
+            DynamicCallGate consumerGate)
+            implements AutoCloseable {
+
+        @Override
+        public void close() {
+            providerLease.release();
+            consumerGate.release();
+        }
     }
 
     ContextInfo contextInfo(String contextId) {
@@ -485,7 +584,9 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         key,
                         context.contextId(),
                         RuntimeView.OwnerData.Host.INSTANCE,
-                        intent.value()));
+                        intent.value(),
+                        new ProviderLeaseRuntime(
+                                intent.handle().registrationId())));
         draft.capabilityTypes.putIfAbsent(key.name(), key.type());
         return true;
     }
@@ -507,7 +608,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     handle.registrationId(),
                     "component registration must be revoked through its component handle");
         }
-        draft.registrations.remove(handle.registrationId());
+        removeRegistrationInView(draft, handle.registrationId(), executable);
         Set<String> direct = componentsWithBinding(
                 draft,
                 Set.of(handle.registrationId()));
@@ -711,10 +812,16 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             RuntimeView.ContextData data = draft.contexts.get(contextId);
             draft.contexts.put(contextId, data.withState(ContextState.DISPOSING));
         }
-        draft.registrations.values().removeIf(registration ->
-                subtree.contains(registration.contextId())
-                        && registration.owner() instanceof RuntimeView.OwnerData.Host);
-
+        for (RuntimeView.RegistrationData registration :
+                draft.registrations.values().stream()
+                        .filter(registration -> subtree.contains(registration.contextId())
+                                && registration.owner() instanceof RuntimeView.OwnerData.Host)
+                        .toList()) {
+            removeRegistrationInView(
+                    draft,
+                    registration.registrationId(),
+                    executable);
+        }
         // 处置范围包含子树内每个根组件拥有的后代，而不仅是直接位于这些 Context 中的组件。
         Set<String> handles = draft.components.values().stream()
                 .filter(component -> subtree.contains(component.contextId()))
@@ -909,7 +1016,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         Set<String> closure = draft.dependentsClosure(handles);
         List<String> ownedRegistrations = draft.registrationsOwnedBy(closure);
         for (String registrationId : ownedRegistrations) {
-            draft.registrations.remove(registrationId);
+            removeRegistrationInView(draft, registrationId, executable);
         }
         for (String handleId : closure) {
             RuntimeView.ComponentData component = draft.components.get(handleId);
@@ -1002,6 +1109,26 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     "component handle does not belong to a live component");
         }
         return handle;
+    }
+
+    private void removeRegistrationInView(
+            RuntimeView.Draft draft,
+            String registrationId,
+            ExecutableCommitPlan executable) {
+        RuntimeView.RegistrationData registration =
+                draft.registrations.remove(registrationId);
+        if (registration != null) {
+            executable.retiredRegistrations.putIfAbsent(
+                    registrationId,
+                    registration.leases());
+        }
+    }
+
+    private List<CompletableFuture<Void>> retireCommittedRegistrations(
+            ExecutableCommitPlan executable) {
+        return executable.retiredRegistrations.values().stream()
+                .map(ProviderLeaseRuntime::retire)
+                .toList();
     }
 
     // 该方法只在视图发布后、仍在协调器内调用；失败路径必须在进入前完成全部可预期校验。
@@ -1345,14 +1472,20 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         for (CapabilityRequirement requirement
                 : data.descriptor().sortedRequirements()) {
             RuntimeView.BindingData binding = bindings.get(requirement.key().name());
+            RuntimeView.RegistrationData registration = draft.resolve(
+                    data.contextId(),
+                    requirement.key(),
+                    Map.of()).orElse(null);
             if (binding != null && binding.present()) {
-                RuntimeView.RegistrationData registration = draft.resolve(
-                        data.contextId(),
-                        requirement.key(),
-                        Map.of()).orElseThrow();
                 activation.capturedValues.put(
                         requirement.key().name(),
                         registration.value());
+            }
+            if (requirement.binding() == CapabilityRequirement.CapabilityBinding.DYNAMIC
+                    && requirement.mode() == CapabilityRequirement.Mode.REQUIRED) {
+                activation.initialDynamicRequiredPresence.put(
+                        requirement.key().name(),
+                        registration != null);
             }
         }
         draft.activations.put(activationId, new RuntimeView.ActivationData(
@@ -1422,6 +1555,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 RuntimeView next = draft.publishOnce();
                 view = next;
                 published = next;
+                retireCommittedRegistrations(postCommit.executable());
                 commitActivationExecutable(
                         next,
                         runtime,
@@ -1459,6 +1593,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                     refreshDiagnostics(rollback);
                     RuntimeView next = rollback.publishOnce();
                     view = next;
+                    retireCommittedRegistrations(postCommit.executable());
                     commitActivationExecutable(
                             next,
                             runtime,
@@ -1558,6 +1693,26 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         for (CapabilityRequirement requirement
                 : data.descriptor().sortedRequirements()) {
+            if (requirement.binding()
+                    == CapabilityRequirement.CapabilityBinding.DYNAMIC) {
+                if (requirement.mode() == CapabilityRequirement.Mode.REQUIRED) {
+                    boolean initialPresence = activation.initialDynamicRequiredPresence
+                            .getOrDefault(requirement.key().name(), false);
+                    boolean currentPresence = current.resolve(
+                            data.contextId(),
+                            requirement.key())
+                            .isPresent();
+                    if (initialPresence != currentPresence) {
+                        return new CommitDecision(
+                                false,
+                                true,
+                                false,
+                                "dynamic binding presence changed: "
+                                        + requirement.key().name());
+                    }
+                }
+                continue;
+            }
             RuntimeView.BindingData captured =
                     activation.bindings.get(requirement.key().name());
             RuntimeView.BindingData effective = current.effectiveBindings(
@@ -1837,6 +1992,10 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             ComponentRuntime runtime,
             ActivationRuntime activation,
             CompletableFuture<ComponentState> future) {
+        // 先关闭本 Activation 的动态调用准入；provider lease 也在进入 LifecycleScope 前排空。
+        CompletableFuture<Void> activationDrain =
+                activation.dynamicCalls.close()
+                        .thenCompose(ignored -> drainProviderLeases(activation));
         List<ComponentRuntime> dependents;
         synchronized (coordinator) {
             dependents = dependentsForProvider(runtime.handleId);
@@ -1845,11 +2004,23 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 .map(dependent -> dependent.enqueue(this, executor))
                 .toList();
         CompletableFuture<Void> prerequisite = settlements.isEmpty()
-                ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.allOf(settlements.toArray(
-                        new CompletableFuture[0]));
+                ? activationDrain
+                : CompletableFuture.allOf(Stream.concat(
+                        Stream.of(activationDrain),
+                        settlements.stream())
+                        .toArray(CompletableFuture[]::new));
         prerequisite.whenComplete((ignored, error) ->
                 finishCleanup(runtime, activation, future));
+    }
+
+    private CompletableFuture<Void> drainProviderLeases(ActivationRuntime activation) {
+        List<CompletableFuture<Void>> drains = activation.stagedRegistrations.values().stream()
+                .map(RuntimeView.RegistrationData::leases)
+                .map(ProviderLeaseRuntime::retire)
+                .toList();
+        return drains.isEmpty()
+                ? CompletableFuture.completedFuture(null)
+                : CompletableFuture.allOf(drains.toArray(new CompletableFuture[0]));
     }
 
     // 从提供方反向扩散到所有传递依赖，并纳入其拥有的子挂载，但只调度仍处 STOPPING 的目标。
@@ -2060,6 +2231,7 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         Set<String> dirty;
         Set<String> subtree;
         CompletableFuture<Void> future;
+        List<CompletableFuture<Void>> registrationDrains = List.of();
         synchronized (coordinator) {
             RuntimeView.ContextData data = view.contexts.get(handle.contextId());
             if (data == null || data.state() == ContextState.DISPOSED) {
@@ -2082,10 +2254,16 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 RuntimeView.ContextData child = draft.contexts.get(contextId);
                 draft.contexts.put(contextId, child.withState(ContextState.DISPOSING));
             }
-            draft.registrations.values().removeIf(registration ->
-                    subtree.contains(registration.contextId())
-                            && registration.owner()
-                                    instanceof RuntimeView.OwnerData.Host);
+            for (RuntimeView.RegistrationData registration :
+                    draft.registrations.values().stream()
+                            .filter(registration -> subtree.contains(registration.contextId())
+                                    && registration.owner() instanceof RuntimeView.OwnerData.Host)
+                            .toList()) {
+                removeRegistrationInView(
+                        draft,
+                        registration.registrationId(),
+                        executable);
+            }
             Set<String> handles = draft.components.values().stream()
                     .filter(component -> subtree.contains(component.contextId()))
                     .flatMap(component ->
@@ -2119,10 +2297,14 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             RuntimeView next = draft.publishOnce();
             view = next;
             commitExecutable(next, List.of(), executable);
+            registrationDrains = retireCommittedRegistrations(executable);
         }
 
+        List<CompletableFuture<?>> settlements =
+                new ArrayList<>(registrationDrains);
+        settlements.addAll(schedule(dirty));
         CompletableFuture<Void> settlement = CompletableFuture.allOf(
-                schedule(dirty).toArray(new CompletableFuture[0]));
+                settlements.toArray(new CompletableFuture[0]));
         settlement.whenComplete((ignored, error) ->
                 finalizeContext(subtree, future));
         return future;

@@ -105,7 +105,8 @@ final class RuntimeView {
                         component.descriptor().sortedRequirements().stream()
                                 .map(requirement -> new RuntimeSnapshot.RequirementSnapshot(
                                         capabilitySnapshot(requirement.key()),
-                                        requirement.mode()))
+                                        requirement.mode(),
+                                        requirement.binding()))
                                 .toList()))
                 .sorted(Comparator.comparing(RuntimeSnapshot.ComponentSnapshot::handleId))
                 .toList();
@@ -150,7 +151,8 @@ final class RuntimeView {
                 capabilitySnapshot(requirement.key()),
                 binding == null ? null : binding.registrationId(),
                 binding != null && binding.present(),
-                requirement.mode());
+                requirement.mode(),
+                requirement.binding());
     }
 
     private RuntimeSnapshot.RegistrationOwnerSnapshot ownerSnapshot(OwnerData owner) {
@@ -216,10 +218,14 @@ final class RuntimeView {
                     .orElse(null);
             bindings.put(
                     requirement.key().name(),
-                    new BindingData(
-                            registration == null ? null : registration.registrationId(),
-                            registration != null,
-                            requirement.mode()));
+                    requirement.binding().equals(
+                            CapabilityRequirement.CapabilityBinding.DYNAMIC)
+                            ? new BindingData(null, false, requirement.mode(), requirement.binding())
+                            : new BindingData(
+                                    registration == null ? null : registration.registrationId(),
+                                    registration != null,
+                                    requirement.mode(),
+                                    requirement.binding()));
         }
         return bindings;
     }
@@ -243,17 +249,29 @@ final class RuntimeView {
             Map<String, BindingData> source = tentative.isEmpty()
                     ? activation.bindings()
                     : effectiveBindings(component, tentative);
-            for (BindingData binding : source.values()) {
-                if (!binding.present()) {
-                    continue;
-                }
-                RegistrationData registration = registrations.get(binding.registrationId());
-                if (registration == null) {
-                    registration = tentative.values().stream()
-                            .filter(candidate -> candidate.registrationId()
-                                    .equals(binding.registrationId()))
-                            .findFirst()
+            for (CapabilityRequirement requirement :
+                    component.descriptor().sortedRequirements()) {
+                RegistrationData registration;
+                if (requirement.binding() ==
+                        CapabilityRequirement.CapabilityBinding.DYNAMIC) {
+                    registration = resolve(
+                            component.contextId(),
+                            requirement.key(),
+                            tentative)
                             .orElse(null);
+                } else {
+                    BindingData binding = source.get(requirement.key().name());
+                    if (binding == null || !binding.present()) {
+                        continue;
+                    }
+                    registration = registrations.get(binding.registrationId());
+                    if (registration == null) {
+                        registration = tentative.values().stream()
+                                .filter(candidate -> candidate.registrationId()
+                                        .equals(binding.registrationId()))
+                                .findFirst()
+                                .orElse(null);
+                    }
                 }
                 if (registration != null
                         && registration.owner() instanceof OwnerData.Activation owner) {
@@ -405,10 +423,12 @@ final class RuntimeView {
                     continue;
                 }
                 boolean depends = activation.bindings.values().stream()
-                        .filter(BindingData::present)
+                        .filter(binding -> binding.present()
+                                && binding.binding() ==
+                                        CapabilityRequirement.CapabilityBinding.PINNED)
                         .map(BindingData::registrationId)
                         .map(registrations::get)
-                        .filter(registration -> registration != null)
+                        .filter(Objects::nonNull)
                         .anyMatch(registration -> {
                             if (!(registration.owner()
                                     instanceof OwnerData.Activation owner)) {
@@ -524,7 +544,8 @@ final class RuntimeView {
             CapabilityKey<?> key,
             String contextId,
             OwnerData owner,
-            Object value) {
+            Object value,
+            ProviderLeaseRuntime leases) {
     }
 
     record ComponentData(
@@ -583,7 +604,8 @@ final class RuntimeView {
     record BindingData(
             String registrationId,
             boolean present,
-            CapabilityRequirement.Mode mode) {
+            CapabilityRequirement.Mode mode,
+            CapabilityRequirement.CapabilityBinding binding) {
     }
 
     record ActivationData(

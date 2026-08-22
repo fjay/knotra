@@ -65,18 +65,20 @@ public record RuntimeSnapshot(
     /** 组件声明的单项依赖需求。 */
     public record RequirementSnapshot(
             CapabilitySnapshot capability,
-            CapabilityRequirement.Mode mode) {
+            CapabilityRequirement.Mode mode,
+            CapabilityRequirement.CapabilityBinding binding) {
     }
 
     /**
-     * Activation BindingSet 中的单个绑定。present 为 false 表示该需求当前无提供方，
-     * 仅可能出现在 OPTIONAL 需求上。
+     * Activation BindingSet 中的单个绑定。PINNED 绑定记录当前代际的注册身份；
+     * DYNAMIC 绑定是固定占位，present 为 false 且不记录当前 provider。
      */
     public record BindingSnapshot(
             CapabilitySnapshot capability,
             String registrationId,
             boolean present,
-            CapabilityRequirement.Mode mode) {
+            CapabilityRequirement.Mode mode,
+            CapabilityRequirement.CapabilityBinding binding) {
     }
 
     /** 单次 Activation 的快照，含激活开始时固定的 BindingSet。 */

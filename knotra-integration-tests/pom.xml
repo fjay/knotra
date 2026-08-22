@@ -28,6 +28,16 @@
         </dependency>
         <dependency>
             <groupId>io.knotra</groupId>
+            <artifactId>knotra-beans</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.knotra</groupId>
+            <artifactId>knotra-spring</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.knotra</groupId>
             <artifactId>knotra-events</artifactId>
             <scope>test</scope>
         </dependency>

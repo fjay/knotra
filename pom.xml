@@ -21,6 +21,7 @@
         <pf4j.version>3.13.0</pf4j.version>
         <asm.version>9.7</asm.version>
         <slf4j.version>2.0.16</slf4j.version>
+        <spring.version>6.1.14</spring.version>
         <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
         <maven.surefire.plugin.version>3.5.2</maven.surefire.plugin.version>
         <maven.jar.plugin.version>3.4.2</maven.jar.plugin.version>
@@ -33,7 +34,10 @@
 
     <modules>
         <module>knotra-core</module>
+        <module>knotra-beans</module>
+        <module>knotra-beans-processor</module>
         <module>knotra-events</module>
+        <module>knotra-spring</module>
         <module>knotra-pf4j-spi</module>
         <module>knotra-pf4j</module>
         <module>knotra-loader</module>
@@ -46,6 +50,21 @@
             <dependency>
                 <groupId>io.knotra</groupId>
                 <artifactId>knotra-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-beans</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-beans-processor</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-spring</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

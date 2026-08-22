@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.knotra</groupId>
+        <artifactId>knotra-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>knotra-spring</artifactId>
+    <name>Knotra Spring</name>
+    <description>Activation-owned Spring child contexts and a dynamic capability bridge.</description>
+
+
+    <dependencies>
+        <dependency>
+            <groupId>io.knotra</groupId>
+            <artifactId>knotra-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+            <version>${spring.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>ban-unrelated-integrations-from-spring</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <excludes>
+                                        <exclude>org.springframework.boot:*</exclude>
+                                        <exclude>org.pf4j:*</exclude>
+                                        <exclude>org.ow2.asm:*</exclude>
+                                        <exclude>io.knotra:knotra-beans</exclude>
+                                        <exclude>io.knotra:knotra-beans-processor</exclude>
+                                        <exclude>io.knotra:knotra-events</exclude>
+                                        <exclude>io.knotra:knotra-pf4j-spi</exclude>
+                                        <exclude>io.knotra:knotra-pf4j</exclude>
+                                        <exclude>io.knotra:knotra-loader</exclude>
+                                    </excludes>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

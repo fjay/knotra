@@ -8,6 +8,7 @@ import io.knotra.CapabilityKey;
 import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentFactory;
+import io.knotra.DynamicCapability;
 import io.knotra.ContextInfo;
 import io.knotra.LifecycleScope;
 import io.knotra.MountOptions;
@@ -44,6 +45,12 @@ final class GuardedActivationContext implements ActivationContext {
     public <T> Optional<T> find(CapabilityKey<T> key) {
         validate(key);
         return delegate.find(key);
+    }
+
+    @Override
+    public <T> DynamicCapability<T> subscribe(CapabilityKey<T> key) {
+        validate(key);
+        return delegate.subscribe(key);
     }
 
     @Override

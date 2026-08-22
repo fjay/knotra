@@ -8,6 +8,9 @@ public interface ActivationContext {
 
     <T> Optional<T> find(CapabilityKey<T> key);
 
+    /** 订阅动态绑定的 Capability；只能用于声明为 DYNAMIC 的需求。 */
+    <T> DynamicCapability<T> subscribe(CapabilityKey<T> key);
+
     <T> void provide(CapabilityKey<T> key, T value);
 
     <C> ComponentHandle<C> mountChild(

@@ -26,8 +26,12 @@ final class ActivationRuntime {
     final Map<String, RuntimeView.BindingData> bindings;
     // 与 BindingSet 同一代际捕获的 Capability 值，供用户 start() 在协调器锁外读取。
     final Map<String, Object> capturedValues = new ConcurrentHashMap<>();
+    // DYNAMIC 不进入固定 BindingSet；required 只记录启动候选验证所需的初始 presence。
+    final Map<String, Boolean> initialDynamicRequiredPresence = new ConcurrentHashMap<>();
     // Activation 的根 LifecycleScope；无论提交成功还是回滚，都负责逆序释放已接受资源。
     final LifecycleScopeImpl scope;
+    // 动态调用准入；在 LifecycleScope teardown 前关闭并等待在途调用归零。
+    final DynamicCallGate dynamicCalls = new DynamicCallGate();
     // 尚未发布的注册暂存；只有提交验证通过后才复制进 RuntimeView。
     final Map<String, RuntimeView.RegistrationData> stagedRegistrations =
             new ConcurrentHashMap<>();
@@ -59,15 +63,15 @@ final class ActivationRuntime {
 
     RuntimeView.RegistrationData stage(
             CapabilityKey<?> key,
-            Object value,
-            String contextId) {
+            Object value) {
         String id = Sequences.registration();
         RuntimeView.RegistrationData registration = new RuntimeView.RegistrationData(
                 id,
                 key,
-                contextId,
+                owner.contextId,
                 new RuntimeView.OwnerData.Activation(activationId),
-                value);
+                value,
+                new ProviderLeaseRuntime(id));
         stagedRegistrations.put(key.name(), registration);
         return registration;
     }
