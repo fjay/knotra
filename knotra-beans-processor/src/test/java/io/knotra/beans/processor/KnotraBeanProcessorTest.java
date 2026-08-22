@@ -282,7 +282,7 @@ final class KnotraBeanProcessorTest {
                     @KnotraConstructor
                     ValidBean(
                             @KnotraFixed("processor.storage") Storage storage,
-                            @KnotraOptional("processor.feature") Optional<Feature> feature,
+                            @KnotraFixedOptional("processor.feature") Optional<Feature> feature,
                             @KnotraDynamicProxy("processor.router") Router router) {
                         this.storage = storage;
                         this.feature = feature;
@@ -416,7 +416,7 @@ final class KnotraBeanProcessorTest {
                         """, "exactly one of"},
                 new Object[] {"optional wrong type", """
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraOptional("x") String value) {}
+                            @KnotraConstructor BadBean(@KnotraFixedOptional("x") String value) {}
                         }
                         """, "Optional<contract>"},
                 new Object[] {"dynamic non-interface", """
@@ -478,7 +478,7 @@ final class KnotraBeanProcessorTest {
                         """, "contract must not be a generic or parameterized type"},
                 new Object[] {"optional nested type argument", """
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraOptional("x")
+                            @KnotraConstructor BadBean(@KnotraFixedOptional("x")
                                     Optional<java.util.List<String>> value) {}
                         }
                         """, "contract must not be a generic or parameterized type"},
@@ -518,7 +518,7 @@ final class KnotraBeanProcessorTest {
                         class BadBean {
                             private interface Contract { String value(); }
 
-                            @KnotraConstructor BadBean(@KnotraOptional("x") Optional<Contract> value) {}
+                            @KnotraConstructor BadBean(@KnotraFixedOptional("x") Optional<Contract> value) {}
                         }
                         """, "contract must be accessible"},
                 new Object[] {"private nested dynamic contract", """

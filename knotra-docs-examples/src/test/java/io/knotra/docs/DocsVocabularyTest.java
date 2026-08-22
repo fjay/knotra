@@ -24,7 +24,9 @@ final class DocsVocabularyTest {
             "dynamicProxyRequired",
             "Beans.required(",
             "Beans.optional(",
-            "KnotraRequire");
+            "KnotraRequire",
+            "KnotraOptional");
+
 
 
     @Test

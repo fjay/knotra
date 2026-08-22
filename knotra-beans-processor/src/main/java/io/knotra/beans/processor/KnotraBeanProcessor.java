@@ -6,10 +6,11 @@ import io.knotra.beans.annotation.KnotraConstructor;
 import io.knotra.beans.annotation.KnotraDestroy;
 import io.knotra.beans.annotation.KnotraDynamicProxy;
 import io.knotra.beans.annotation.KnotraFixed;
+import io.knotra.beans.annotation.KnotraFixedOptional;
 import io.knotra.beans.annotation.KnotraInit;
 import io.knotra.beans.annotation.KnotraNormalizeConfig;
-import io.knotra.beans.annotation.KnotraOptional;
 import io.knotra.beans.annotation.KnotraOutput;
+
 
 
 
@@ -345,7 +346,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             TypeMirror configType,
             boolean noConfig) {
         AnnotationMirror fixedMirror = mirror(parameter, KnotraFixed.class.getCanonicalName());
-        AnnotationMirror optionalMirror = mirror(parameter, KnotraOptional.class.getCanonicalName());
+        AnnotationMirror optionalMirror = mirror(parameter, KnotraFixedOptional.class.getCanonicalName());
         AnnotationMirror dynamicMirror = mirror(parameter, KnotraDynamicProxy.class.getCanonicalName());
         AnnotationMirror configMirror = mirror(parameter, KnotraConfig.class.getCanonicalName());
 
@@ -364,9 +365,10 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         }
         if (declarations != 1) {
             error(parameter, "every constructor parameter must have exactly one of "
-                    + "@KnotraFixed, @KnotraOptional, @KnotraDynamicProxy, or @KnotraConfig");
+                    + "@KnotraFixed, @KnotraFixedOptional, @KnotraDynamicProxy, or @KnotraConfig");
             return null;
         }
+
 
         if (configMirror != null) {
             if (noConfig) {
@@ -449,9 +451,10 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         if (kind == ParameterKind.OPTIONAL) {
             Optional<TypeMirror> value = exactOptionalOf(parameter.asType(), contract);
             if (value.isEmpty()) {
-                error(parameter, "@KnotraOptional parameter must be exactly Optional<contract>");
+                error(parameter, "@KnotraFixedOptional parameter must be exactly Optional<contract>");
                 return null;
             }
+
             return new ParameterInfo(kind, name, value.get(), required);
         }
         if (kind == ParameterKind.DYNAMIC) {
@@ -955,9 +958,10 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
 
     private enum ParameterKind {
         FIXED("@KnotraFixed"),
-        OPTIONAL("@KnotraOptional"),
+        OPTIONAL("@KnotraFixedOptional"),
         DYNAMIC("@KnotraDynamicProxy"),
         CONFIG("@KnotraConfig");
+
 
 
         private final String annotationName;

@@ -240,7 +240,7 @@ public final class CheckoutService implements Checkout {
     @KnotraConstructor
     CheckoutService(
             @KnotraFixed("checkout.pricing") Pricing pricing,
-            @KnotraOptional("checkout.profile") Optional<UserProfile> profile,
+            @KnotraFixedOptional("checkout.profile") Optional<UserProfile> profile,
             @KnotraDynamicProxy("checkout.gateway") PaymentGateway gateway) {
         ...
     }
@@ -271,9 +271,9 @@ MountHandle handle = definition.mount(runtime);
 - `@KnotraBean(id, outputs, config, lifecycle)`
 - `@KnotraConstructor`
 - `@KnotraFixed(name)`
-- `@KnotraOptional(name)`
-
+- `@KnotraFixedOptional(name)`
 - `@KnotraDynamicProxy(name)`
+
 - `@KnotraConfig`
 - `@KnotraOutput(name, contract)`
 - `@KnotraInit`
