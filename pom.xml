@@ -42,6 +42,10 @@
         <module>knotra-pf4j</module>
         <module>knotra-loader</module>
         <module>knotra-pf4j-loader</module>
+        <module>knotra-bom</module>
+        <module>knotra-starter</module>
+        <module>knotra-spring-starter</module>
+        <module>knotra-pf4j-starter</module>
         <module>knotra-integration-tests</module>
     </modules>
 
@@ -90,6 +94,21 @@
             <dependency>
                 <groupId>io.knotra</groupId>
                 <artifactId>knotra-pf4j-loader</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-spring-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-pf4j-starter</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

@@ -18,12 +18,10 @@ public interface KnotraRuntime extends AutoCloseable {
      */
     <R> TransactionReceipt<R> transact(Function<RuntimeTransaction, R> transaction);
 
-    /** 在根 Context 发布单个宿主 Capability。多操作原子替换应使用 transact。 */
-    default <T> RegistrationHandle provide(CapabilityKey<T> key, T value) {
-        return transact(tx -> tx.provide(root(), key, value)).value();
-    }
+    /** 在根 Context 发布单个宿主 Capability，并返回携带类型与 settlement 的句柄。 */
+    <T> Provided<T> provide(CapabilityKey<T> key, T value);
 
-    /** 撤销单个宿主注册。多操作原子替换应使用 transact。 */
+    /** 撤销单个宿主注册。多操作原子变更应使用 transact。 */
     default void revoke(RegistrationHandle registration) {
         transact(tx -> {
             tx.revoke(registration);

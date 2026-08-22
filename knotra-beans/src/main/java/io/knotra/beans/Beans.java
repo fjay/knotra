@@ -2,7 +2,9 @@ package io.knotra.beans;
 
 import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
+import io.knotra.ComponentHandle;
 import io.knotra.DynamicCapability;
+import io.knotra.KnotraRuntime;
 import io.knotra.NoConfig;
 
 import java.util.Objects;
@@ -32,8 +34,24 @@ public final class Beans {
         return BeanDependency.of(CapabilityRequirement.optional(key), context -> context.find(key));
     }
 
+    /** 声明动态必需依赖：creator 收到显式调用的 {@code DynamicCapability<T>}。 */
+    public static <T> BeanDependency<DynamicCapability<T>> dynamicRequired(CapabilityKey<T> key) {
+        Objects.requireNonNull(key, "key");
+        return BeanDependency.of(
+                CapabilityRequirement.dynamicRequired(key),
+                context -> context.subscribe(key));
+    }
+
+    /** 声明动态可选依赖：creator 收到显式调用的 {@code DynamicCapability<T>}。 */
+    public static <T> BeanDependency<DynamicCapability<T>> dynamicOptional(CapabilityKey<T> key) {
+        Objects.requireNonNull(key, "key");
+        return BeanDependency.of(
+                CapabilityRequirement.dynamicOptional(key),
+                context -> context.subscribe(key));
+    }
+
     /** 声明动态必需依赖：creator 收到方法级持有调用租约的 interface proxy。 */
-    public static <T> BeanDependency<T> dynamicRequired(CapabilityKey<T> key) {
+    public static <T> BeanDependency<T> dynamicProxyRequired(CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         return BeanDependency.of(
                 CapabilityRequirement.dynamicRequired(key),
@@ -41,25 +59,11 @@ public final class Beans {
     }
 
     /** 声明动态可选依赖：creator 收到方法级持有调用租约的 interface proxy。 */
-    public static <T> BeanDependency<T> dynamicOptional(CapabilityKey<T> key) {
+    public static <T> BeanDependency<T> dynamicProxyOptional(CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         return BeanDependency.of(
                 CapabilityRequirement.dynamicOptional(key),
                 context -> context.subscribe(key).proxy(key.type()));
-    }
-
-    /** 声明动态必需依赖：creator 收到 {@code DynamicCapability<T>}，供显式调用使用。 */
-    public static <T> BeanDependency<DynamicCapability<T>> dynamicCapabilityRequired(CapabilityKey<T> key) {
-        Objects.requireNonNull(key, "key");
-        return BeanDependency.of(
-                CapabilityRequirement.dynamicRequired(key), context -> context.subscribe(key));
-    }
-
-    /** 声明动态可选依赖：creator 收到 {@code DynamicCapability<T>}，供显式调用使用。 */
-    public static <T> BeanDependency<DynamicCapability<T>> dynamicCapabilityOptional(CapabilityKey<T> key) {
-        Objects.requireNonNull(key, "key");
-        return BeanDependency.of(
-                CapabilityRequirement.dynamicOptional(key), context -> context.subscribe(key));
     }
 
     public static NoConfigBeanBuilder0 component(String componentId) {
@@ -71,6 +75,44 @@ public final class Beans {
         return new ConfiguredBeanBuilder0<>(
                 requireComponentId(componentId),
                 Objects.requireNonNull(configType, "configType"));
+    }
+
+    /** 挂载无配置 Bean；mountId 默认使用 definition 的 componentId。 */
+    public static <T> ComponentHandle<NoConfig> mount(
+            KnotraRuntime runtime,
+            BeanDefinition<NoConfig, T> definition) {
+        return mount(runtime, definition, definition.componentId());
+    }
+
+    /** 使用显式 mountId 挂载无配置 Bean。 */
+    public static <T> ComponentHandle<NoConfig> mount(
+            KnotraRuntime runtime,
+            BeanDefinition<NoConfig, T> definition,
+            String mountId) {
+        Objects.requireNonNull(runtime, "runtime");
+        Objects.requireNonNull(definition, "definition");
+        Objects.requireNonNull(mountId, "mountId");
+        return runtime.mount(mountId, definition);
+    }
+
+    /** 挂载配置 Bean；mountId 默认使用 definition 的 componentId。 */
+    public static <C, T> ComponentHandle<C> mount(
+            KnotraRuntime runtime,
+            BeanDefinition<C, T> definition,
+            C config) {
+        return mount(runtime, definition, definition.componentId(), config);
+    }
+
+    /** 使用显式 mountId 挂载配置 Bean。 */
+    public static <C, T> ComponentHandle<C> mount(
+            KnotraRuntime runtime,
+            BeanDefinition<C, T> definition,
+            String mountId,
+            C config) {
+        Objects.requireNonNull(runtime, "runtime");
+        Objects.requireNonNull(definition, "definition");
+        Objects.requireNonNull(mountId, "mountId");
+        return runtime.mount(mountId, definition, config);
     }
 
     static String requireComponentId(String componentId) {

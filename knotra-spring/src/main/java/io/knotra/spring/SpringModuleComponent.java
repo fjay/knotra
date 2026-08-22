@@ -105,8 +105,10 @@ final class SpringModuleComponent<C> implements Component<C> {
             case REQUIRED -> registerRequired(context, spring, cast(dependency));
             case OPTIONAL_VALUE -> registerOptionalValue(context, spring, cast(dependency));
             case OPTIONAL_OPTIONAL -> registerOptionalWrapper(context, spring, cast(dependency));
-            case DYNAMIC_REQUIRED, DYNAMIC_OPTIONAL ->
-                    registerDynamic(context, spring, cast(dependency));
+            case DYNAMIC_CAPABILITY_REQUIRED, DYNAMIC_CAPABILITY_OPTIONAL ->
+                    registerDynamicCapability(context, spring, cast(dependency));
+            case DYNAMIC_PROXY_REQUIRED, DYNAMIC_PROXY_OPTIONAL ->
+                    registerDynamicProxy(context, spring, cast(dependency));
         }
     }
 
@@ -151,12 +153,23 @@ final class SpringModuleComponent<C> implements Component<C> {
     }
 
 
-    private static <T> void registerDynamic(
+    private static <T> void registerDynamicCapability(
             ActivationContext context,
             AnnotationConfigApplicationContext spring,
             SpringDependency<T> dependency) {
-        DynamicCapability<T> dynamic = context.subscribe(dependency.key());
-        T proxy = dynamic.proxy(dependency.key().type());
+        registerExternalSingleton(
+                spring,
+                dependency.beanName(),
+                DynamicCapability.class,
+                context.subscribe(dependency.key()));
+    }
+
+    private static <T> void registerDynamicProxy(
+            ActivationContext context,
+            AnnotationConfigApplicationContext spring,
+            SpringDependency<T> dependency) {
+        DynamicCapability<T> capability = context.subscribe(dependency.key());
+        T proxy = capability.proxy(dependency.key().type());
         registerExternalSingleton(
                 spring,
                 dependency.beanName(),

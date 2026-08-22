@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Deliberately standalone: an imported BOM must expose only the management
+         entries declared here, not anything inherited from the build aggregator. -->
+    <groupId>io.knotra</groupId>
+    <artifactId>knotra-bom</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Knotra BOM</name>
+    <description>Bill of materials for consuming Knotra artifacts at a compatible version set.</description>
+
+    <properties>
+        <spring.version>6.1.14</spring.version>
+        <pf4j.version>3.13.0</pf4j.version>
+        <asm.version>9.7</asm.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-beans</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-beans-processor</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-events</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-spring</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-pf4j-spi</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-pf4j</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-loader</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-pf4j-loader</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-spring-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.knotra</groupId>
+                <artifactId>knotra-pf4j-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- Third-party versions the public integrations are built and verified against. -->
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-context</artifactId>
+                <version>${spring.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.pf4j</groupId>
+                <artifactId>pf4j</artifactId>
+                <version>${pf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.ow2.asm</groupId>
+                <artifactId>asm</artifactId>
+                <version>${asm.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>

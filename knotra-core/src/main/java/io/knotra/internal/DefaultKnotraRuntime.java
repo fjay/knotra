@@ -8,6 +8,7 @@ import io.knotra.CapabilityUnavailableException;
 import io.knotra.ComponentFactory;
 import io.knotra.ComponentGoal;
 import io.knotra.ComponentHandle;
+import io.knotra.ComponentNotActiveException;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
@@ -19,6 +20,7 @@ import io.knotra.KnotraConfig;
 import io.knotra.KnotraRuntime;
 import io.knotra.LifecycleState;
 import io.knotra.MountOptions;
+import io.knotra.Provided;
 import io.knotra.RegistrationHandle;
 import io.knotra.RuntimeDiagnostic;
 import io.knotra.RuntimeSnapshot;
@@ -27,6 +29,7 @@ import io.knotra.TransactionReceipt;
 import io.knotra.TransactionRejectedException;
 
 import java.lang.reflect.InvocationTargetException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -40,15 +43,17 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
 
 /**
  * Runtime 内核的默认实现，拥有宿主事务、Activation 状态机和组件过渡调度。
@@ -107,6 +112,16 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     @Override
+    public <T> Provided<T> provide(CapabilityKey<T> key, T value) {
+        TransactionReceipt<RegistrationHandle> receipt =
+                transact(transaction -> transaction.provide(root(), key, value));
+        return new ProvidedImpl<>(
+                receipt.value(),
+                key,
+                receipt.settlement());
+    }
+
+    @Override
     public RuntimeSnapshot snapshot() {
         RuntimeSnapshot partial;
         Map<String, ActivationRuntime> activationCopy;
@@ -129,6 +144,47 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                 partial.registrations(),
                 scopes,
                 partial.diagnostics());
+    }
+
+    @Override
+    public void revoke(RegistrationHandle registration) {
+        if (registration instanceof ProvidedImpl<?> provided) {
+            if (provided.runtime() == this) {
+                revoke(provided);
+            } else {
+                transact(transaction -> {
+                    transaction.revoke(registration);
+                    return null;
+                });
+            }
+            return;
+        }
+        transact(transaction -> {
+            transaction.revoke(registration);
+            return null;
+        });
+    }
+
+    <T> Provided<T> replace(ProvidedImpl<T> handle, T value) {
+        handle.requireFresh("replace");
+        TransactionReceipt<RegistrationHandle> receipt = transact(transaction -> {
+            transaction.revoke(handle);
+            return transaction.provide(root(), handle.capabilityKey(), value);
+        });
+        handle.markStale();
+        return new ProvidedImpl<>(
+                receipt.value(),
+                handle.capabilityKey(),
+                receipt.settlement());
+    }
+
+    <T> void revoke(ProvidedImpl<T> handle) {
+        handle.requireFresh("revoke");
+        transact(transaction -> {
+            transaction.revoke(handle);
+            return null;
+        });
+        handle.markStale();
     }
 
     @Override
@@ -234,6 +290,10 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
             }
         });
         return created;
+    }
+
+    boolean hasLiveRegistration(String registrationId) {
+        return view.registrations.containsKey(registrationId);
     }
 
     <T> Optional<T> findInContext(String contextId, CapabilityKey<T> key) {
@@ -414,6 +474,51 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
                         : CompletableFuture.completedFuture(state));
     }
 
+    <C> ComponentHandle<C> requireActive(ComponentHandleImpl<C> handle, Duration timeout) {
+        if (timeout != null && (timeout.isZero() || timeout.isNegative())) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
+        ComponentState settled;
+        try {
+            if (timeout == null) {
+                settled = handle.whenSettled().toCompletableFuture().get();
+            } else {
+                settled = handle.whenSettled().toCompletableFuture()
+                        .get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw notActive(handle, timeout, error);
+        } catch (TimeoutException error) {
+            throw notActive(handle, timeout, null);
+        } catch (ExecutionException | CompletionException error) {
+            throw notActive(handle, timeout, error);
+        }
+        if (settled == ComponentState.ACTIVE) {
+            return handle;
+        }
+        throw notActive(handle, timeout, null);
+    }
+
+    private <C> ComponentNotActiveException notActive(
+            ComponentHandleImpl<C> handle,
+            Duration timeout,
+            Throwable cause) {
+        String handleId = handle.handleId();
+        List<RuntimeDiagnostic> diagnostics = view.diagnostics.stream()
+                .filter(diagnostic -> handleId.equals(diagnostic.targetId()))
+                .toList();
+        return new ComponentNotActiveException(
+                handle.state(),
+                handleId,
+                handle.mountId(),
+                handle.componentId(),
+                handle.factoryId(),
+                handle.contextId(),
+                timeout,
+                diagnostics,
+                cause);
+    }
     <C> CompletionStage<ComponentState> reconfigure(
             ComponentHandleImpl<C> handle,
             C config) {
@@ -2594,8 +2699,16 @@ public final class DefaultKnotraRuntime implements KnotraRuntime {
         @Override
         public void revoke(RegistrationHandle registration) {
             Objects.requireNonNull(registration, "registration");
-            if (!(registration instanceof RegistrationHandleImpl handle)
-                    || handle.runtime != DefaultKnotraRuntime.this) {
+            RegistrationHandleImpl handle;
+            if (registration instanceof ProvidedImpl<?> provided) {
+                provided.requireFresh("revoke");
+                handle = provided.registration();
+            } else if (registration instanceof RegistrationHandleImpl internal) {
+                handle = internal;
+            } else {
+                handle = null;
+            }
+            if (handle == null || handle.runtime != DefaultKnotraRuntime.this) {
                 throw new IllegalArgumentException(
                         "registration handle does not belong to this runtime");
             }

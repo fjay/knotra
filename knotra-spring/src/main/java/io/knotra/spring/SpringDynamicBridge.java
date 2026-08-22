@@ -23,11 +23,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Host-side stable proxy for a dynamic Knotra capability.
+ * Host-side accessor for a dynamic Knotra capability and its method-lease proxy.
  *
- * <p>The bridge component subscribes to {@code sourceKey} and publishes the Core-created
- * lease proxy under {@code bridgeKey}. Replacing the source does not restart the bridge or
- * its Spring child consumers; an in-flight call keeps its provider lease until completion.
+ * <p>The bridge component subscribes to {@code sourceKey} and publishes the Core-created lease
+ * proxy under {@code bridgeKey}. Replacing the source does not restart the bridge or its Spring
+ * child consumers; an in-flight call keeps its provider lease until completion. Use
+ * {@link #withCurrent(DynamicOperation)} or {@link #withCurrentAsync(AsyncDynamicOperation)} to
+ * pin one provider for a callback, or {@link #proxy()} when each interface method may independently
+ * select the current provider.
  */
 public final class SpringDynamicBridge<T> implements AutoCloseable {
 
@@ -125,15 +128,29 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
         }
     }
 
+    /**
+     * Returns the {@code T} proxy with method-level provider leases.
+     *
+     * <p>Each interface method invocation selects and leases a provider independently. Do not
+     * use this object when multiple method calls must observe one provider; use
+     * {@link #withCurrent(DynamicOperation)} instead.
+     */
     public T proxy() {
         rejectClosed();
         return proxy;
     }
 
+    /** Returns whether the current dynamic capability has a provider. */
     public boolean available() {
         return !closed.get() && capability.available();
     }
 
+    /**
+     * Runs a callback against one provider for the duration of that callback.
+     *
+     * <p>The provider is pinned before the callback starts and its lease is retained until the
+     * callback returns. This is the safe way to make multiple observations as one provider.
+     */
     public <R> R withCurrent(
             DynamicOperation<? super T, ? extends R> callback) {
         Objects.requireNonNull(callback, "callback");
@@ -141,6 +158,12 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
         return capability.call(callback);
     }
 
+    /**
+     * Runs an asynchronous callback against one provider until its completion stage settles.
+     *
+     * <p>The provider lease and Knotra's async stage drain semantics remain in effect after this
+     * method returns.
+     */
     public <R> CompletionStage<R> withCurrentAsync(
             AsyncDynamicOperation<? super T, R> callback) {
         Objects.requireNonNull(callback, "callback");

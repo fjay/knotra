@@ -59,6 +59,7 @@ final class KnotraBeanProcessorTest {
         CompilerKit.assertSuccess(first);
         String source = first.generatedSource("ValidBean_KnotraFactory.java");
         assertGeneratedInvariants(source);
+        assertTrue(source.contains("Beans.dynamicProxyRequired("));
         assertEquals(1, countGeneratedSources(first));
 
         Path secondCompile = temporaryDirectory.resolve("second");
@@ -161,6 +162,33 @@ final class KnotraBeanProcessorTest {
         }
     }
 
+    @Test
+    void processorSupportsConstructorDependenciesBeyondHandWrittenDslArity() throws Exception {
+        Path compileDirectory = temporaryDirectory.resolve("six-dependencies");
+        assertTrue(CompilerKit.compile(compileDirectory, sixDependencySources()));
+        CompilerKit.Compilation compilation = CompilerKit.lastCompilation();
+        CompilerKit.assertSuccess(compilation);
+        String source = compilation.generatedSource("SixDependencyBean_KnotraFactory.java");
+        assertEquals(6, countOccurrences(source, "Beans.required("));
+
+        runtime = KnotraRuntime.create();
+        try (URLClassLoader loader = compilation.classLoader()) {
+            for (int index = 0; index < 6; index++) {
+                provide("processor.six-" + index, String.class, Integer.toString(index));
+            }
+            Object factory = loader.loadClass("demo.SixDependencyBean_KnotraFactory")
+                    .getConstructor().newInstance();
+            Method definition = factory.getClass().getMethod("definition");
+            ComponentHandle<NoConfig> handle =
+                    mountNoConfig("six-dependencies", definition.invoke(factory));
+            assertEquals(ComponentState.ACTIVE, settle(handle));
+
+            Class<?> outputType = loader.loadClass("demo.SixOutput");
+            Object output = require("processor.six-output", outputType);
+            assertEquals("012345", accessibleMethod(outputType, "value").invoke(output));
+        }
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("negativeCases")
     void invalidBeansAreRejected(String name, String body, String expectedDiagnostic) throws Exception {
@@ -250,9 +278,9 @@ final class KnotraBeanProcessorTest {
 
                     @KnotraConstructor
                     ValidBean(
-                            @KnotraRequire(name = "processor.storage", contract = Storage.class) Storage storage,
-                            @KnotraOptional(name = "processor.feature", contract = Feature.class) Optional<Feature> feature,
-                            @KnotraDynamic(name = "processor.router", contract = Router.class) Router router) {
+                            @KnotraRequire("processor.storage") Storage storage,
+                            @KnotraOptional("processor.feature") Optional<Feature> feature,
+                            @KnotraDynamicProxy("processor.router") Router router) {
                         this.storage = storage;
                         this.feature = feature;
                         this.router = router;
@@ -333,6 +361,38 @@ final class KnotraBeanProcessorTest {
         return List.of(new CompilerKit.Source("demo.ConfiguredBean", source));
     }
 
+    /** The processor follows every constructor parameter, so it has no hand-written DSL arity limit. */
+    private static List<CompilerKit.Source> sixDependencySources() {
+        String source = """
+                package demo;
+
+                import io.knotra.beans.annotation.*;
+
+                interface SixOutput { String value(); }
+
+                @KnotraBean(
+                        id = "processor.six",
+                        outputs = @KnotraOutput(name = "processor.six-output", contract = SixOutput.class))
+                class SixDependencyBean implements SixOutput {
+                    private final String joined;
+
+                    @KnotraConstructor
+                    SixDependencyBean(
+                            @KnotraRequire("processor.six-0") String zero,
+                            @KnotraRequire("processor.six-1") String one,
+                            @KnotraRequire("processor.six-2") String two,
+                            @KnotraRequire("processor.six-3") String three,
+                            @KnotraRequire("processor.six-4") String four,
+                            @KnotraRequire("processor.six-5") String five) {
+                        this.joined = zero + one + two + three + four + five;
+                    }
+
+                    public String value() { return joined; }
+                }
+                """;
+        return List.of(new CompilerKit.Source("demo.SixDependencyBean", source));
+    }
+
     private static Stream<Object[]> negativeCases() {
         return Stream.of(
                 new Object[] {"zero constructors", """
@@ -343,8 +403,7 @@ final class KnotraBeanProcessorTest {
                 new Object[] {"two constructors", """
                         class BadBean {
                             @KnotraConstructor BadBean() {}
-                            @KnotraConstructor BadBean(@KnotraRequire(
-                                    name = "x", contract = String.class) String value) { this(); }
+                            @KnotraConstructor BadBean(@KnotraRequire("x") String value) { this(); }
                         }
                         """, "exactly one @KnotraConstructor"},
                 new Object[] {"unannotated parameter", """
@@ -354,16 +413,14 @@ final class KnotraBeanProcessorTest {
                         """, "exactly one of"},
                 new Object[] {"optional wrong type", """
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraOptional(
-                                    name = "x", contract = String.class) String value) {}
+                            @KnotraConstructor BadBean(@KnotraOptional("x") String value) {}
                         }
                         """, "Optional<contract>"},
                 new Object[] {"dynamic non-interface", """
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraDynamic(
-                                    name = "x", contract = String.class) String value) {}
+                            @KnotraConstructor BadBean(@KnotraDynamicProxy("x") String value) {}
                         }
-                        """, "contract must be an interface"},
+                        """, "must be an exact non-generic interface type"},
                 new Object[] {"config mismatch", """
                         @KnotraBean(id = "bad", config = Integer.class)
                         class BadBean {
@@ -381,8 +438,7 @@ final class KnotraBeanProcessorTest {
                         @KnotraOutput(
                                 name = "x", contract = String.class)
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraRequire(
-                                    name = "x", contract = String.class) String value) {}
+                            @KnotraConstructor BadBean(@KnotraRequire("x") String value) {}
                         }
                         """, "duplicate capability name"},
                 new Object[] {"bad init", """
@@ -414,14 +470,12 @@ final class KnotraBeanProcessorTest {
 
                         @KnotraBean(id = "bad")
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraRequire(
-                                    name = "x", contract = Contract.class) Contract<String> value) {}
+                            @KnotraConstructor BadBean(@KnotraRequire("x") Contract<String> value) {}
                         }
                         """, "contract must not be a generic or parameterized type"},
                 new Object[] {"optional nested type argument", """
                         class BadBean {
-                            @KnotraConstructor BadBean(@KnotraOptional(
-                                    name = "x", contract = java.util.List.class)
+                            @KnotraConstructor BadBean(@KnotraOptional("x")
                                     Optional<java.util.List<String>> value) {}
                         }
                         """, "contract must not be a generic or parameterized type"},
@@ -454,24 +508,21 @@ final class KnotraBeanProcessorTest {
                         class BadBean {
                             private interface Contract { String value(); }
 
-                            @KnotraConstructor BadBean(@KnotraRequire(
-                                    name = "x", contract = Contract.class) Contract value) {}
+                            @KnotraConstructor BadBean(@KnotraRequire("x") Contract value) {}
                         }
                         """, "contract must be accessible"},
                 new Object[] {"private nested optional contract", """
                         class BadBean {
                             private interface Contract { String value(); }
 
-                            @KnotraConstructor BadBean(@KnotraOptional(
-                                    name = "x", contract = Contract.class) Optional<Contract> value) {}
+                            @KnotraConstructor BadBean(@KnotraOptional("x") Optional<Contract> value) {}
                         }
                         """, "contract must be accessible"},
                 new Object[] {"private nested dynamic contract", """
                         class BadBean {
                             private interface Contract { String value(); }
 
-                            @KnotraConstructor BadBean(@KnotraDynamic(
-                                    name = "x", contract = Contract.class) Contract value) {}
+                            @KnotraConstructor BadBean(@KnotraDynamicProxy("x") Contract value) {}
                         }
                         """, "contract must be accessible"},
                 new Object[] {"private nested output contract", """
@@ -491,6 +542,15 @@ final class KnotraBeanProcessorTest {
         assertFalse(source.contains("System.currentTimeMillis"), "generated source must not embed a timestamp");
         assertFalse(source.contains("Instant.now"), "generated source must not embed a timestamp");
         assertTrue(source.contains("contractClass("), "generated source must use compile-time class literals");
+    }
+    private static int countOccurrences(String value, String token) {
+        int count = 0;
+        int index = 0;
+        while ((index = value.indexOf(token, index)) >= 0) {
+            count++;
+            index += token.length();
+        }
+        return count;
     }
 
     private static int countGeneratedSources(CompilerKit.Compilation compilation) throws Exception {

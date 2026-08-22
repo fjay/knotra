@@ -4,6 +4,8 @@ import io.knotra.ComponentGoal;
 import io.knotra.ComponentHandle;
 import io.knotra.ComponentState;
 
+import java.time.Duration;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -60,6 +62,20 @@ final class ComponentHandleImpl<C> implements ComponentHandle<C> {
     @Override
     public CompletionStage<ComponentState> whenSettled() {
         return runtime.whenSettled(id);
+    }
+
+    @Override
+    public ComponentHandle<C> requireActive() {
+        return runtime.requireActive(this, null);
+    }
+
+    @Override
+    public ComponentHandle<C> requireActive(Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
+        return runtime.requireActive(this, timeout);
     }
 
     @Override

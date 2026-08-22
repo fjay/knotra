@@ -328,6 +328,34 @@ final class BeansTest {
     }
 
     @Test
+    void mountConveniencesDefaultToComponentIdAndSupportExplicitMountId() throws Exception {
+        BeanDefinition<NoConfig, Service> noConfig = Beans.component("mount-default")
+                .create(() -> new Service("x"))
+                .build();
+        ComponentHandle<NoConfig> defaultNoConfig = Beans.mount(runtime, noConfig);
+        assertEquals("mount-default", defaultNoConfig.mountId());
+        assertEquals(ComponentState.ACTIVE, settle(defaultNoConfig));
+
+        ComponentHandle<NoConfig> explicitNoConfig =
+                Beans.mount(runtime, noConfig, "mount-explicit");
+        assertEquals("mount-explicit", explicitNoConfig.mountId());
+        assertEquals(ComponentState.ACTIVE, settle(explicitNoConfig));
+
+        BeanDefinition<Prefix, Service> configured = Beans.component("mount-configured", Prefix.class)
+                .create(config -> new Service(config.value()))
+                .build();
+        ComponentHandle<Prefix> defaultConfigured =
+                Beans.mount(runtime, configured, new Prefix("one"));
+        assertEquals("mount-configured", defaultConfigured.mountId());
+        assertEquals(ComponentState.ACTIVE, settle(defaultConfigured));
+
+        ComponentHandle<Prefix> explicitConfigured =
+                Beans.mount(runtime, configured, "mount-configured-explicit", new Prefix("two"));
+        assertEquals("mount-configured-explicit", explicitConfigured.mountId());
+        assertEquals(ComponentState.ACTIVE, settle(explicitConfigured));
+    }
+
+    @Test
     void noConfigCreatorAritiesShapesResolveDependenciesInOrder() throws Exception {
         runtime.provide(D0, "0");
         runtime.provide(D1, "1");
@@ -580,14 +608,14 @@ final class BeansTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void dynamicRequiredInjectsLeaseProxyAndDoesNotRestartOnProviderChange() throws Exception {
+    void dynamicProxyRequiredInjectsLeaseProxyAndDoesNotRestartOnProviderChange() throws Exception {
         CapabilityKey<Api> api = CapabilityKey.of("beans-dynamic-api", Api.class);
         CapabilityKey<Supplier<String>> output = CapabilityKey.of(
                 "beans-dynamic-output", (Class<Supplier<String>>) (Class<?>) Supplier.class);
         AtomicInteger starts = new AtomicInteger();
 
         BeanDefinition<NoConfig, Supplier<String>> definition = Beans.component("beans-dynamic-consumer")
-                .with(Beans.dynamicRequired(api))
+                .with(Beans.dynamicProxyRequired(api))
                 .<Supplier<String>>create(proxy -> {
                     starts.incrementAndGet();
                     return () -> proxy.value();
@@ -609,11 +637,11 @@ final class BeansTest {
     }
 
     @Test
-    void dynamicCapabilityFactoriesExposeExplicitLeasedCallEntrypoint() throws Exception {
+    void dynamicFactoriesExposeExplicitLeasedCallEntrypoint() throws Exception {
         CapabilityKey<Api> api = CapabilityKey.of("beans-explicit-dynamic", Api.class);
         AtomicReference<DynamicCapability<Api>> dynamic = new AtomicReference<>();
 
-        BeanDependency<DynamicCapability<Api>> dependency = Beans.dynamicCapabilityOptional(api);
+        BeanDependency<DynamicCapability<Api>> dependency = Beans.dynamicOptional(api);
         assertEquals(CapabilityBinding.DYNAMIC, dependency.requirement().binding());
 
         BeanDefinition<NoConfig, Boolean> definition = Beans.component("beans-explicit-consumer")

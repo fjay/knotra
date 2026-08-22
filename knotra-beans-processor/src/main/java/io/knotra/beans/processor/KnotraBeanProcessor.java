@@ -4,7 +4,7 @@ import io.knotra.beans.annotation.KnotraBean;
 import io.knotra.beans.annotation.KnotraConfig;
 import io.knotra.beans.annotation.KnotraConstructor;
 import io.knotra.beans.annotation.KnotraDestroy;
-import io.knotra.beans.annotation.KnotraDynamic;
+import io.knotra.beans.annotation.KnotraDynamicProxy;
 import io.knotra.beans.annotation.KnotraInit;
 import io.knotra.beans.annotation.KnotraNormalizeConfig;
 import io.knotra.beans.annotation.KnotraOptional;
@@ -48,7 +48,8 @@ import java.util.Set;
 
 /**
  * Generates an immutable {@link io.knotra.beans.BeanDefinition} factory for each
- * {@link KnotraBean}-annotated top-level class.
+ * {@link KnotraBean}-annotated top-level class. Constructor dependency count follows the
+ * declared constructor and is not limited by the hand-written Beans DSL arity.
  */
 @SupportedAnnotationTypes("io.knotra.beans.annotation.KnotraBean")
 @SupportedSourceVersion(SourceVersion.RELEASE_21)
@@ -344,7 +345,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             boolean noConfig) {
         AnnotationMirror requireMirror = mirror(parameter, KnotraRequire.class.getCanonicalName());
         AnnotationMirror optionalMirror = mirror(parameter, KnotraOptional.class.getCanonicalName());
-        AnnotationMirror dynamicMirror = mirror(parameter, KnotraDynamic.class.getCanonicalName());
+        AnnotationMirror dynamicMirror = mirror(parameter, KnotraDynamicProxy.class.getCanonicalName());
         AnnotationMirror configMirror = mirror(parameter, KnotraConfig.class.getCanonicalName());
 
         int declarations = 0;
@@ -362,7 +363,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         }
         if (declarations != 1) {
             error(parameter, "every constructor parameter must have exactly one of "
-                    + "@KnotraRequire, @KnotraOptional, @KnotraDynamic, or @KnotraConfig");
+                    + "@KnotraRequire, @KnotraOptional, @KnotraDynamicProxy, or @KnotraConfig");
             return null;
         }
 
@@ -401,11 +402,17 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
         }
 
         Map<String, AnnotationValue> annotationValues = values(dependencyMirror);
-        String name = stringValue(annotationValues.get("name"), "");
-        TypeMirror contract = typeValue(annotationValues.get("contract"));
+        String name = stringValue(annotationValues.get("value"), "");
         boolean required = !Boolean.FALSE.equals(
                 value(annotationValues.get("required"), Boolean.class, Boolean.TRUE));
 
+        TypeMirror contract;
+        if (kind == ParameterKind.REQUIRED || kind == ParameterKind.DYNAMIC) {
+            contract = parameter.asType();
+        } else {
+            contract = optionalContract(parameter.asType())
+                    .orElseGet(parameter::asType);
+        }
         if (name.isBlank()) {
             error(parameter, kind.annotationName() + " name must not be blank");
             return null;
@@ -449,11 +456,11 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
             if (!(contract instanceof DeclaredType)
                     || contractElement == null
                     || contractElement.getKind() != ElementKind.INTERFACE) {
-                error(parameter, "@KnotraDynamic contract must be an interface");
+                error(parameter, "@KnotraDynamicProxy parameter must be an exact non-generic interface type");
                 return null;
             }
             if (!isSameErasedType(parameter.asType(), contract)) {
-                error(parameter, "@KnotraDynamic parameter must have the exact contract interface type");
+                error(parameter, "@KnotraDynamicProxy parameter must have the exact contract interface type");
                 return null;
             }
         }
@@ -500,6 +507,25 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
 
     private boolean isSameErasedType(TypeMirror left, TypeMirror right) {
         return types.isSameType(types.erasure(left), types.erasure(right));
+    }
+
+    private Optional<TypeMirror> optionalContract(TypeMirror parameter) {
+        if (!(parameter instanceof DeclaredType declared)
+                || declared.getTypeArguments().size() != 1) {
+            return Optional.empty();
+        }
+        Element element = types.asElement(declared);
+        TypeMirror optionalType = elements.getTypeElement("java.util.Optional").asType();
+        if (element == null || !isSameErasedType(declared, optionalType)) {
+            return Optional.empty();
+        }
+        TypeMirror argument = declared.getTypeArguments().getFirst();
+        if (argument.getKind() == TypeKind.WILDCARD
+                || argument.getKind() == TypeKind.TYPEVAR
+                || isParameterizedOrGeneric(argument)) {
+            return Optional.empty();
+        }
+        return Optional.of(argument);
     }
 
     private Optional<TypeMirror> exactOptionalOf(TypeMirror parameter, TypeMirror contract) {
@@ -705,9 +731,9 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
                 } else if (parameter.kind() == ParameterKind.OPTIONAL) {
                     source.append("optional");
                 } else if (parameter.required()) {
-                    source.append("dynamicRequired");
+                    source.append("dynamicProxyRequired");
                 } else {
-                    source.append("dynamicOptional");
+                    source.append("dynamicProxyOptional");
                 }
                 source.append("(KEY_").append(index).append(')');
             }
@@ -916,7 +942,7 @@ public final class KnotraBeanProcessor extends AbstractProcessor implements Proc
     private enum ParameterKind {
         REQUIRED("@KnotraRequire"),
         OPTIONAL("@KnotraOptional"),
-        DYNAMIC("@KnotraDynamic"),
+        DYNAMIC("@KnotraDynamicProxy"),
         CONFIG("@KnotraConfig");
 
         private final String annotationName;

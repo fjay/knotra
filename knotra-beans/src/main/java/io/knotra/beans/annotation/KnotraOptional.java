@@ -5,11 +5,9 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
-/** Declares an optional pinned constructor dependency; the parameter must be Optional<T>. */
+/** Declares an optional pinned dependency inferred from an exact Optional<T> parameter. */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.PARAMETER)
 public @interface KnotraOptional {
-    String name();
-
-    Class<?> contract();
+    String value();
 }

@@ -1,6 +1,14 @@
 package io.knotra;
 
+import java.time.Duration;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /** 组件的稳定逻辑挂载点句柄。 */
 public interface ComponentHandle<C> extends AutoCloseable {
@@ -22,6 +30,57 @@ public interface ComponentHandle<C> extends AutoCloseable {
 
     /** 等待组件离开当前 STARTING/STOPPING 过渡并返回结算状态。 */
     CompletionStage<ComponentState> whenSettled();
+
+    /** 无限期等待当前过渡收敛，且仅在结算状态为 ACTIVE 时返回自身。 */
+    default ComponentHandle<C> requireActive() {
+        return awaitActive(null);
+    }
+
+    /**
+     * 有界等待当前过渡收敛，且仅在结算状态为 ACTIVE 时返回自身。
+     * WAITING、FAILED、DISPOSED 与超时都会抛出 ComponentNotActiveException。
+     */
+    default ComponentHandle<C> requireActive(Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
+        return awaitActive(timeout);
+    }
+
+    private ComponentHandle<C> awaitActive(Duration timeout) {
+        ComponentState settled;
+        try {
+            CompletableFuture<ComponentState> future = whenSettled().toCompletableFuture();
+            settled = timeout == null
+                    ? future.get()
+                    : future.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw notActive(timeout, error);
+        } catch (TimeoutException error) {
+            throw notActive(timeout, error);
+        } catch (ExecutionException | CompletionException error) {
+            throw notActive(timeout, error);
+        }
+        if (settled == ComponentState.ACTIVE) {
+            return this;
+        }
+        throw notActive(timeout, null);
+    }
+
+    private ComponentNotActiveException notActive(Duration timeout, Throwable cause) {
+        return new ComponentNotActiveException(
+                state(),
+                handleId(),
+                mountId(),
+                componentId(),
+                factoryId(),
+                contextId(),
+                timeout,
+                List.of(),
+                cause);
+    }
 
     /** 请求类型化配置变更；事务拒绝时 stage 异常完成。 */
     CompletionStage<ComponentState> reconfigureAsync(C config);

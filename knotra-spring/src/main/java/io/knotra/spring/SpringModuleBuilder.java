@@ -172,18 +172,61 @@ public final class SpringModuleBuilder<C> {
                 key, beanName, SpringDependency.Binding.OPTIONAL_OPTIONAL));
     }
 
-    public <T> SpringModuleBuilder<C> dynamic(String beanName, CapabilityKey<T> key) {
-        return dynamicRequired(beanName, key);
+    /**
+     * Registers a required dynamic dependency as {@code DynamicCapability<T>}.
+     *
+     * <p>The capability holder is stable while providers are replaced. Use it when application
+     * code needs to pin one provider explicitly for {@code call} or {@code callAsync}. Inject it
+     * by the declared bean name or through a qualifier; multiple dynamic dependencies can use
+     * the same erased {@code DynamicCapability} type.
+     */
+    public <T> SpringModuleBuilder<C> dynamicRequired(
+            String beanName,
+            CapabilityKey<T> key) {
+        return dependency(new SpringDependency<>(
+                key, beanName, SpringDependency.Binding.DYNAMIC_CAPABILITY_REQUIRED));
     }
 
-    public <T> SpringModuleBuilder<C> dynamicRequired(String beanName, CapabilityKey<T> key) {
-        return dependency(new SpringDependency<>(key, beanName,
-                SpringDependency.Binding.DYNAMIC_REQUIRED));
+    /**
+     * Registers an optional dynamic dependency as {@code DynamicCapability<T>}.
+     *
+     * <p>The bean is always registered; its capability may be unavailable while no provider is
+     * present. Inject it by the declared bean name or through a qualifier because multiple dynamic
+     * dependencies can use the same erased {@code DynamicCapability} type.
+     */
+    public <T> SpringModuleBuilder<C> dynamicOptional(
+            String beanName,
+            CapabilityKey<T> key) {
+        return dependency(new SpringDependency<>(
+                key, beanName, SpringDependency.Binding.DYNAMIC_CAPABILITY_OPTIONAL));
     }
 
-    public <T> SpringModuleBuilder<C> dynamicOptional(String beanName, CapabilityKey<T> key) {
-        return dependency(new SpringDependency<>(key, beanName,
-                SpringDependency.Binding.DYNAMIC_OPTIONAL));
+    /**
+     * Registers a required dynamic dependency as a {@code T} method-lease proxy.
+     *
+     * <p>Every interface method invocation may target the current provider and holds that
+     * provider only for the duration of the method call. This is convenient for independent
+     * calls, but is not a substitute for pinning a provider across multiple calls.
+     */
+    public <T> SpringModuleBuilder<C> dynamicProxyRequired(
+            String beanName,
+            CapabilityKey<T> key) {
+        return dependency(new SpringDependency<>(
+                key, beanName, SpringDependency.Binding.DYNAMIC_PROXY_REQUIRED));
+    }
+
+    /**
+     * Registers an optional dynamic dependency as a {@code T} method-lease proxy.
+     *
+     * <p>The proxy bean is always registered; method calls fail while no provider is present.
+     * Every interface method invocation may target the current provider and holds that provider
+     * only for the duration of the method call.
+     */
+    public <T> SpringModuleBuilder<C> dynamicProxyOptional(
+            String beanName,
+            CapabilityKey<T> key) {
+        return dependency(new SpringDependency<>(
+                key, beanName, SpringDependency.Binding.DYNAMIC_PROXY_OPTIONAL));
     }
 
     /**

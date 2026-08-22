@@ -5,13 +5,11 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
-/** Declares a dynamic interface constructor dependency backed by a method-level lease proxy. */
+/** Declares a dynamic proxy dependency backed by a method-level provider lease. */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.PARAMETER)
-public @interface KnotraDynamic {
-    String name();
-
-    Class<?> contract();
+public @interface KnotraDynamicProxy {
+    String value();
 
     boolean required() default true;
 }

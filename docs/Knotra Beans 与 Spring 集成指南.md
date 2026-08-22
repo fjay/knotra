@@ -1,54 +1,236 @@
 # Knotra Beans 与 Spring 集成指南
 
-本文描述当前 `0.1.0-SNAPSHOT` 的三个官方装配模块：
+> 💡 **面向读者**：如果您熟悉 Java 和 Spring 开发，但完全不了解 Knotra，本文将从零开始，用最熟悉的 Spring 语境带您理解 Knotra 如何管理 POJO 与 Spring 模块的动态生命周期。
 
-- `knotra-beans`：把普通 Java POJO 构造成 Activation 拥有的 Bean。
-- `knotra-beans-processor`：在编译期生成无反射 `ComponentFactory`。
-- `knotra-spring`：为每个 Activation 创建 Spring child context，并提供宿主动态 bridge。
+---
 
-Knotra Core 的 Context、Capability、固定 BindingSet、Activation、Lifecycle 和事务语义保持不变。这些模块只减少装配样板，不引入第二套运行时容器。
+## 🧭 1. Spring 开发者 3 分钟速览
 
-## 模块与 Maven
+### 1.1 为什么有了 Spring，还需要 Knotra？
 
-项目要求 Java 21+、Maven 3.9+。版本尚未发布到 Maven Central，当前使用本地或内部仓库中的 `0.1.0-SNAPSHOT`。
+Spring 是优秀的依赖注入与应用容器，但其默认设计是**静态单例模型**：应用启动时初始化所有 Bean，运行期间 Bean 的引用和结构通常不再改变。
 
-| 模块 | 引入时机 | 运行依赖 |
-|---|---|---|
-| `knotra-beans` | 手写 POJO DSL，或使用生成的 Factory | `knotra-core` |
-| `knotra-beans-processor` | 编译期注解处理 | 编译期使用，应用运行时不需要 |
-| `knotra-spring` | Spring child context 或宿主动态 bridge | `knotra-core`、`spring-context` |
+当您遇到以下**动态诉求**时，原生 Spring 会面临挑战：
+1. **在线热替换业务逻辑**：在不重启 JVM 的情况下，将 `WechatPayService` 热替换为 `AlipayService`。
+2. **安全排空（Drain）**：旧插件被替换时，必须等待正在处理的请求安全结束，再销毁旧容器；不能暴力直接 `close()`。
+3. **依赖代际一致性**：当底层数据库连接或基础服务更新时，依赖它的上层组件必须自动原子重建，绝不允许上层持有失效的旧连接。
 
-手写 DSL 只需要：
+**Knotra 与 Spring 的分工**：
+- **Spring** 负责组织组件内部复杂的 Bean 依赖图与生态支持（如 `@Transactional`、MVC 等）；
+- **Knotra** 负责在外部作为**“动态运行时调度器”**，管理 Spring 子容器或 POJO 组件的加载、热重载、依赖代际传播与安全排空。
 
-```xml
-<dependency>
-  <groupId>io.knotra</groupId>
-  <artifactId>knotra-beans</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
-</dependency>
+```mermaid
+graph TB
+    subgraph Knotra 运行时 [Knotra 动态运行时 (Runtime)]
+        direction TB
+        K[Knotra 事务与生命周期调度]
+
+        subgraph 模式 A: 纯 POJO 模式
+            P[POJO Bean: 零外部依赖]
+        end
+
+        subgraph 模式 B: Spring 子容器模式
+            SC[Spring Child Context: 独立 Spring 容器]
+            SC --> B1[Service]
+            SC --> B2[Repository]
+        end
+
+        subgraph 模式 C: 宿主动态桥模式
+            SDB[SpringDynamicBridge 智能代理]
+        end
+    end
+
+    HostSpring[宿主 Spring Boot 单例 Service] -->|注入代理| SDB
+    SDB -->|动态路由| SC
 ```
 
-使用注解生成时，应用保留 `knotra-beans`，并把 processor 放入 compiler plugin 的 processor path：
+---
+
+### 1.2 核心术语人话对照字典
+
+| Knotra 术语 | Spring 对应概念 / 通俗比喻 | 含义解释 |
+|---|---|---|
+| **`CapabilityKey<T>`** | 接口契约标识符（类似带类型的 Bean Name） | 用名称 + Java `Class<T>` 唯一标识一项服务接口。 |
+| **`ComponentHandle<C>`** | 永久插座（固定挂载点） | 组件在系统中的永久挂载点，热替换期间该句柄保持稳定不变。 |
+| **`Activation`** | 当前运行的一代实例（运行中的灯泡） | 某一次实际运行的 Bean 实例或 Spring 容器。依赖变更时，旧 Activation 销毁，新 Activation 启动。 |
+| **`PINNED` 依赖** | 普通 `@Autowired` 依赖（固定注入） | 启动时注入具体对象；一旦被注入的对象被替换，消费方组件会自动**整机重启（重新 new）**以获取新依赖。 |
+| **`DYNAMIC` 依赖** | 智能动态代理（Proxy） | 注入一个智能代理，每次方法调用时自动路由到最新实现，**消费方无需重启**。 |
+| **`External Singleton`** | 外部借入的单例 | Knotra 把宿主提供的对象借给 Spring 子容器使用，Spring 销毁时**绝不会**自作主张把它 close 掉。 |
+| **`LifecycleScope`** | 资源清理清单（LIFO 顺序） | 记录该代实例申请的所有连接、线程和资源，销毁时按严格后进先出释放。 |
+
+---
+
+## 📦 2. Maven 依赖引入
+
+在项目的 `pom.xml` 中引入 BOM 对齐版本：
 
 ```xml
-<dependency>
-  <groupId>io.knotra</groupId>
-  <artifactId>knotra-beans</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
-</dependency>
+<properties>
+  <knotra.version>0.1.0-SNAPSHOT</knotra.version>
+</properties>
 
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>io.knotra</groupId>
+      <artifactId>knotra-bom</artifactId>
+      <version>${knotra.version}</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+
+<dependencies>
+  <!-- 普通 Java 应用引入 starter -->
+  <dependency>
+    <groupId>io.knotra</groupId>
+    <artifactId>knotra-starter</artifactId>
+  </dependency>
+
+  <!-- Spring 应用引入 spring-starter -->
+  <dependency>
+    <groupId>io.knotra</groupId>
+    <artifactId>knotra-spring-starter</artifactId>
+  </dependency>
+</dependencies>
+```
+
+---
+
+## 🚀 3. 模式一：纯 POJO 业务组件装配（`knotra-beans`）
+
+很多时候，插件或业务策略根本不需要引入庞大的 Spring 容器。`knotra-beans` 提供了一个流畅的 DSL，让**普通的 Java POJO 也能享受类型安全的依赖注入与热重载**。
+
+### 3.1 编写干净的业务类（零框架依赖）
+
+```java
+// 1. 业务接口
+public interface Greeting {
+    String greet(String name);
+}
+
+// 2. 纯 Java 实现（无需实现 Knotra 的任何接口）
+public final class GreetingBean implements Greeting, AutoCloseable {
+    @Override
+    public String greet(String name) {
+        return "Hello, " + name;
+    }
+
+    @Override
+    public void close() {
+        System.out.println("GreetingBean 资源已安全释放！");
+    }
+}
+```
+
+### 3.2 装配与启动
+
+```java
+import io.knotra.*;
+import io.knotra.beans.*;
+
+// 1. 定义 Capability 契约 Key
+static final CapabilityKey<Greeting> GREETING =
+        CapabilityKey.of("app.greeting", Greeting.class);
+
+// 2. 使用 DSL 定义 Bean
+BeanDefinition<NoConfig, GreetingBean> factory = Beans.component("greeting")
+        .create(GreetingBean::new)      // 构造函数
+        .provide(GREETING)              // 对外发布的能力
+        .build();
+
+// 3. 挂载并启动
+try (KnotraRuntime runtime = KnotraRuntime.create()) {
+    ComponentHandle<NoConfig> handle = Beans.mount(runtime, factory);
+    handle.requireActive(); // 确保组件启动成功
+}
+```
+
+### 3.3 依赖注入：Required 与 Optional
+
+当组件需要依赖其他服务时，使用 `with(...)` 进行声明：
+
+```java
+static final CapabilityKey<UserRepository> USERS =
+        CapabilityKey.of("app.users", UserRepository.class);
+static final CapabilityKey<Metrics> METRICS =
+        CapabilityKey.of("app.metrics", Metrics.class);
+static final CapabilityKey<UserService> USER_SERVICE =
+        CapabilityKey.of("app.user-service", UserService.class);
+
+// UserService 构造函数接收 UserRepository 和 Optional<Metrics>
+BeanDefinition<NoConfig, UserService> userDef = Beans.component("user-service")
+        .with(
+                Beans.required(USERS),    // 必需依赖：缺失则等待
+                Beans.optional(METRICS)   // 可选依赖：收到 Optional<Metrics>
+        )
+        .create((users, metrics) -> new UserService(users, metrics))
+        .provide(USER_SERVICE)
+        .build();
+```
+
+| 依赖申明方式 | 构造函数收到的参数类型 | 当依赖提供者被热替换时 |
+|---|---|---|
+| `Beans.required(KEY)` | `T` | **自动重载消费方**（PINNED 语义：重新 new UserService） |
+| `Beans.optional(KEY)` | `Optional<T>` | **自动重载消费方**（注入最新的 Optional） |
+| `Beans.dynamicProxyRequired(KEY)` | `T` (智能代理) | **消费方不重载**，调用时自动路由到最新 Provider |
+| `Beans.dynamicRequired(KEY)` | `DynamicCapability<T>` | **消费方不重载**，通过 `call()` 块固定单次调用的 Provider |
+
+---
+
+### 3.4 动态依赖（Dynamic）：热替换时不重启消费方
+
+如果您希望 Provider 替换时，消费方完全不需要重建（适合无状态服务或高频调用的网关），使用 **动态代理**：
+
+```mermaid
+sequenceDiagram
+    participant OrderService as 消费方 (OrderService)
+    participant Proxy as 方法级 Proxy
+    participant OldPay as 旧支付渠道 (V1)
+    participant NewPay as 新支付渠道 (V2)
+
+    OrderService->>Proxy: pay(100元)
+    Proxy->>OldPay: 转发调用 V1
+    OldPay-->>OrderService: 支付成功
+
+    Note over Proxy: 此时管理员热更新了支付渠道
+
+    OrderService->>Proxy: pay(200元)
+    Proxy->>NewPay: 自动切换转发调用 V2
+    NewPay-->>OrderService: 支付成功 (OrderService 实例未发生任何重启)
+```
+
+```java
+static final CapabilityKey<PaymentGateway> PAYMENT =
+        CapabilityKey.of("app.payment", PaymentGateway.class);
+
+BeanDefinition<NoConfig, CheckoutService> checkoutDef = Beans.component("checkout")
+        .with(Beans.dynamicProxyRequired(PAYMENT)) // 注入动态代理
+        .create(CheckoutService::new)
+        .build();
+```
+
+---
+
+## ⚡ 4. 模式二：编译期注解驱动（`knotra-beans-processor`）
+
+如果您不想手写 `Beans.component()` DSL，Knotra 提供了**编译期注解处理器**。它在 `javac` 编译时直接生成 Java 代码，**零反射、启动极快**。
+
+### 4.1 配置 Maven Compiler Plugin
+
+```xml
 <build>
   <plugins>
     <plugin>
       <groupId>org.apache.maven.plugins</groupId>
       <artifactId>maven-compiler-plugin</artifactId>
       <configuration>
-        <proc>full</proc>
         <annotationProcessorPaths>
           <path>
             <groupId>io.knotra</groupId>
             <artifactId>knotra-beans-processor</artifactId>
-            <version>0.1.0-SNAPSHOT</version>
+            <version>${knotra.version}</version>
           </path>
         </annotationProcessorPaths>
       </configuration>
@@ -57,803 +239,207 @@ Knotra Core 的 Context、Capability、固定 BindingSet、Activation、Lifecycl
 </build>
 ```
 
-Spring child context 或 bridge 使用：
-
-```xml
-<dependency>
-  <groupId>io.knotra</groupId>
-  <artifactId>knotra-spring</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
-</dependency>
-```
-
-## 最小无配置 POJO
-
-业务类保持普通 Java 对象形状，可以实现业务接口和 `AutoCloseable`，但不依赖 Knotra API：
+### 4.2 像写 Spring 组件一样标注注解
 
 ```java
-public interface Greeting {
-    String greet(String name);
-}
+package com.example.service;
 
-public final class GreetingBean implements Greeting, AutoCloseable {
-    @Override
-    public String greet(String name) {
-        return "hello, " + name;
-    }
+import io.knotra.beans.annotation.*;
+import java.util.Optional;
 
-    @Override
-    public void close() {
-        // 只释放 GreetingBean 自己拥有的资源。
-    }
-}
-```
-
-Capability 和组件定义只出现在应用装配层：
-
-```java
-static final CapabilityKey<Greeting> GREETING =
-        CapabilityKey.of("app.greeting", Greeting.class);
-
-BeanDefinition<NoConfig, GreetingBean> factory =
-        Beans.component("greeting")
-                .create(GreetingBean::new)
-                .provide(GREETING)
-                .build();
-
-ComponentHandle<NoConfig> handle =
-        runtime.mount("greeting", factory);
-```
-
-每次 Activation 的执行顺序固定：
-
-```text
-归一化配置
--> 解析本代依赖
--> creator 创建新 Bean
--> 立即登记 Bean cleanup
--> 执行 initializer
--> 解析并暂存全部输出
--> Core 原子提交输出
-```
-
-`BeanDefinition` 和由它创建的 Component 外壳可以跨 Activation 复用，但不保存 Bean、依赖、输出值或 `ActivationContext`。业务 Bean 必须每次 `start()` 新建。creator 返回 `null` 时本次 Activation 失败。
-
-## Required 与 Optional
-
-Required pinned 依赖在本次 Activation 内固定：
-
-```java
-static final CapabilityKey<UserRepository> USERS =
-        CapabilityKey.of("app.users", UserRepository.class);
-static final CapabilityKey<Metrics> METRICS =
-        CapabilityKey.of("app.metrics", Metrics.class);
-
-BeanDefinition<NoConfig, UserService> factory =
-        Beans.component("user-service")
-                .with(Beans.required(USERS))
-                .create(UserService::new)
-                .provide(USER_SERVICE)
-                .build();
-```
-
-Optional pinned 依赖传给 creator 的是 `Optional<T>`，缺失时为空，不使用 `null`：
-
-```java
-BeanDefinition<NoConfig, UserService> factory =
-        Beans.component("user-service")
-                .with(
-                        Beans.required(USERS),
-                        Beans.optional(METRICS))
-                .create(UserService::new)
-                .provide(USER_SERVICE)
-                .build();
-```
-
-`UserService` 的构造器相应为：
-
-```java
-public UserService(
-        UserRepository users,
-        Optional<Metrics> metrics) {
-    // ...
-}
-```
-
-依赖 token 与 creator 参数由泛型连接：
-
-| Token | Creator 收到 | Provider 变化 |
-|---|---|---|
-| `Beans.required(KEY)` | `T` | REQUIRED pinned：启动等待；ACTIVE 后重激活 |
-| `Beans.optional(KEY)` | `Optional<T>` | OPTIONAL pinned：可启动；出现、消失或替换都重激活 |
-| `Beans.dynamicRequired(KEY)` | `T` 方法级 proxy | 首次启动要求存在；之后 consumer 不重启 |
-| `Beans.dynamicOptional(KEY)` | `T` 方法级 proxy | 可缺失启动；之后 consumer 不重启 |
-| `Beans.dynamicCapabilityRequired(KEY)` | `DynamicCapability<T>` | 首次启动要求存在；之后 consumer 不重启 |
-| `Beans.dynamicCapabilityOptional(KEY)` | `DynamicCapability<T>` | 可缺失启动；之后 consumer 不重启 |
-
-`with(...)` 和 `create(...)` 支持 0 到 5 个依赖。无配置 creator 形状为 `create(d1, ..., dn)`；类型化配置 creator 形状始终是 `create(config, d1, ..., dn)`。builder 支持分批追加依赖：
-
-```java
-BeanDefinition<NoConfig, OrderService> factory =
-        Beans.component("order-service")
-                .with(
-                        Beans.required(USER_REPOSITORY),
-                        Beans.optional(METRICS))
-                .with(Beans.dynamicRequired(PAYMENT_GATEWAY))
-                .create((users, metrics, payment) ->
-                        new OrderService(users, metrics, payment))
-                .provide(ORDER_SERVICE)
-                .build();
-```
-
-不要用 `CapabilityKey<?>...` 加运行时下标取值；这不是 Knotra 的类型安全路径。
-
-## 类型化配置
-
-配置类型在定义时冻结：
-
-```java
-public record CacheConfig(
-        long maximumSize,
-        Duration expireAfterWrite) {}
-
-static final CapabilityKey<CacheStore> CACHE_STORE =
-        CapabilityKey.of("app.cache-store", CacheStore.class);
-
-BeanDefinition<CacheConfig, CacheStore> factory =
-        Beans.component("cache", CacheConfig.class)
-                .with(Beans.required(STORAGE))
-                .create((config, storage) -> new LocalCacheStore(
-                        config,
-                        storage,
-                        storage.metrics()))
-                .normalizeConfig(config -> new CacheConfig(
-                        config.maximumSize(),
-                        config.expireAfterWrite().truncatedTo(ChronoUnit.SECONDS)))
-                .provide(CACHE_STORE)
-                .build();
-
-ComponentHandle<CacheConfig> cache = runtime.mount(
-        "cache",
-        factory,
-        new CacheConfig(10_000, Duration.ofMinutes(5)));
-```
-
-typed creator 的参数顺序固定为：
-
-```text
-config, d1, d2, d3, d4, d5
-```
-
-同一 `ComponentHandle` 可以重新配置：
-
-```java
-cache.reconfigureAsync(new CacheConfig(20_000, Duration.ofMinutes(10)))
-        .toCompletableFuture()
-        .get(30, TimeUnit.SECONDS);
-```
-
-reconfigure 会先归一化新配置，再关闭旧 Bean 和旧输出，最后创建新一代 Bean。依赖集合是静态 descriptor 的一部分，不能随某次配置值动态增减；需要不同依赖图时应替换整个 Factory。
-
-配置为 `null`、raw 配置类型不匹配、normalizer 抛错、返回 `null` 或返回错误类型时，事务以 `INVALID_CONFIG` 拒绝，不会进入 Activation。
-
-## Initializer 与输出
-
-initializer 在 cleanup 登记之后、输出提交之前执行：
-
-```java
-BeanDefinition<NoConfig, HttpClient> factory =
-        Beans.component("http-client")
-                .with(Beans.required(HTTP_CONFIG))
-                .create(HttpClient::new)
-                .initializer(HttpClient::warmUp)
-                .provide(HTTP_CLIENT)
-                .build();
-```
-
-initializer 抛出任何异常都会回滚本次 Activation，并执行已登记的 Bean cleanup。
-
-单输出可以直接发布 Bean 本身：
-
-```java
-.provide(USER_SERVICE)
-```
-
-多输出可以从同一个 Bean 映射多个 Capability：
-
-```java
-BeanDefinition<NoConfig, InfrastructureModule> factory =
-        Beans.component("infrastructure")
-                .with(Beans.required(DATABASE))
-                .create(InfrastructureModule::new)
-                .provide(INFRASTRUCTURE)
-                .provideAs(USER_REPOSITORY, module -> module.users())
-                .provideAs(ORDER_REPOSITORY, module -> module.orders())
-                .build();
-```
-
-输出契约：
-
-- `provide(KEY)` 要求 Bean 可赋值给 `KEY.type()`；不匹配会在 Activation 中失败。
-- `provideAs(KEY, mapper)` 由 mapper 产生输出值，mapper 不能为 `null`。
-- creator 返回 `null`、任一输出 mapper 返回 `null` 或输出类型不匹配，都会使本次 Activation 失败。
-- 同一定义中重复输出 Capability 名称会在构建时抛 `IllegalArgumentException`。
-- 多个输出先全部解析并暂存，再统一提交；任一输出失败，其他输出也不可见。
-- 零输出定义是合法的，适合只产生副作用或只登记 lifecycle 的 Component。
-
-## 生命周期
-
-默认策略是 AUTO：
-
-```text
-AsyncCloseable -> LifecycleScope.manageAsync
-AutoCloseable  -> LifecycleScope.manage
-其他对象       -> 不登记 cleanup
-```
-
-`AsyncCloseable` 优先于 `AutoCloseable`。它表示 Knotra 会等待 `closeAsync()` 返回的 stage 完成；业务对象自己仍必须实现“拒绝新工作并排空已接受工作”的契约。
-
-自定义同步清理：
-
-```java
-BeanDefinition<NoConfig, LegacyClient> factory =
-        Beans.component("legacy-client")
-                .with(Beans.required(LEGACY_CONFIG))
-                .create(LegacyClient::new)
-                .destroyWith(LegacyClient::shutdown)
-                .provide(LEGACY_CLIENT)
-                .build();
-```
-
-自定义异步清理：
-
-```java
-BeanDefinition<NoConfig, AsyncClient> factory =
-        Beans.component("async-client")
-                .with(Beans.required(CLIENT_CONFIG))
-                .create(AsyncClient::new)
-                .destroyAsyncWith(AsyncClient::drainAndClose)
-                .provide(ASYNC_CLIENT)
-                .build();
-```
-
-自定义清理失败时组件保持 `FAILED`，随后 `retryAsync()` 只重试失败的 lifecycle entry。同步 disposer 和异步 disposer 都应幂等且可重试；异步 disposer 返回异常完成的 stage 也表示可重试。
-
-生命周期策略后调用覆盖前调用：
-
-```java
-.destroyWith(Client::shutdown)
-.unmanaged()
-```
-
-最终生效的是 `UNMANAGED`。DSL 允许这种链式覆盖；注解模式则没有等价链式语义。
-
-### UNMANAGED 与所有权
-
-```java
-BeanDefinition<NoConfig, PooledExecutor> factory =
-        Beans.component("worker")
-                .create(PooledExecutor::new)
-                .unmanaged()
-                .build();
-```
-
-`unmanaged()` 表示 Knotra 不为本次 Activation 创建的 Bean 登记任何 cleanup。它只适合创建方已经把对象交给另一个可负责关闭的资源，或该对象确实没有需要执行的清理动作。
-
-使用边界：
-
-- 不建议 creator 返回跨 Activation 共享的 singleton。
-- UNMANAGED 不改变“每次 Activation 新建 Bean”的设计意图。
-- Activation 失败或关闭时，Knotra 不会调用该 Bean 的任何 close 或 destroy 方法。
-- 宿主通过 `runtime.provide(KEY, value)` 发布的对象仍由宿主拥有；撤销 registration 不会自动关闭 value。
-- 借入依赖不应该在 Bean cleanup 中关闭；只关闭 Bean 自己创建的资源。
-
-`BeanLifecycles` 是公开工具类，提供与 DSL 相同的 `autoManage`、`manageSync` 和 `manageAsync` 语义，供框架集成或生成代码复用。
-
-## Dynamic 依赖
-
-默认依赖是 PINNED。provider 的 registration 变化时，Knotra 会关闭旧 Activation，并用新的固定依赖重建 consumer。
-
-DYNAMIC 依赖适用于无状态调用或显式路由。consumer ACTIVE 后 provider 替换不重建 consumer，每次调用解析当前已提交 provider。
-
-### 方法级 Proxy
-
-```java
-static final CapabilityKey<PaymentGateway> PAYMENT =
-        CapabilityKey.of("app.payment", PaymentGateway.class);
-
-BeanDefinition<NoConfig, CheckoutService> factory =
-        Beans.component("checkout")
-                .with(Beans.dynamicRequired(PAYMENT))
-                .create(CheckoutService::new)
-                .provide(CHECKOUT_SERVICE)
-                .build();
-```
-
-`CheckoutService` 构造器收到的是 `PaymentGateway` proxy。每个 proxy 方法独立执行：
-
-```text
-原子获取 consumer/provider 调用租约
--> 固定到一个 provider
--> 执行一次方法
--> 同步返回后释放租约
-```
-
-如果方法返回 `CompletionStage`，租约会保持到 stage 完成。provider 替换或清理会等待旧租约归零；STARTING、stale 或未提交 registration 不会被调用。
-
-连续两个 proxy 方法可能在中间发生 provider 替换，不能用于事务或多方法一致性问题。
-
-### 显式 DynamicCapability
-
-多个方法必须落在同一个 provider 时，注入 `DynamicCapability<T>`：
-
-```java
-BeanDefinition<NoConfig, PaymentService> factory =
-        Beans.component("payment-service")
-                .with(Beans.dynamicCapabilityRequired(PAYMENT))
-                .create(PaymentService::new)
-                .provide(PAYMENT_SERVICE)
-                .build();
-```
-
-一次 `call` 固定一个 provider：
-
-```java
-payment.call(gateway -> {
-    gateway.begin();
-    gateway.charge(order);
-    gateway.commit();
-    return null;
-});
-```
-
-异步版本：
-
-```java
-CompletionStage<Receipt> receipt =
-        payment.callAsync(gateway -> gateway.chargeAsync(order));
-```
-
-`callAsync` 在执行 callback 前获取租约。callback 抛错时返回异常完成的 stage 并立即释放租约；callback 正常返回 stage 时，租约保持到该 stage 完成，组合 stage 抛错也会释放租约。
-
-### 失败语义
-
-- `CapabilityUnavailableException`：当前没有已提交且可用的 provider。`dynamicRequired` 首次启动需要 provider；ACTIVE 后 provider 消失时 consumer 不重启，后续调用得到该异常，provider 回来后继续使用。STARTING 期间 required provider 消失时，本次 Activation 回滚到 `WAITING`，不会误提交。
-- `DynamicCapabilityClosedException`：consumer 或 dynamic capability 已关闭，之后不再接受新调用。
-- `available()` 只是 advisory 快照。返回 `true` 不保证下一次调用一定成功；真正调用仍在准入 gate 内原子获取租约。调用代码应处理 unavailable 或 closed，不应把 `available()` 当作锁。
-
-其他约束：
-
-- `Beans.dynamicRequired/dynamicOptional` 注入 JDK proxy，因此 contract 必须是 Java interface；`dynamicCapabilityRequired/dynamicCapabilityOptional` 只注入显式调用入口，`call/callAsync` 本身不要求 contract 是 interface。
-- `proxy(Class)` 只接受与 CapabilityKey 完全相同的 interface，不接受子接口。
-- Proxy 的 `equals/hashCode/toString` 表达 proxy 自身身份，不转发给 provider。
-- `call` 或 `callAsync` 回调返回的 provider、连接或内部句柄如果长期逃逸，Core 无法追踪或排空。
-- DYNAMIC 边不进入固定 BindingSet 身份，但参与依赖图和环检测。
-
-## BeanDefinition 与 Expert API
-
-`build()` 返回不可变 `BeanDefinition<C, T>`，它同时实现 `ComponentFactory<C>`：
-
-```java
-definition.componentId();       // 显式稳定组件 ID
-definition.factoryId();         // 与 componentId 相同
-definition.configType();        // NoConfig.class 或显式 Class<C>
-definition.dependencies();      // 不可变，按声明顺序
-definition.outputNames();       // 不可变，按声明顺序
-definition.outputKeys();        // 不可变，按声明顺序
-definition.descriptor();        // 由依赖生成的静态 descriptor
-definition.create();            // 每次调用返回新的无状态外壳
-```
-
-`componentId` 同时用于 descriptor 和 `factoryId`。它不像 mount ID 那样由调用点自动生成，而是定义的一部分；Loader、PF4J export 和诊断应使用这个稳定 ID。
-
-Expert 入口允许集成层直接使用 `ActivationContext`：
-
-```java
-BeanDefinition<ServiceConfig, ExpertService> factory =
-        BeanDefinition.<ServiceConfig, ExpertService>expert(
-                "expert-service",
-                ServiceConfig.class,
-                List.of(
-                        Beans.required(STORAGE),
-                        Beans.optional(METRICS)),
-                (context, config) -> new ExpertService(
-                        config,
-                        context.require(STORAGE),
-                        context.find(METRICS)))
-                .provide(EXPERT_SERVICE)
-                .build();
-```
-
-Expert creator 运行时的每个 `require/find/subscribe` 仍必须与依赖列表声明一致；未声明 key、pinned 依赖调用 `subscribe` 或 dynamic 依赖调用 `require/find` 都会被 Core 拒绝。普通业务装配优先使用定长 creator API。
-
-## 编译期 Factory
-
-注解模式适合希望把 wiring 固化在业务源文件旁的项目。它引入编译期耦合；注解为 `SOURCE` retention，运行时不存在注解对象。
-
-最小示例：
-
-```java
 @KnotraBean(id = "order-service")
-@KnotraOutput(
-        name = "app.order-service",
-        contract = OrderService.class)
+@KnotraOutput(name = "app.order-service", contract = OrderService.class)
 public final class DefaultOrderService implements OrderService {
 
     private final UserRepository users;
     private final Optional<Metrics> metrics;
+    private final PaymentGateway payment;
 
     @KnotraConstructor
     DefaultOrderService(
-            @KnotraRequire(
-                    name = "app.users",
-                    contract = UserRepository.class)
-            UserRepository users,
-            @KnotraOptional(
-                    name = "app.metrics",
-                    contract = Metrics.class)
-            Optional<Metrics> metrics) {
+            @KnotraRequire("app.users") UserRepository users,
+            @KnotraOptional("app.metrics") Optional<Metrics> metrics,
+            @KnotraDynamicProxy("app.payment") PaymentGateway payment) {
         this.users = users;
         this.metrics = metrics;
+        this.payment = payment;
     }
 
     @KnotraInit
-    void start() {
-        // cleanup 已登记，输出尚未提交。
+    void init() {
+        System.out.println("订单服务启动初始化！");
     }
 
     @KnotraDestroy
-    public void stop() {
-        // 幂等清理，失败可被 Knotra retry。
+    public void close() {
+        System.out.println("订单服务销毁清理！");
     }
 }
 ```
 
-生成类与业务类位于同一个 package，名称固定为：
-
-```text
-DefaultOrderService_KnotraFactory
-```
-
-生成类是 public final、有无参构造函数，并实现 `ComponentFactory<C>`。直接实例化和挂载：
+编译后，Processor 会自动在同一包下生成 `DefaultOrderService_KnotraFactory.java`，直接使用即可：
 
 ```java
-DefaultOrderService_KnotraFactory factory =
-        new DefaultOrderService_KnotraFactory();
-
-ComponentHandle<NoConfig> handle =
-        runtime.mount("order-service", factory);
+DefaultOrderService_KnotraFactory factory = new DefaultOrderService_KnotraFactory();
+ComponentHandle<NoConfig> handle = Beans.mount(runtime, factory.definition());
+handle.requireActive();
 ```
 
-需要读取定义元数据时：
+---
+
+## 🍃 5. 模式三：Spring 子容器动态插拔（`SpringModules`）
+
+这是**将一整套 Spring 模块（包含多个 `@Service`、`@Repository`、`@Configuration`）打包为动态插件**的核心模式。
+
+### 5.1 工作机制图解
+
+```mermaid
+graph TB
+    subgraph Knotra Runtime 宿主
+        KR[Knotra 运行时]
+        UP[宿主提供的 UserRepository]
+    end
+
+    subgraph Spring Child Context 插件代际
+        direction TB
+        SCC[AnnotationConfigApplicationContext]
+        SCC -->|注入外部 Singleton| EB[UserRepository Bean 引用]
+        SCC -->|插件内部创建| PS[PaymentService Bean]
+        EB -.-> PS
+    end
+
+    KR -->|生命周期管理| SCC
+    UP -->|借入使用| EB
+    PS -->|expose 发布为 Capability| KP[PAYMENT_SERVICE 供宿主调用]
+```
+
+### 5.2 完整上手步骤
+
+#### 第一步：编写插件内部的 Spring `@Configuration`
 
 ```java
-BeanDefinition<NoConfig, DefaultOrderService> definition =
-        new DefaultOrderService_KnotraFactory().definition();
+package com.example.plugin;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class PluginSpringConfig {
+
+    // UserRepository 是从宿主环境注入进来的
+    @Bean
+    public PaymentService paymentService(UserRepository users) {
+        return new WechatPaymentService(users);
+    }
+}
 ```
 
-生成代码特性：
+#### 第二步：用 `SpringModules` 定义子容器
 
-- 直接调用业务 constructor 和方法，不使用反射。
-- CapabilityKey 使用编译期 class literal。
-- 不嵌入时间戳，重复编译生成源稳定。
-- 每个生成的 Factory 实例持有一个不可变 `BeanDefinition`。
-- `create()` 返回的 Component 外壳不保存激活期状态。
-- `@KnotraConfig` 参数传给 constructor；`Require/Optional/Dynamic` 按声明顺序传入。
-- `@KnotraOutput` 使用 `bean -> bean` 映射，因此业务类必须可赋值给输出 contract。
+```java
+import io.knotra.spring.SpringModules;
 
-### 注解参考
+ComponentFactory<NoConfig> pluginFactory = SpringModules.noConfig("payment-plugin")
+        // 1. 扫描插件的 Spring 配置类
+        .annotatedClasses(PluginSpringConfig.class)
+        // 2. 声明需要从 Knotra 借入的依赖，并指定在 Spring 容器中的 Bean Name
+        .required("users", USER_REPOSITORY_KEY)
+        // 3. 声明把插件内部的哪个 Spring Bean 暴露为外部 Capability
+        .expose(PAYMENT_SERVICE_KEY, "paymentService")
+        .build();
 
-| 注解 | 位置 | 语义 |
-|---|---|---|
-| `@KnotraBean` | 类 | 声明 `id`、`config`、`lifecycle`、`outputs` |
-| `@KnotraConstructor` | 构造器 | 选择唯一构造器 |
-| `@KnotraRequire` | 构造参数 | Required pinned 依赖 |
-| `@KnotraOptional` | 构造参数 | Optional pinned 依赖，参数必须是 `Optional<T>` |
-| `@KnotraDynamic` | 构造参数 | Dynamic 依赖，`required` 默认 `true` |
-| `@KnotraConfig` | 构造参数 | 接收归一化配置 |
-| `@KnotraOutput` | 类，可重复 | 声明输出 Capability |
-| `@KnotraInit` | 实例方法 | Cleanup 登记后、输出提交前初始化 |
-| `@KnotraDestroy` | 实例方法 | 同步或异步 Bean 清理 |
-| `@KnotraNormalizeConfig` | 静态方法 | 配置归一化 |
+// 挂载并启动 Spring 子容器
+ComponentHandle<NoConfig> pluginHandle = runtime.mount("payment-plugin", pluginFactory);
+pluginHandle.requireActive();
+```
 
-`@KnotraBean.lifecycle` 只支持：
+> 🔍 **发生了什么？**
+> 1. Knotra 自动为该插件创建独立的 `AnnotationConfigApplicationContext`；
+> 2. 将外部借入的 `UserRepository` 注册为 Spring 单例；
+> 3. 调用 `context.refresh()` 启动容器；
+> 4. 获取名为 `paymentService` 的 Bean 并发布到 Knotra 运行时中；
+> 5. 当外部 `USER_REPOSITORY_KEY` 发生热替换时，Knotra 会**自动优雅关闭当前 Spring 容器，并重新创建一个新的 Spring 容器**！
 
-- `AUTO`：无 `@KnotraDestroy` 时按 `AsyncCloseable/AutoCloseable` 推断；有 `@KnotraDestroy` 时使用该方法。
-- `UNMANAGED`：生成 `.unmanaged()`，不为 Bean 登记清理；不能同时声明 `@KnotraDestroy`。
+---
 
-### 结构与诊断
+## 🌉 6. 模式四：Spring 宿主动态桥（`SpringDynamicBridge`）
 
-Processor 在编译期拒绝以下形状，并输出稳定错误信息：
+### 6.1 场景：在宿主 Spring Boot 单例中无感知调用动态插件
 
-| 类别 | 规则 |
-|---|---|
-| 类形状 | 必须是 top-level class；不能是 interface、enum、record、abstract、private 或泛型类 |
-| 稳定 ID | `id` 必须非空 |
-| 构造器 | 必须有且只有一个 `@KnotraConstructor`；不能 private 或声明类型参数 |
-| 参数标注 | 每个构造参数恰好标注 `Require/Optional/Dynamic/Config` 之一 |
-| Required | contract 和参数类型必须精确一致，且不能 primitive、void、generic 或 parameterized |
-| Optional | 参数必须精确为 `Optional<contract>`，contract 不能 generic 或 parameterized |
-| Dynamic | contract 必须是 interface，参数必须是同一精确 interface；不能 generic 或 parameterized |
-| Config | typed bean 必须恰好一个 `@KnotraConfig`；NoConfig bean 必须没有；类型必须精确匹配且非 primitive、generic 或 parameterized |
-| 输出 | 名称非空；contract 非 primitive、void、generic 或 parameterized；业务类可赋值给它；同一输出名称不能重复 |
-| Capability 名称 | 依赖和输出之间不能重复名称 |
-| Init | 最多一个；非 private、零参数实例方法 |
-| Destroy | 最多一个；非 private、零参数实例方法；`async=true` 必须返回 `CompletionStage<Void>`；不能与 UNMANAGED 组合 |
-| Normalizer | 最多一个；typed bean 专用；非 private static，一个 config 参数，返回类型可赋值给 config 类型 |
-| 可访问性 | config、依赖 contract、输出 contract 必须能被同 package 的生成类访问；private nested 类型拒绝 |
-| 生成类冲突 | 完全限定 `Bean_KnotraFactory` 已存在或已被计划生成时拒绝 |
+在典型的 Spring Boot 宿主应用中，您的 Controller 或 Service 是单例的，无法随意重启。但它又需要调用某个可能会动态热更新的插件接口。
 
-由于 CapabilityKey 的运行时 token 是精确 `Class<T>`，processor 不做泛型擦除猜测。需要 `List<String>`、`Optional<Integer>` 这类参数化 Capability 时，应拆出精确非泛型 contract，或改用手写 DSL 在边界自行处理。
-
-## Spring Child Context
-
-一个 Knotra Component 对应一个 Spring child context；不要为每个普通 Spring Bean 挂一个 Knotra 组件。child context 默认没有宿主 parent context，所有外部 Capability 必须显式声明。
-
-### 最小 noConfig
+`SpringDynamicBridge` 会为 Spring 主容器提供一个**永不失效的动态代理对象**：
 
 ```java
 @Configuration
-class OrderSpringConfig {
+public class HostSpringConfiguration {
+
     @Bean
-    OrderService orderService(UserRepository users) {
-        return new OrderService(users);
+    public SpringDynamicBridge<PaymentGateway> paymentBridge(KnotraRuntime runtime) {
+        return SpringDynamicBridge.mount(
+                runtime,
+                "payment-bridge",
+                DYNAMIC_PAYMENT_KEY,      // 插件实际发布的 Key
+                SPRING_PAYMENT_KEY        // 暴露给 Spring 宿主的 Key
+        );
+    }
+
+    // 将 Bridge 生成的代理对象直接暴露为 Spring Bean
+    @Bean
+    public PaymentGateway paymentGateway(SpringDynamicBridge<PaymentGateway> bridge) {
+        return bridge.proxy();
     }
 }
 ```
 
-```java
-ComponentFactory<NoConfig> factory =
-        SpringModules.noConfig("order-spring")
-                .annotatedClasses(OrderSpringConfig.class)
-                .required("users", USER_REPOSITORY)
-                .expose(ORDER_SERVICE, "orderService")
-                .build();
-
-ComponentHandle<NoConfig> spring =
-        runtime.mount("order-spring", factory);
-```
-
-每次 Activation 都创建新的 `AnnotationConfigApplicationContext`。pinned required 或 optional provider 变化、配置变化时，整个 child context 关闭并重建；dynamic provider 变化时 context 不重建。
-
-### 类型化配置
+在您的 Spring 业务代码中直接像普通 Bean 一样使用：
 
 ```java
-public record PluginConfig(String endpoint, int poolSize) {}
+@Service
+public class OrderController {
 
-ComponentFactory<PluginConfig> factory =
-        SpringModules.typed("plugin-spring", PluginConfig.class)
-                .annotatedClasses(PluginSpringConfig.class)
-                .configBeanName("pluginConfig")
-                .configNormalizer(config -> new PluginConfig(
-                        config.endpoint().trim(),
-                        Math.max(1, config.poolSize())))
-                .required("repository", REPOSITORY)
-                .expose(PLUGIN_SERVICE, "pluginService")
-                .build();
+    @Autowired
+    private PaymentGateway paymentGateway; // 这是一个智能代理
 
-ComponentHandle<PluginConfig> plugin = runtime.mount(
-        "plugin-spring",
-        factory,
-        new PluginConfig(" https://example", 0));
-```
-
-Typed module 的配置默认注册为名为 `knotraConfig` 的 external singleton，可用 `configBeanName(...)` 改名。normalizer 在创建 context 前执行；返回 `null` 或抛错会以 `INVALID_CONFIG` 拒绝。
-
-### 依赖注入形态
-
-| Builder 方法 | Spring 中注册的形状 | 语义 |
-|---|---|---|
-| `required(name, key)` / `pinned(...)` | provider 存在时注册 `T` | Required pinned，变化重建 context |
-| `optional(name, key)` | 存在时注册 `T`，缺失时不注册 bean | Optional pinned，出现、消失或替换重建 context |
-| `optionalAsOptional(name, key)` | 总是注册 `Optional<T>` | Optional pinned，同样重建 context |
-| `dynamic(name, key)` / `dynamicRequired(...)` | 注册稳定方法级 proxy | Dynamic required，provider 变化不重建 context |
-| `dynamicOptional(name, key)` | 注册稳定方法级 proxy | Dynamic optional，provider 变化不重建 context |
-
-`optional` 在 provider 存在时以 `T` 注册，缺失时完全没有该 bean。因此直接作为 Spring 必需构造参数或 `@Bean` 方法参数注入，会在缺失代 refresh 失败；需要使用 `ObjectProvider<T>`、`@Nullable`、`@Autowired(required = false)` 等 Spring 可选注入形式，或让该配置在缺失代注册其他 fallback。多个 assignable bean 时仍遵循 Spring by-type 候选解析，可能产生歧义。
-
-`optionalAsOptional` 总是注册 `Optional<T>`，适合业务构造器明确接收 `Optional<T>`。external singleton 无法向 Spring 暴露可靠的自定义泛型 metadata，因此应通过声明的 bean name 或 qualifier 注入，不要依赖 `Optional<T>` 的类型参数完成 by-type 解析。
-
-示例：
-
-```java
-@Bean
-OrderService orderService(
-        @Qualifier("metrics") Optional<Metrics> metrics) {
-    return new OrderService(metrics);
+    public void checkout(Order order) {
+        // 无论底层插件如何升级替换，这里的调用都会自动路由到当前最新可用的插件实现！
+        paymentGateway.charge(order);
+    }
 }
 ```
 
-### 输出
+---
 
-按 bean name 查找是推荐方式：
+## 🛠️ 7. 常见场景选型决策指南
 
-```java
-.expose(ORDER_SERVICE, "orderService")
+```mermaid
+graph TD
+    Start["我该使用哪种装配方式？"] --> Q1{"是否必须使用 Spring 容器？"}
+
+    Q1 -->|"否 (普通 Java 类)"| Q2{"构造器参数数量？"}
+    Q2 -->|"0 ~ 5 个"| R1["✅ knotra-beans DSL<br/>(Beans.component)"]
+    Q2 -->|"较多 / 偏好注解"| R2["✅ knotra-beans-processor<br/>(@KnotraBean)"]
+
+    Q1 -->|"是 (已有 Spring 代码)"| Q3{"组件在架构中的角色？"}
+    Q3 -->|"整块动态业务模块/插件"| R3["✅ SpringModules 子容器<br/>(SpringModules.noConfig/typed)"]
+    Q3 -->|"宿主单例调用动态插件"| R4["✅ SpringDynamicBridge<br/>(bridge.proxy())"]
 ```
 
-也可以按类型查找：
+---
 
-```java
-.expose(ORDER_SERVICE)
-```
+## ⚠️ 8. 避坑与核心原则
 
-By-type 查找使用 Spring bean factory 的候选解析，候选集合也包含 Knotra 注册的 config、借入依赖和 dynamic proxy 等 external singleton。多个 assignable bean 可能失败或选中非预期对象；Knotra 在查找后只检查结果是否可赋值给 Capability contract，子类实例也合法。需要确保输出来自模块内部 Bean 时，应使用稳定 bean name。
-
-多输出按声明顺序全部解析后统一提交：
-
-```java
-ComponentFactory<NoConfig> factory =
-        SpringModules.noConfig("module")
-                .annotatedClasses(ModuleConfig.class)
-                .expose(FIRST, "first")
-                .expose(SECOND, "second")
-                .build();
-```
-
-按 bean name 输出时，builder 会拒绝使用 config 或依赖占用的名称，通常用于发布 Spring 自己创建并拥有的内部 Bean；这类 Bean 随 child context 销毁。By-type 输出没有这层来源限制，因此必须自行确认解析到的对象及其所有权。
-
-### Customizer、ClassLoader 与清理
-
-`annotatedClasses(...)` 可重复调用追加配置类；`customizer(...)` 也可重复调用。启动顺序为：
-
-```text
-创建 context
--> 登记 Knotra cleanup
--> 设置 Spring ClassLoader 和 TCCL
--> register annotated classes
--> 注册 config external singleton
--> 注册依赖 external singleton 或 proxy
--> 依次执行 customizer
--> refresh
--> 解析并暂存输出
--> 恢复原 TCCL
--> Core 原子提交输出
-```
-
-ClassLoader 规则：
-
-- 显式 `classLoader(loader)` 时始终使用该 loader。
-- 未显式指定且有 annotated class 时，使用第一个 annotated class 的 loader。
-- 未显式指定且没有 annotated class 时，使用 `knotra-spring` 实现类的 loader；plugin 中只靠 customizer 装配的模块应显式调用 `classLoader(pluginLoader)`，不要依赖该 fallback。
-- 未显式指定且多个 annotated classes 来自不同 loader 时，`build()` 直接拒绝。
-- start、refresh、customizer、closer hook 和物理 cleanup 期间，TCCL 临时切换为选定 loader，结束后恢复。
-
-`customizer` 可注册额外 bean definition 或设置 Spring 属性。customizer 抛错时本次 Activation 失败，Knotra 会清理 context；如果 refresh 尚未完成，则销毁 Spring 已创建的早期 singleton。
-
-### External Singleton 所有权
-
-配置、required/optional 依赖和 dynamic proxy 都通过 Spring external singleton registry 注册。Spring 不会对它们执行：
-
-- `InitializingBean` 初始化回调；
-- `DisposableBean.destroy()`；
-- `@PreDestroy`；
-- 推断的 `close()`。
-
-这些对象仍由 Knotra provider 或宿主拥有。Spring context 关闭只销毁 Spring 自己创建的内部 Bean。
-
-### Closer 与重试
-
-默认清理是一个不透明的 Spring context lifecycle entry。Spring 自己可能记录并吞掉内部 Bean 的 destroy 异常，因此这些异常不能可靠推动 Knotra retry。
-
-需要把关闭失败反馈给 Knotra 时：
-
-```java
-SpringContextCloser closer = context ->
-        drainExternalQueues().thenApply(ignored -> null);
-
-ComponentFactory<NoConfig> factory =
-        SpringModules.noConfig("module")
-                .annotatedClasses(ModuleConfig.class)
-                .closer(closer)
-                .build();
-```
-
-清理顺序：
-
-```text
-执行 closer hook
--> hook 正常完成：物理关闭 context
--> hook 抛错或异常完成：保留 context，lifecycle entry FAILED
--> retryAsync() 重新执行同一个 hook
-```
-
-Hook 必须幂等，且不能假设异常后没有做过任何部分工作。Hook 成功后 Knotra 总是执行物理清理：active context 调 `close()`；refresh 未完成的 context 调 `destroySingletons()`。当前实现把 hook 返回 null 与正常完成等价，也会立即进入物理清理；实现方应优先返回明确的已完成 stage，避免依赖 null 约定。
-
-Builder 还会拒绝重复依赖 bean name、重复依赖 Capability、重复输出 Capability、输出 bean name 占用依赖 name，以及依赖或输出 name 占用 config bean name。
-
-## SpringDynamicBridge
-
-宿主 Spring singleton 需要长期持有某个动态 Capability 的稳定 interface 时，使用 `SpringDynamicBridge`。bridge 是一个 dynamic OPTIONAL Knotra 组件，source 缺失时自身仍可 ACTIVE，并向 bridge key 发布稳定 proxy。
-
-挂载到 root：
-
-```java
-SpringDynamicBridge<PaymentGateway> bridge =
-        SpringDynamicBridge.mount(
-                runtime,
-                "payment-bridge",
-                PAYMENT_GATEWAY,
-                SPRING_PAYMENT_GATEWAY);
-```
-
-挂载到指定 Context：
-
-```java
-SpringDynamicBridge<PaymentGateway> bridge =
-        SpringDynamicBridge.mount(
-                runtime,
-                workspace,
-                "payment-bridge",
-                PAYMENT_GATEWAY,
-                SPRING_PAYMENT_GATEWAY);
-```
-
-约束：
-
-- source 和 bridge CapabilityKey 的类型必须完全相同。
-- Capability 类型必须是 Java interface；不接受 class 或子接口。
-- mount ID 非空；bridge component 和 factory ID 由 mount ID 派生。
-- source 缺失时 bridge 仍可 ACTIVE。
-- `mount(...)` 是同步入口，内部最多等待 bridge Component settle 30 秒；未达到 `ACTIVE`、等待失败或超时时会先尝试 dispose provisional bridge，再抛出启动失败异常。
-
-宿主 Spring 注入稳定 proxy：
-
-```java
-PaymentGateway gateway = bridge.proxy();
-String receipt = gateway.charge(order);
-```
-
-多方法固定 provider：
-
-```java
-bridge.withCurrent(payment -> {
-    payment.begin();
-    payment.charge(order);
-    payment.commit();
-    return null;
-});
-```
-
-异步版本：
-
-```java
-CompletionStage<Receipt> receipt =
-        bridge.withCurrentAsync(payment -> payment.chargeAsync(order));
-```
-
-`available()` 是 advisory：
-
-- source 缺失或 bridge 已关闭时返回 `false`；
-- 返回 `true` 不锁住 provider；
-- proxy 调用时 source 缺失抛 `CapabilityUnavailableException`；
-- bridge 关闭后 proxy 调用抛 `DynamicCapabilityClosedException`；
-- bridge 关闭后调用 `proxy()`、`withCurrent` 或 `withCurrentAsync` 抛 `IllegalStateException`。
-
-`closeAsync()` 会依次：
-
-1. 标记 bridge 关闭，拒绝新的 bridge API 和 proxy 调用；
-2. 推进 bridge Component 清理：正常路径 dispose，若上一次清理已失败则 retry；
-3. 等待已接受的动态调用或异步 stage 租约归零；
-4. 成功后撤销 bridge capability，并让 stage 正常完成。
-
-同一轮关闭未完成时，重复 `closeAsync()` 返回同一个 future，不会启动多条并行关闭链。清理失败时 stage 异常完成；下一次 `closeAsync()` 会继续 retry，直到 bridge Component 达到 `DISPOSED`。同步 `close()` 等待 `closeAsync()` 完成。
-
-bridge 不拥有 source provider。宿主仍按原方式管理 Spring singleton 的生命周期；从 provider 内部逃逸出来的连接、session 或回调句柄也不由 bridge 自动排空。
-
-## 选择边界
-
-| 场景 | 推荐方式 |
-|---|---|
-| 普通业务对象图 | 一个 `knotra-beans` Component 内构造一组 POJO |
-| 独立配置、观测和替换边界 | 单独 Capability + pinned dependency |
-| 可缺 metrics 或 features | `optional` / `optionalAsOptional` |
-| 配置变化需要重建资源 | typed config + normalizer + reconfigure |
-| 一个 Bean 发布多个外部视图 | 多输出 `provide` / `provideAs` |
-| 无状态单方法动态路由 | Dynamic proxy |
-| 多方法事务、session 或一致性边界 | `DynamicCapability.call` / `callAsync` |
-| 希望编译期固定 wiring | `knotra-beans-processor` |
-| 一组 Spring Bean 作为动态模块 | `SpringModules` child context |
-| 宿主 singleton 持有动态 Knotra interface | `SpringDynamicBridge` |
-
-不要用 dynamic proxy 绕过状态边界。事务、长连接 session、流式结果、返回对象逃逸和多步骤业务操作都需要显式 `call`、`withCurrent`，或业务自己的 lease/close 契约。
+1. **不要在 Spring 子容器中重复扫描宿主的 Bean**：
+   - Spring 子容器应该保持精简，只包含插件自身的 `@Configuration`。外部依赖一律通过 `.required("name", KEY)` 显式借入。
+2. **外部借入对象的所有权（External Singleton）**：
+   - 从宿主借入的依赖对象不归 Spring 子容器所有。Spring 子容器销毁时，**不会**调用这些借入对象的 `@PreDestroy` 或 `close()`。
+3. **多方法事务请使用显式 `withCurrent`**：
+   - 动态代理（Proxy）的方法调用是**单方法独立路由**的。如果您需要连续执行多步操作（例如 `begin() -> charge() -> commit()`）且必须落在同一个插件实例上，请使用：
+   ```java
+   bridge.withCurrent(gateway -> {
+       gateway.begin();
+       gateway.charge(order);
+       gateway.commit();
+       return null;
+   });
+   ```
