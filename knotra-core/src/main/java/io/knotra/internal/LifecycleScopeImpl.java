@@ -6,8 +6,8 @@ import io.knotra.CleanupState;
 import io.knotra.LifecycleScope;
 import io.knotra.LifecycleState;
 import io.knotra.ManagedHandle;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.RuntimeSnapshot;
-
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -17,7 +17,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicLong;
-
+import java.util.function.LongSupplier;
 
 /**
  * Activation 拥有的可逆资源作用域实现。
@@ -39,6 +39,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
     private final String description;
     private final boolean parallel;
     private final long sequence;
+    private final LongSupplier ticker;
     private final Object lock = new Object();
     // 只在各自 lock 内修改；teardown 先复制快照，再在锁外执行释放器。
     private final List<Node> nodes = new ArrayList<>();
@@ -52,21 +53,24 @@ final class LifecycleScopeImpl implements LifecycleScope {
             LifecycleScopeImpl parent,
             String description,
             boolean parallel,
-            long sequence) {
+            long sequence,
+            LongSupplier ticker) {
         this.id = id;
         this.parent = parent;
         this.description = description;
         this.parallel = parallel;
         this.sequence = sequence;
+        this.ticker = ticker;
     }
 
-    static LifecycleScopeImpl root(String activationId) {
+    static LifecycleScopeImpl root(String activationId, LongSupplier ticker) {
         return new LifecycleScopeImpl(
                 "scope-" + activationId,
                 null,
                 "activation",
                 false,
-                SEQUENCE.incrementAndGet());
+                SEQUENCE.incrementAndGet(),
+                ticker);
     }
 
     @Override
@@ -164,7 +168,8 @@ final class LifecycleScopeImpl implements LifecycleScope {
                     this,
                     safeDescription,
                     parallel,
-                    SEQUENCE.incrementAndGet());
+                    SEQUENCE.incrementAndGet(),
+                    ticker);
             nodes.add(new ScopeNode(child, SEQUENCE.incrementAndGet()));
             return child;
         }
@@ -173,6 +178,40 @@ final class LifecycleScopeImpl implements LifecycleScope {
     boolean isStopping() {
         synchronized (lock) {
             return state != LifecycleState.OPEN;
+        }
+    }
+
+    List<PendingOperationSample> pendingCleanup() {
+        List<PendingOperationSample> result = new ArrayList<>();
+        collectPendingCleanup(result);
+        return result;
+    }
+
+    private void collectPendingCleanup(List<PendingOperationSample> result) {
+        List<ScopeNode> children;
+        synchronized (lock) {
+            if (state == LifecycleState.OPEN) {
+                return;
+            }
+            for (Node node : nodes) {
+                if (node instanceof Entry entry
+                        && entry.state() == CleanupState.PENDING
+                        && entry.attemptStarted()) {
+                    result.add(new PendingOperationSample(
+                            PendingOperationsSnapshot.Kind.LIFECYCLE_CLEANUP,
+                            entry.id(),
+                            PendingOperationsSnapshot.WaitType.LIFECYCLE_ENTRY,
+                            entry.attemptStartedNanos(),
+                            (entry.asynchronous() ? "async " : "") + entry.description()));
+                }
+            }
+            children = nodes.stream()
+                    .filter(ScopeNode.class::isInstance)
+                    .map(ScopeNode.class::cast)
+                    .toList();
+        }
+        for (ScopeNode child : children) {
+            child.scope().collectPendingCleanup(result);
         }
     }
 
@@ -213,14 +252,41 @@ final class LifecycleScopeImpl implements LifecycleScope {
 
     // 递归传播 STOPPING 也遵守父到子的方向；该状态会拒绝清理期间的晚到 manage。
     private void markStopping() {
+        long now = ticker.getAsLong();
         synchronized (lock) {
             if (state != LifecycleState.OPEN) {
                 return;
             }
             state = LifecycleState.STOPPING;
             for (Node node : nodes) {
+                if (node instanceof Entry entry
+                        && entry.state() == CleanupState.PENDING) {
+                    entry.markPending(now);
+                }
+            }
+            for (Node node : nodes) {
                 if (node instanceof ScopeNode scopeNode) {
-                    scopeNode.scope().markStopping();
+                    scopeNode.scope().markStopping(now);
+                }
+            }
+        }
+    }
+
+    private void markStopping(long now) {
+        synchronized (lock) {
+            if (state != LifecycleState.OPEN) {
+                return;
+            }
+            state = LifecycleState.STOPPING;
+            for (Node node : nodes) {
+                if (node instanceof Entry entry
+                        && entry.state() == CleanupState.PENDING) {
+                    entry.markPending(now);
+                }
+            }
+            for (Node node : nodes) {
+                if (node instanceof ScopeNode scopeNode) {
+                    scopeNode.scope().markStopping(now);
                 }
             }
         }
@@ -269,7 +335,7 @@ final class LifecycleScopeImpl implements LifecycleScope {
                         new IllegalStateException("scope is not stopping"));
                 return rejected;
             }
-            entry.beginAttempt();
+            entry.beginAttempt(ticker.getAsLong());
         }
         CompletableFuture<Void> result;
         try {
@@ -511,6 +577,8 @@ final class LifecycleScopeImpl implements LifecycleScope {
         private AsyncDisposer async;
         private CleanupState state = CleanupState.PENDING;
         private int attempts;
+        private long attemptStartedNanos;
+        private boolean attemptStarted;
         private String lastError = "";
 
         private Entry(
@@ -563,18 +631,34 @@ final class LifecycleScopeImpl implements LifecycleScope {
             return attempts;
         }
 
+        private long attemptStartedNanos() {
+            return attemptStartedNanos;
+        }
+
+        private boolean attemptStarted() {
+            return attemptStarted;
+        }
+
         private String lastError() {
             return lastError;
         }
 
-        private void beginAttempt() {
+        private void markPending(long now) {
+            attemptStartedNanos = now;
+            attemptStarted = true;
+        }
+
+        private void beginAttempt(long now) {
             attempts++;
             state = CleanupState.PENDING;
+            attemptStartedNanos = now;
+            attemptStarted = true;
         }
 
         private void succeed() {
             state = CleanupState.SUCCEEDED;
             lastError = "";
+            attemptStarted = false;
             sync = null;
             async = null;
             resource = null;

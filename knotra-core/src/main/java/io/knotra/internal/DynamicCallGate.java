@@ -1,6 +1,7 @@
 package io.knotra.internal;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.function.LongSupplier;
 
 /**
  * 一个 Activation 的动态调用准入闸门。
@@ -12,12 +13,23 @@ final class DynamicCallGate {
     // closed 与 active 必须在同一个临界区内线性化，否则 drain 完成后仍可能漏进迟到调用。
     private boolean closed;
     private int active;
+    private long oldestActiveNanos;
+    private boolean oldestActivePresent;
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
+    private final LongSupplier ticker;
+
+    DynamicCallGate(LongSupplier ticker) {
+        this.ticker = ticker;
+    }
 
     boolean tryAcquire() {
         synchronized (this) {
             if (closed) {
                 return false;
+            }
+            if (active == 0) {
+                oldestActiveNanos = ticker.getAsLong();
+                oldestActivePresent = true;
             }
             active++;
             return true;
@@ -28,6 +40,9 @@ final class DynamicCallGate {
         boolean completeDrain;
         synchronized (this) {
             active--;
+            if (active == 0) {
+                oldestActivePresent = false;
+            }
             completeDrain = closed && active == 0;
         }
         if (completeDrain) {
@@ -51,5 +66,20 @@ final class DynamicCallGate {
         synchronized (this) {
             return closed;
         }
+    }
+
+    ActiveSnapshot pendingSnapshot() {
+        synchronized (this) {
+            return new ActiveSnapshot(
+                    active, closed, oldestActivePresent, oldestActiveNanos);
+        }
+    }
+
+    // started 独立于计数表达时间戳存在性，避免假设 System.nanoTime 非负。
+    record ActiveSnapshot(
+            int active,
+            boolean draining,
+            boolean started,
+            long startNanos) {
     }
 }

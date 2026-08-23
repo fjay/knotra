@@ -3,6 +3,7 @@ package io.knotra.internal;
 import io.knotra.ActivationContext;
 import io.knotra.ActivationState;
 import io.knotra.AdvancedRuntime;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.PublicationChange;
 import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
@@ -61,6 +62,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -79,6 +81,7 @@ import java.util.stream.Stream;
  */
 final class DefaultKnotraRuntime implements KnotraRuntime {
     final KnotraConfig configuration;
+    private final LongSupplier ticker;
     // 结构一致性主锁：保护视图草稿、代际发布、可执行索引同步和过渡状态裁决。
     final Object coordinator = new Object();
     final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -99,10 +102,18 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<ComponentState>> disposeRequests =
             new ConcurrentHashMap<>();
+    private final Map<String, RequestPending> disposeRequestPending =
+            new ConcurrentHashMap<>();
+    private final Map<String, ContextDisposalPending> contextDisposalPending =
+            new ConcurrentHashMap<>();
+    private final Map<String, ProviderLeaseRuntime> providerLeases =
+            new ConcurrentHashMap<>();
     // close 先于新事务置位；失败的未来可被替换以便重试关闭，成功后复用同一结果。
     private final AtomicBoolean closing = new AtomicBoolean();
     private final AtomicReference<CompletableFuture<Void>> closeFuture =
             new AtomicReference<>();
+    private volatile long closeStartNanos;
+    private volatile boolean closeStartPresent;
     private final AdvancedRuntime advanced = new RuntimeAdvancedFacade(this);
     private final BindingImpactAnalyzer bindingImpacts = new BindingImpactAnalyzer(this);
     private final DynamicCapabilityBroker dynamicBroker = new DynamicCapabilityBroker(this);
@@ -117,8 +128,18 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     private final DiagnosticSupport diagnostics = new DiagnosticSupport(this);
 
     DefaultKnotraRuntime(KnotraConfig configuration) {
+        this(configuration, System::nanoTime);
+    }
+
+    // 包内测试可注入单调时钟；生产路径始终使用 System.nanoTime()。
+    DefaultKnotraRuntime(KnotraConfig configuration, LongSupplier ticker) {
         this.configuration = Objects.requireNonNull(configuration, "configuration");
+        this.ticker = Objects.requireNonNull(ticker, "ticker");
         contextHandles.put("ctx-root", new ContextHandleImpl(this, "ctx-root"));
+    }
+
+    long pendingTime() {
+        return ticker.getAsLong();
     }
 
     RuntimeView currentView() {
@@ -128,6 +149,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     DynamicCapabilityBroker dynamicBroker() {
         return dynamicBroker;
     }
+
     @Override
     public String runtimeId() {
         return configuration.runtimeId();
@@ -370,10 +392,15 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     @Override
     public CompletionStage<Void> closeAsync() {
+        CompletableFuture<Void> previous = closeFuture.get();
         CompletableFuture<Void> created = closeFuture.updateAndGet(existing ->
                 existing != null && !existing.isCompletedExceptionally()
                         ? existing
                         : new CompletableFuture<>());
+        if (created != previous) {
+            closeStartNanos = pendingTime();
+            closeStartPresent = true;
+        }
         closing.set(true);
         ContextHandleImpl root = contextHandles.get("ctx-root");
         // Runtime close 复用根 Context 处置路径；只有全树清理成功才关闭执行器。
@@ -386,6 +413,80 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             }
         });
         return created;
+    }
+
+    PendingOperationsSnapshot pendingOperations() {
+        long now = ticker.getAsLong();
+        List<PendingOperationSample> samples = new ArrayList<>();
+        Set<String> transitionTargets = new LinkedHashSet<>();
+        for (ComponentRuntime component : components.values()) {
+            PendingOperationSample sample = component.pendingSnapshot();
+            if (sample != null) {
+                samples.add(sample);
+                transitionTargets.add(sample.targetId());
+            }
+        }
+        for (RequestPending request : disposeRequestPending.values()) {
+            CompletableFuture<ComponentState> future =
+                    disposeRequests.get(request.targetId());
+            if (future == null || future.isDone()
+                    || transitionTargets.contains(request.targetId())) {
+                continue;
+            }
+            samples.add(new PendingOperationSample(
+                    PendingOperationsSnapshot.Kind.COMPONENT_TRANSITION,
+                    request.targetId(),
+                    PendingOperationsSnapshot.WaitType.COMPONENT,
+                    request.startNanos(),
+                    "mount dispose waiting for component"));
+        }
+        for (ContextDisposalPending context : contextDisposalPending.values()) {
+            samples.add(new PendingOperationSample(
+                    PendingOperationsSnapshot.Kind.CONTEXT_DISPOSAL,
+                    context.contextId(),
+                    PendingOperationsSnapshot.WaitType.CONTEXT,
+                    context.startNanos(),
+                    "context disposal"));
+        }
+        for (ActivationRuntime activation : activations.values()) {
+            samples.addAll(activation.scope.pendingCleanup());
+            DynamicCallGate.ActiveSnapshot calls =
+                    activation.dynamicCalls.pendingSnapshot();
+            if (calls.draining() && calls.active() > 0 && calls.started()) {
+                samples.add(new PendingOperationSample(
+                        PendingOperationsSnapshot.Kind.CONSUMER_LEASE,
+                        activation.owner.handleId,
+                        PendingOperationsSnapshot.WaitType.LEASE_RELEASE,
+                        calls.startNanos(),
+                        "dynamic calls=" + calls.active()
+                                + " activation=" + activation.activationId));
+            }
+        }
+        for (ProviderLeaseRuntime leases : providerLeases.values()) {
+            ProviderLeaseRuntime.LeaseSnapshot snapshot =
+                    leases.pendingSnapshot();
+            if (snapshot.retired() && snapshot.leases() > 0 && snapshot.started()) {
+                samples.add(new PendingOperationSample(
+                        PendingOperationsSnapshot.Kind.PROVIDER_LEASE,
+                        leases.registrationId(),
+                        PendingOperationsSnapshot.WaitType.LEASE_RELEASE,
+                        snapshot.startNanos(),
+                        "provider leases=" + snapshot.leases()));
+            }
+        }
+        CompletableFuture<Void> close = closeFuture.get();
+        if (closing.get() && close != null && !close.isDone()
+                && closeStartPresent) {
+            samples.add(new PendingOperationSample(
+                    PendingOperationsSnapshot.Kind.RUNTIME_CLOSE,
+                    configuration.runtimeId(),
+                    PendingOperationsSnapshot.WaitType.RUNTIME_DRAIN,
+                    closeStartNanos,
+                    "runtime close"));
+        }
+        List<PendingOperationsSnapshot.Operation> operations =
+                samples.stream().map(sample -> sample.toOperation(now)).toList();
+        return new PendingOperationsSnapshot(closing.get(), operations, 0);
     }
 
     boolean hasLiveRegistration(String registrationId) {
@@ -580,15 +681,21 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             if (existing != null && !existing.isDone()) {
                 return existing;
             }
+            if (existing != null) {
+                removeDisposeRequest(handle.handleId(), existing);
+            }
             CompletableFuture<ComponentState> request = new CompletableFuture<>();
+            RequestPending pending =
+                    new RequestPending(handle.handleId(), pendingTime());
             disposeRequests.put(handle.handleId(), request);
+            disposeRequestPending.put(handle.handleId(), pending);
             try {
                 transact(transaction -> {
                     transaction.dispose(handle);
                     return null;
                 });
             } catch (TransactionRejectedException rejection) {
-                disposeRequests.remove(handle.handleId(), request);
+                removeDisposeRequest(handle.handleId(), request);
                 request.completeExceptionally(rejection);
                 return request;
             }
@@ -606,14 +713,14 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 try {
                     executor.execute(() -> settleDisposeRequest(handleId, request));
                 } catch (RejectedExecutionException rejectionError) {
-                    disposeRequests.remove(handleId, request);
+                    removeDisposeRequest(handleId, request);
                     request.completeExceptionally(
                             new TransitionRejectedStateException(rejectionError));
                 }
                 return;
             }
             if (error != null || state != ComponentState.STOPPING) {
-                disposeRequests.remove(handleId, request);
+                removeDisposeRequest(handleId, request);
             }
             if (error != null) {
                 request.completeExceptionally(error);
@@ -621,6 +728,15 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 request.complete(state);
             }
         });
+    }
+
+    private void removeDisposeRequest(
+            String handleId,
+            CompletableFuture<ComponentState> request) {
+        RequestPending pending = disposeRequestPending.get(handleId);
+        if (disposeRequests.remove(handleId, request)) {
+            disposeRequestPending.remove(handleId, pending);
+        }
     }
 
     CompletionStage<Void> disposeContext(ContextHandleImpl handle) {
@@ -713,7 +829,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         RuntimeView.OwnerData.Host.INSTANCE,
                         intent.value(),
                         new ProviderLeaseRuntime(
-                                intent.handle().registrationId())));
+                                intent.handle().registrationId(),
+                                ticker)));
         draft.capabilityTypes.putIfAbsent(key.name(), key.type());
         return true;
     }
@@ -1157,9 +1274,18 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     private List<CompletableFuture<Void>> retireCommittedRegistrations(
             ExecutableCommitPlan executable) {
-        return executable.retiredRegistrations.values().stream()
-                .map(ProviderLeaseRuntime::retire)
+        return executable.retiredRegistrations.entrySet().stream()
+                .map(entry -> retireProviderLease(entry.getKey(), entry.getValue()))
                 .toList();
+    }
+
+    private CompletableFuture<Void> retireProviderLease(
+            String registrationId,
+            ProviderLeaseRuntime leases) {
+        CompletableFuture<Void> drain = leases.retire();
+        drain.whenComplete((ignored, error) ->
+                providerLeases.remove(registrationId, leases));
+        return drain;
     }
 
     // 该方法只在视图发布后、仍在协调器内调用；失败路径必须在进入前完成全部可预期校验。
@@ -1239,6 +1365,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 }
             }
         }
+        next.registrations.values().forEach(registration ->
+                providerLeases.putIfAbsent(
+                        registration.registrationId(),
+                        registration.leases()));
         registrationHandles.keySet().retainAll(next.registrations.keySet());
     }
 
@@ -1304,22 +1434,40 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
         List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
         for (String handleId : orderForStop(draft.asView(), stopping)) {
-            reserveDraft(handleId, executable, reservations);
+            RuntimeView.ComponentData data = draft.components.get(handleId);
+            reserveDraft(handleId, executable, reservations, stopDetail(data));
         }
         for (String handleId : starting.stream().sorted().toList()) {
-            reserveDraft(handleId, executable, reservations);
+            RuntimeView.ComponentData data = draft.components.get(handleId);
+            reserveDraft(handleId, executable, reservations, startDetail(data));
         }
         return reservations;
+    }
+
+    private String stopDetail(RuntimeView.ComponentData data) {
+        if (data == null) {
+            return "component stop";
+        }
+        return data.goal() == ComponentGoal.DISPOSED
+                ? "component dispose"
+                : "component stop";
+    }
+
+    private String startDetail(RuntimeView.ComponentData data) {
+        return data != null && data.state() == ComponentState.FAILED
+                ? "component restart"
+                : "component activation start";
     }
 
     private void reserveDraft(
             String handleId,
             ExecutableCommitPlan executable,
-            List<ComponentRuntime.Reservation> reservations) {
+            List<ComponentRuntime.Reservation> reservations,
+            String detail) {
         ComponentRuntime runtime = executable.componentRuntimes
                 .computeIfAbsent(handleId, components::get);
         if (runtime != null) {
-            reservations.add(runtime.reserveTransition());
+            reservations.add(runtime.reserveTransition(pendingTime(), detail));
         }
     }
 
@@ -1649,7 +1797,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 component.desiredConfig,
                 component.desiredRevision,
                 bindings,
-                List.of());
+                List.of(),
+                ticker);
         for (CapabilityRequirement requirement
                 : data.descriptor().sortedRequirements()) {
             RuntimeView.BindingData binding = bindings.get(requirement.key().name());
@@ -2201,6 +2350,12 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         null);
             }
         }
+        if (decision.successful()) {
+            activation.stagedRegistrations.forEach((registrationId, registration) ->
+                    providerLeases.putIfAbsent(
+                            registrationId,
+                            registration.leases()));
+        }
         for (String activationId : postCommit.executable().staleActivations) {
             ActivationRuntime impacted = activations.get(activationId);
             if (impacted != null) {
@@ -2259,9 +2414,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     private CompletableFuture<Void> drainProviderLeases(ActivationRuntime activation) {
-        List<CompletableFuture<Void>> drains = activation.stagedRegistrations.values().stream()
-                .map(RuntimeView.RegistrationData::leases)
-                .map(ProviderLeaseRuntime::retire)
+        List<CompletableFuture<Void>> drains = activation.stagedRegistrations.entrySet().stream()
+                .map(entry -> retireProviderLease(entry.getKey(), entry.getValue().leases()))
                 .toList();
         return drains.isEmpty()
                 ? CompletableFuture.completedFuture(null)
@@ -2410,7 +2564,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 view = draft.publishOnce();
                 // 仍在协调器内替换过渡链，随后到锁外提交新 Activation，保证旧请求先有结果。
                 if (restart) {
-                    restartReservation = runtime.replaceTransition();
+                    restartReservation = runtime.replaceTransition(
+                            pendingTime(), "component restart");
                 } else {
                     transitionCompletion = prepareTransitionCompletion(runtime, future, state);
                 }
@@ -2504,12 +2659,19 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     return CompletableFuture.completedFuture(null);
                 }
                 synchronized (contextFutures) {
-                    CompletableFuture<Void> existing = contextFutures.get(handle.contextId());
+                    CompletableFuture<Void> existing =
+                            contextFutures.get(handle.contextId());
                     if (existing != null && !existing.isCompletedExceptionally()) {
                         return existing;
                     }
+                    if (existing != null) {
+                        removeContextFuture(handle.contextId(), existing);
+                    }
                     future = new CompletableFuture<>();
+                    ContextDisposalPending pending = new ContextDisposalPending(
+                            handle.contextId(), pendingTime());
                     contextFutures.put(handle.contextId(), future);
+                    contextDisposalPending.put(handle.contextId(), pending);
                 }
 
                 RuntimeView.Draft draft = new RuntimeView.Draft(view);
@@ -2579,7 +2741,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 completeCancelledTransitions(
                         cancelCreatedReservationFutures(reservations));
                 if (future != null) {
-                    contextFutures.remove(handle.contextId(), future);
+                    removeContextFuture(handle.contextId(), future);
                     future.completeExceptionally(new IllegalStateException(
                             "context disposal commit failed"));
                 }
@@ -2628,7 +2790,11 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             RuntimeView next = draft.publishOnce();
             view = next;
             for (String contextId : subtree) {
-                contextFutures.remove(contextId);
+                CompletableFuture<Void> currentFuture =
+                        contextFutures.get(contextId);
+                if (currentFuture != null) {
+                    removeContextFuture(contextId, currentFuture);
+                }
                 if (!failed && !contextId.equals("ctx-root")) {
                     contextHandles.remove(contextId);
                 }
@@ -2647,6 +2813,14 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         dispatchCompletion(contextCompletion);
     }
 
+    private void removeContextFuture(
+            String contextId,
+            CompletableFuture<Void> future) {
+        ContextDisposalPending pending = contextDisposalPending.get(contextId);
+        if (contextFutures.remove(contextId, future)) {
+            contextDisposalPending.remove(contextId, pending);
+        }
+    }
     // 事务内处置在组件收敛完成后才结算；这里为外层 Context 创建去重的最终化 Future。
     private CompletableFuture<Void> settleContextDisposal(
             String contextId,
@@ -2660,12 +2834,19 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 return CompletableFuture.completedFuture(null);
             }
             synchronized (contextFutures) {
-                CompletableFuture<Void> existing = contextFutures.get(contextId);
+                CompletableFuture<Void> existing =
+                        contextFutures.get(contextId);
                 if (existing != null && !existing.isCompletedExceptionally()) {
                     return existing;
                 }
+                if (existing != null) {
+                    removeContextFuture(contextId, existing);
+                }
                 future = new CompletableFuture<>();
+                ContextDisposalPending pending = new ContextDisposalPending(
+                        contextId, pendingTime());
                 contextFutures.put(contextId, future);
+                contextDisposalPending.put(contextId, pending);
             }
             subtree = current.contextSubtree(contextId);
             components = current.components.values().stream()
@@ -2697,4 +2878,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return future;
     }
 
+    record RequestPending(String targetId, long startNanos) {
+    }
+
+    record ContextDisposalPending(String contextId, long startNanos) {
+    }
 }

@@ -337,7 +337,8 @@ final class TransitionObservationTest {
 
         ComponentRuntime component = runtime.components.get(handle.handleId());
         ActivationRuntime activation = component.current;
-        ComponentRuntime.Reservation reservation = component.replaceTransition();
+        ComponentRuntime.Reservation reservation = component.replaceTransition(
+                System.nanoTime(), "test transition");
         component.pendingStartFailure = true;
         synchronized (runtime.coordinator) {
             runtime.emergencyRollbackActivation(component, activation);

@@ -14,6 +14,16 @@ public interface AdvancedRuntime {
     RuntimeSnapshot snapshot();
 
     /**
+     * 获取当前排空过程中的挂起操作 point-in-time 快照。
+     *
+     * <p>任意运行时生命周期阶段（ACTIVE、CLOSING、CLOSED）均可调用。该方法不获取
+     * 内核协调器锁、不等待任何 Future，也不执行用户代码；调用它不会改变 close 的
+     * 收敛语义，也不会触发失败组件或清理条目的重试。各操作来自对应叶子状态的短锁采样，
+     * 因此不承诺全局原子性。</p>
+     */
+    PendingOperationsSnapshot pendingOperations();
+
+    /**
      * 在单个原子事务中执行一组结构变更（挂载、提供、注销等）。
      *
      * @param transaction 包含变更意图的事务闭包
@@ -29,7 +39,6 @@ public interface AdvancedRuntime {
     default <T> PublicationChange<T> publication(ContextHandle context, Class<T> type, T value) {
         return publication(context, CapabilityKey.of(type), value);
     }
-
 
     /** 在指定父上下文下创建命名的子上下文节点。 */
     ContextHandle childContext(ContextHandle parent, String name);

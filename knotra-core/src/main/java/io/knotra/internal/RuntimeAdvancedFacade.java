@@ -3,6 +3,7 @@ package io.knotra.internal;
 import io.knotra.AdvancedRuntime;
 import io.knotra.CapabilityKey;
 import io.knotra.ContextHandle;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.PublicationChange;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.RuntimeTransaction;
@@ -21,6 +22,11 @@ final class RuntimeAdvancedFacade implements AdvancedRuntime {
     @Override
     public RuntimeSnapshot snapshot() {
         return runtime.snapshot();
+    }
+
+    @Override
+    public PendingOperationsSnapshot pendingOperations() {
+        return runtime.pendingOperations();
     }
 
     @Override

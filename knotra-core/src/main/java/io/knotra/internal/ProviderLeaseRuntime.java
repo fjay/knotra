@@ -1,6 +1,7 @@
 package io.knotra.internal;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.function.LongSupplier;
 
 /**
  * 单个 Capability registration 的 provider 租约。
@@ -13,10 +14,14 @@ final class ProviderLeaseRuntime {
     private final String registrationId;
     private int leases;
     private boolean retired;
+    private long oldestLeaseNanos;
+    private boolean oldestLeasePresent;
     private final CompletableFuture<Void> drain = new CompletableFuture<>();
+    private final LongSupplier ticker;
 
-    ProviderLeaseRuntime(String registrationId) {
+    ProviderLeaseRuntime(String registrationId, LongSupplier ticker) {
         this.registrationId = registrationId;
+        this.ticker = ticker;
     }
 
     String registrationId() {
@@ -28,6 +33,10 @@ final class ProviderLeaseRuntime {
             if (retired) {
                 return false;
             }
+            if (leases == 0) {
+                oldestLeaseNanos = ticker.getAsLong();
+                oldestLeasePresent = true;
+            }
             leases++;
             return true;
         }
@@ -37,6 +46,9 @@ final class ProviderLeaseRuntime {
         boolean completeDrain;
         synchronized (this) {
             leases--;
+            if (leases == 0) {
+                oldestLeasePresent = false;
+            }
             completeDrain = retired && leases == 0;
         }
         if (completeDrain) {
@@ -60,5 +72,20 @@ final class ProviderLeaseRuntime {
         synchronized (this) {
             return retired;
         }
+    }
+
+    LeaseSnapshot pendingSnapshot() {
+        synchronized (this) {
+            return new LeaseSnapshot(
+                    leases, retired, oldestLeasePresent, oldestLeaseNanos);
+        }
+    }
+
+    // started 独立于计数表达时间戳存在性，避免假设 System.nanoTime 非负。
+    record LeaseSnapshot(
+            int leases,
+            boolean retired,
+            boolean started,
+            long startNanos) {
     }
 }

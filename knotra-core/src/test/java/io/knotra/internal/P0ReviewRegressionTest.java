@@ -198,7 +198,8 @@ final class P0ReviewRegressionTest {
 
         runtime.executor.shutdown();
         ComponentRuntime queuedRuntime = runtime.components.get(queued.handleId());
-        ComponentRuntime.Reservation queuedReservation = queuedRuntime.reserveTransition();
+        ComponentRuntime.Reservation queuedReservation = queuedRuntime.reserveTransition(
+                System.nanoTime(), "test transition");
         queuedRuntime.executeReserved(
                 runtime, runtime.executor, queuedReservation.future());
         ExecutionException queuedFailure = assertThrows(
@@ -209,7 +210,8 @@ final class P0ReviewRegressionTest {
 
         ComponentRuntime immediateRuntime = runtime.components.get(immediate.handleId());
         ComponentRuntime.Reservation immediateReservation =
-                immediateRuntime.reserveTransition();
+                immediateRuntime.reserveTransition(
+                        System.nanoTime(), "test transition");
         runtime.driveTransition(immediateRuntime, immediateReservation.future());
         assertEquals(ComponentState.ACTIVE, immediateReservation.future()
                 .get(10, TimeUnit.SECONDS));
@@ -228,7 +230,8 @@ final class P0ReviewRegressionTest {
         assertEquals(ComponentState.ACTIVE, handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         ComponentRuntime component = runtime.components.get(handle.handleId());
-        ComponentRuntime.Reservation reservation = component.reserveTransition();
+        ComponentRuntime.Reservation reservation = component.reserveTransition(
+                System.nanoTime(), "test transition");
         runtime.components.remove(handle.handleId());
         runtime.driveTransition(component, reservation.future());
         assertEquals(ComponentState.DISPOSED, reservation.future()

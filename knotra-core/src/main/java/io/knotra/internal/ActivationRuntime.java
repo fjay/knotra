@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-
+import java.util.function.LongSupplier;
 
 /**
  * 一次组件 Activation 的内核侧执行状态。
@@ -31,15 +31,16 @@ final class ActivationRuntime {
     // Activation 的根 LifecycleScope；无论提交成功还是回滚，都负责逆序释放已接受资源。
     final LifecycleScopeImpl scope;
     // 动态调用准入；在 LifecycleScope teardown 前关闭并等待在途调用归零。
-    final DynamicCallGate dynamicCalls = new DynamicCallGate();
+    final DynamicCallGate dynamicCalls;
     // 尚未发布的注册暂存；只有提交验证通过后才复制进 RuntimeView。
     final Map<String, RuntimeView.RegistrationData> stagedRegistrations =
             new ConcurrentHashMap<>();
     final List<ChildMountPlan> childPlans;
-    // stale 是提交裁决信号：结构事务可把它从锁外的用户 start() 中召回并按最新代际重启。
+    // stale 是提交裁决信号：结构事务可把它从锁外的 user start() 中召回并按最新代际重启。
     final AtomicBoolean stale = new AtomicBoolean();
     // start() 返回后置位，防止组件保存的 ActivationContext 在事务外继续暂存副作用。
     final AtomicBoolean closed = new AtomicBoolean();
+    private final LongSupplier pendingTime;
 
     ActivationRuntime(
             String activationId,
@@ -47,13 +48,16 @@ final class ActivationRuntime {
             Object config,
             long configRevision,
             Map<String, RuntimeView.BindingData> bindings,
-            List<ChildMountPlan> childPlans) {
+            List<ChildMountPlan> childPlans,
+            LongSupplier ticker) {
         this.activationId = activationId;
+        this.pendingTime = ticker;
         this.owner = owner;
         this.config = config;
         this.configRevision = configRevision;
         this.bindings = Map.copyOf(bindings);
-        this.scope = LifecycleScopeImpl.root(activationId);
+        this.dynamicCalls = new DynamicCallGate(ticker);
+        this.scope = LifecycleScopeImpl.root(activationId, ticker);
         this.childPlans = List.copyOf(childPlans);
     }
 
@@ -71,7 +75,7 @@ final class ActivationRuntime {
                 owner.contextId,
                 new RuntimeView.OwnerData.Activation(activationId),
                 value,
-                new ProviderLeaseRuntime(id));
+                new ProviderLeaseRuntime(id, pendingTime));
         stagedRegistrations.put(key.name(), registration);
         return registration;
     }

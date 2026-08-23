@@ -2,6 +2,7 @@ package io.knotra.internal;
 
 import io.knotra.ComponentState;
 import io.knotra.FailureInfo;
+import io.knotra.PendingOperationsSnapshot;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -49,6 +50,9 @@ final class ComponentRuntime {
             new AtomicReference<>();
     private final AtomicReference<CompletableFuture<io.knotra.ComponentState>> requestedDriver =
             new AtomicReference<>();
+    // chainLock 内维护；pendingLock 只保护这段纯元数据，观察者不等待 transition 完成回调。
+    private final Object pendingLock = new Object();
+    private PendingOperationSample pendingTransition;
 
     ComponentRuntime(
             String handleId,
@@ -65,7 +69,12 @@ final class ComponentRuntime {
     CompletableFuture<io.knotra.ComponentState> enqueue(
             DefaultKnotraRuntime runtime,
             ExecutorService executor) {
-        Reservation reservation = reserveTransition();
+        Reservation reservation;
+        // 与预约同锁采样展示标签，避免 pending 详情与实际过渡意图错位。
+        synchronized (chainLock) {
+            reservation = reserveTransition(
+                    runtime.pendingTime(), transitionDetail());
+        }
         if (reservation.created()) {
             reservation.component().executeReserved(
                     runtime,
@@ -77,6 +86,14 @@ final class ComponentRuntime {
 
     void requestRetry(RetryIntent intent) {
         this.retryIntent = intent;
+    }
+
+    private String transitionDetail() {
+        return switch (retryIntent) {
+            case CLEANUP -> "component cleanup retry";
+            case ACTIVATION -> "component activation retry";
+            case NONE -> "component transition";
+        };
     }
 
     boolean consumeActivationRetryIntent() {
@@ -105,16 +122,45 @@ final class ComponentRuntime {
             return CompletableFuture.completedFuture(currentState.get());
         }
     }
+
     // 预约可在发布前于协调器内发生；实际驱动必须等协调器释放后提交到虚拟线程。
-    Reservation reserveTransition() {
+    Reservation reserveTransition(long startNanos, String detail) {
         synchronized (chainLock) {
             CompletableFuture<io.knotra.ComponentState> existing = transition.get();
             if (existing != null && !existing.isDone()) {
                 return new Reservation(this, existing, false);
             }
             CompletableFuture<io.knotra.ComponentState> created = new CompletableFuture<>();
+            publishPending(pendingSample(startNanos, detail));
             transition.set(created);
             return new Reservation(this, created, true);
+        }
+    }
+
+    PendingOperationSample pendingSnapshot() {
+        synchronized (pendingLock) {
+            return pendingTransition;
+        }
+    }
+
+    private PendingOperationSample pendingSample(long startNanos, String detail) {
+        return new PendingOperationSample(
+                PendingOperationsSnapshot.Kind.COMPONENT_TRANSITION,
+                handleId,
+                PendingOperationsSnapshot.WaitType.COMPONENT,
+                startNanos,
+                detail);
+    }
+
+    private void publishPending(PendingOperationSample sample) {
+        synchronized (pendingLock) {
+            pendingTransition = sample;
+        }
+    }
+
+    private void clearPending() {
+        synchronized (pendingLock) {
+            pendingTransition = null;
         }
     }
 
@@ -153,7 +199,11 @@ final class ComponentRuntime {
 
     boolean cancelTransition(CompletableFuture<ComponentState> future) {
         synchronized (chainLock) {
-            return transition.compareAndSet(future, null);
+            boolean cancelled = transition.compareAndSet(future, null);
+            if (cancelled) {
+                clearPending();
+            }
+            return cancelled;
         }
     }
 
@@ -161,14 +211,17 @@ final class ComponentRuntime {
             CompletableFuture<io.knotra.ComponentState> future,
             Throwable error) {
         synchronized (chainLock) {
-            transition.compareAndSet(future, null);
+            if (transition.compareAndSet(future, null)) {
+                clearPending();
+            }
             future.completeExceptionally(error);
         }
     }
 
-    Reservation replaceTransition() {
+    Reservation replaceTransition(long startNanos, String detail) {
         synchronized (chainLock) {
             CompletableFuture<io.knotra.ComponentState> created = new CompletableFuture<>();
+            publishPending(pendingSample(startNanos, detail));
             transition.set(created);
             return new Reservation(this, created, true);
         }
@@ -176,7 +229,9 @@ final class ComponentRuntime {
 
     void clearTransition(CompletableFuture<io.knotra.ComponentState> future) {
         synchronized (chainLock) {
-            transition.compareAndSet(future, null);
+            if (transition.compareAndSet(future, null)) {
+                clearPending();
+            }
         }
     }
 
@@ -188,7 +243,9 @@ final class ComponentRuntime {
             CompletableFuture<io.knotra.ComponentState> future,
             io.knotra.ComponentState state) {
         synchronized (chainLock) {
-            transition.compareAndSet(future, null);
+            if (transition.compareAndSet(future, null)) {
+                clearPending();
+            }
             future.complete(state);
         }
     }
