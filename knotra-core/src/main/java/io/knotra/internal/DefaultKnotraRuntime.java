@@ -4,7 +4,8 @@ import io.knotra.ActivationContext;
 import io.knotra.ActivationState;
 import io.knotra.AdvancedRuntime;
 import io.knotra.PendingOperationsSnapshot;
-import io.knotra.PublicationChange;
+import io.knotra.PublicationOperation;
+import io.knotra.PublicationState;
 import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
 import io.knotra.CapabilityUnavailableException;
@@ -27,7 +28,6 @@ import io.knotra.MountHandle;
 import io.knotra.MountNotActiveException;
 import io.knotra.NoConfig;
 import io.knotra.MountOptions;
-import io.knotra.Registration;
 import io.knotra.RegistrationHandle;
 import io.knotra.RuntimeDiagnostic;
 import io.knotra.RuntimeSnapshot;
@@ -234,56 +234,114 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return new SettlementReport(generation, outcomes, operationDiagnostics);
     }
 
-    <T> Registration<T> register(ContextHandle context, CapabilityKey<T> key, T value) {
-        TransactionReceipt<StagedRegistration<T>> receipt =
-                transact(transaction -> transaction.provide(context, key, value));
-        StagedRegistration<T> staged = receipt.value();
-        return new RegistrationImpl<>(
-                staged instanceof StagedRegistrationImpl<T> internal
-                        ? internal.registration()
-                        : null,
-                key,
-                context,
-                receipt.settlement());
+    // ---- 内部 Publication 服务：意图经 transact 提交，槽位验证全部在协调器内完成 ----
+
+    <T> PublicationServiceResult createOrUpdatePublication(
+            ContextHandleImpl context,
+            CapabilityKey<T> key,
+            T value) {
+        Objects.requireNonNull(value, "value");
+        AtomicReference<PublicationProvideOutcome> outcome =
+                new AtomicReference<>();
+        TransactionReceipt<Void> receipt = transact(transaction -> {
+            ((TransactionRecorder) transaction).recordPublicationIntent(
+                    new PublicationProvideIntent(
+                            null,
+                            context,
+                            key,
+                            value,
+                            -1,
+                            null,
+                            new RegistrationHandleImpl(this, Sequences.registration()),
+                            outcome));
+            return null;
+        });
+        return new PublicationServiceResult(outcome.get(), receipt.settlement());
     }
 
-    Settlement revokeRegistration(RegistrationHandle registration) {
-        if (registration instanceof RegistrationImpl<?> typed) {
-            if (typed.runtime() != this) {
-                throw new IllegalArgumentException(
-                        "registration handle does not belong to this runtime");
-            }
-            return revoke(typed);
+    TransactionReceipt<Void> updatePublication(
+            String slotId,
+            long expectedEpoch,
+            String expectedRegistrationId,
+            ContextHandleImpl context,
+            CapabilityKey<?> key,
+            Object value) {
+        return transact(transaction -> {
+            ((TransactionRecorder) transaction).recordPublicationIntent(
+                    new PublicationProvideIntent(
+                            slotId,
+                            context,
+                            key,
+                            value,
+                            expectedEpoch,
+                            expectedRegistrationId,
+                            new RegistrationHandleImpl(this, Sequences.registration()),
+                            new AtomicReference<>()));
+            return null;
+        });
+    }
+
+    TransactionReceipt<Void> unpublishPublication(
+            String slotId,
+            long expectedEpoch,
+            String expectedRegistrationId,
+            ContextHandleImpl context,
+            CapabilityKey<?> key) {
+        return transact(transaction -> {
+            ((TransactionRecorder) transaction).recordPublicationIntent(
+                    new PublicationUnpublishIntent(
+                            slotId, context, key, expectedEpoch, expectedRegistrationId));
+            return null;
+        });
+    }
+
+    RuntimeView.PublicationSlotData publicationSlot(String slotId) {
+        return published.view.publicationSlots.get(slotId);
+    }
+
+    /**
+     * 句柄侧槽位观察：只读一次 published，active-only 视图命中即为 PUBLISHED；
+     * 未命中读共享 ref 的终态数据（完成先于发布，读到新代际必见终态）。
+     */
+    PublicationSlotObservation publicationSlotObservation(
+            PublicationSlotTerminalRef ref) {
+        PublishedKernelState state = published;
+        RuntimeView.PublicationSlotData slot =
+                state.view.publicationSlots.get(ref.slotId);
+        if (slot != null) {
+            return new PublicationSlotObservation(
+                    PublicationState.PUBLISHED,
+                    slot.epoch(),
+                    slot.currentRegistrationId(),
+                    slot.lastChangedGeneration());
         }
-        TransactionReceipt<Void> receipt = transact(transaction -> {
-            transaction.revoke(registration);
-            return null;
-        });
-        return receipt.settlement();
+        PublicationSlotTerminalRef.TerminalData terminal = ref.terminalData();
+        if (terminal != null) {
+            return new PublicationSlotObservation(
+                    terminal.state(), -1, null, terminal.lastChangedGeneration());
+        }
+        // 正常提交顺序下不可达（终态先完成 ref 再发布视图）；防御性按 DISPLACED 观察。
+        return new PublicationSlotObservation(
+                PublicationState.DISPLACED, -1, null, 0);
     }
 
-    <T> Registration<T> replace(RegistrationImpl<T> handle, T value) {
-        handle.requireFresh("replace");
-        TransactionReceipt<StagedRegistration<T>> receipt = transact(transaction -> {
-            transaction.revoke(handle);
-            return transaction.provide(handle.context(), handle.capabilityKey(), value);
-        });
-        handle.markStale();
-        return new RegistrationImpl<>(
-                ((StagedRegistrationImpl<T>) receipt.value()).registration(),
-                handle.capabilityKey(),
-                handle.context(),
-                receipt.settlement());
+    record PublicationSlotObservation(
+            PublicationState state,
+            long epoch,
+            String currentRegistrationId,
+            long lastChangedGeneration) {
     }
 
-    <T> Settlement revoke(RegistrationImpl<T> handle) {
-        handle.requireFresh("revoke");
-        TransactionReceipt<Void> receipt = transact(transaction -> {
-            transaction.revoke(handle);
-            return null;
-        });
-        handle.markStale();
-        return receipt.settlement();
+    /** final commit 专用：published 赋值前完成全部终态 ref；纯赋值，不得抛出。 */
+    private void completeTerminalPublicationRefs(ExecutableCommitPlan executable) {
+        for (ExecutableCommitPlan.PublicationTerminalEffect effect
+                : executable.terminalPublicationSlots.values()) {
+            effect.ref().completeForCommit(effect.terminalData());
+        }
+    }
+
+    record PublicationServiceResult(
+            PublicationProvideOutcome outcome, Settlement settlement) {
     }
 
     public <R> TransactionReceipt<R> transact(Function<RuntimeTransaction, R> action) {
@@ -361,7 +419,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     diagnostics.refresh(draft);
                     RuntimeView next = draft.publishOnce();
                     commitExecutable(next, intents, executable, indexDraft);
-                    this.published = indexDraft.publish(next);
+                    PublishedKernelState candidate = indexDraft.publish(next);
+                    completeTerminalPublicationRefs(executable);
+                    this.published = candidate;
                     committedView = next;
                     published = true;
                     retiredRegistrations = Map.copyOf(executable.retiredRegistrations);
@@ -526,9 +586,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return new PendingOperationsSnapshot(closing.get(), operations, 0);
     }
 
-    boolean hasLiveRegistration(String registrationId) {
-        return published.view.registrations.containsKey(registrationId);
-    }
 
     <T> Optional<T> findInContext(String contextId, CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
@@ -887,6 +944,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return switch (intent) {
             case ProvideIntent provide -> applyProvide(draft, provide);
             case RevokeIntent revoke -> applyRevoke(draft, revoke, dirty, executable);
+            case PublicationProvideIntent provide ->
+                    applyPublicationProvide(draft, provide, dirty, executable);
+            case PublicationUnpublishIntent unpublish ->
+                    applyPublicationUnpublish(draft, unpublish, dirty, executable);
             case ChildContextIntent child -> applyChildContext(draft, child);
             case MountIntent mount -> applyMount(draft, mount, dirty, executable);
             case ReconfigureIntent<?> reconfigure ->
@@ -928,7 +989,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         intent.value(),
                         new ProviderLeaseRuntime(
                                 intent.handle().registrationId(),
-                                ticker)));
+                                ticker),
+                        null));
         draft.capabilityTypes.putIfAbsent(key.name(), key.type());
         return true;
     }
@@ -951,9 +1013,19 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     "component registration must be revoked through its component handle");
         }
         removeRegistrationInView(draft, handle.registrationId(), executable);
+        detachConsumersOfRegistration(draft, handle.registrationId(), dirty, executable);
+        return true;
+    }
+
+    // Publication UPDATE 与外部 raw revoke 共享：旧注册消失时，直接绑定方按所有权闭包脱离并进入重收敛。
+    private void detachConsumersOfRegistration(
+            RuntimeView.Draft draft,
+            String registrationId,
+            Set<String> dirty,
+            ExecutableCommitPlan executable) {
         Set<String> direct = BindingImpactAnalyzer.componentsWithBinding(
                 draft,
-                Set.of(handle.registrationId()));
+                Set.of(registrationId));
         Set<String> impacted = new LinkedHashSet<>();
         for (String handleId : direct) {
             RuntimeView.ComponentData component = draft.components.get(handleId);
@@ -968,7 +1040,148 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     executable));
         }
         detachInView(draft, impacted, dirty, executable);
+    }
+
+    /**
+     * Publication 发布/更新（create-or-attach）。
+     *
+     * <p>slotId 为 null 时：坐标上存在活跃同名槽位则线性化为该槽位的 UPDATE（同类型）；
+     * 存在 raw/Activation 注册占用则拒绝（不接管）；否则创建新槽位。带 slotId 时为乐观 UPDATE，
+     * 期望失效抛内部 Stale 异常由句柄重试。UPDATE 只换 current，不进入终态。</p>
+     */
+    private boolean applyPublicationProvide(
+            RuntimeView.Draft draft,
+            PublicationProvideIntent intent,
+            Set<String> dirty,
+            ExecutableCommitPlan executable) {
+        ContextHandleImpl context = requireContext(draft, intent.context());
+        ensureActiveContext(draft, context.contextId());
+        CapabilityKey<?> key = intent.key();
+        if (!key.type().isInstance(intent.value())) {
+            throw reject(
+                    DiagnosticCode.CAPABILITY_TYPE_CONFLICT,
+                    key.name(),
+                    "value is not an instance of " + key.typeName());
+        }
+        validateDraftCapabilityType(draft, key);
+
+        RuntimeView.PublicationSlotData slot;
+        if (intent.slotId() == null) {
+            slot = draft.activePublicationSlots.get(
+                    new RuntimeView.PublicationSlotKey(
+                            context.contextId(), key.name()));
+            if (slot == null) {
+                boolean occupied = draft.registrations.values().stream()
+                        .anyMatch(registration ->
+                                registration.contextId().equals(context.contextId())
+                                        && registration.key().name().equals(key.name()));
+                if (occupied) {
+                    throw reject(
+                            DiagnosticCode.CAPABILITY_SLOT_OCCUPIED,
+                            key.name(),
+                            "context capability slot is already occupied");
+                }
+            }
+        } else {
+            slot = requireExpectedPublicationSlot(
+                    draft, intent.slotId(), context.contextId(), key,
+                    intent.expectedEpoch(), intent.expectedRegistrationId(), "update");
+        }
+
+        String newRegistrationId = intent.handle().registrationId();
+        long nextEpoch;
+        boolean slotWasCreated = slot == null;
+        PublicationSlotTerminalRef terminalRef;
+        if (slotWasCreated) {
+            String slotId = Sequences.publicationSlot();
+            terminalRef = new PublicationSlotTerminalRef(slotId);
+            slot = new RuntimeView.PublicationSlotData(
+                    slotId,
+                    context.contextId(),
+                    key.name(),
+                    key.typeName(),
+                    null,
+                    null,
+                    -1,
+                    draft.generation);
+            nextEpoch = 0;
+        } else {
+            terminalRef = activePublicationSlotRef(executable, slot.slotId());
+            retireRegistrationForSlotSwap(
+                    draft, slot.currentRegistrationId(), executable);
+            detachConsumersOfRegistration(
+                    draft, slot.currentRegistrationId(), dirty, executable);
+            nextEpoch = slot.epoch() + 1;
+        }
+
+        RuntimeView.PublicationSlotData next = slot.withCurrent(
+                newRegistrationId, nextEpoch, draft.generation + 1);
+        draft.registrations.put(
+                newRegistrationId,
+                new RuntimeView.RegistrationData(
+                        newRegistrationId,
+                        key,
+                        context.contextId(),
+                        RuntimeView.OwnerData.Host.INSTANCE,
+                        intent.value(),
+                        new ProviderLeaseRuntime(newRegistrationId, ticker),
+                        next.slotId()));
+        draft.capabilityTypes.putIfAbsent(key.name(), key.type());
+        draft.publicationSlots.put(next.slotId(), next);
+        draft.activePublicationSlots.put(
+                new RuntimeView.PublicationSlotKey(context.contextId(), key.name()), next);
+        executable.createdPublicationSlots.putIfAbsent(next.slotId(), terminalRef);
+        intent.outcome().set(new PublicationProvideOutcome(
+                next.slotId(),
+                slotWasCreated ? PublicationOperation.PUBLISH : PublicationOperation.UPDATE,
+                terminalRef));
         return true;
+    }
+
+    private boolean applyPublicationUnpublish(
+            RuntimeView.Draft draft,
+            PublicationUnpublishIntent intent,
+            Set<String> dirty,
+            ExecutableCommitPlan executable) {
+        ContextHandleImpl context = requireContext(draft, intent.context());
+        RuntimeView.PublicationSlotData slot = requireExpectedPublicationSlot(
+                draft, intent.slotId(), context.contextId(), intent.key(),
+                intent.expectedEpoch(), intent.expectedRegistrationId(), "unpublish");
+        String registrationId = slot.currentRegistrationId();
+        PublicationSlotTerminalRef terminalRef =
+                activePublicationSlotRef(executable, slot.slotId());
+        retireRegistrationForSlotSwap(draft, registrationId, executable);
+        terminalizePublicationSlotInView(draft, slot);
+        executable.terminalPublicationSlots.putIfAbsent(
+                slot.slotId(),
+                new ExecutableCommitPlan.PublicationTerminalEffect(
+                        terminalRef,
+                        new PublicationSlotTerminalRef.TerminalData(
+                                PublicationState.UNPUBLISHED, draft.generation + 1)));
+        detachConsumersOfRegistration(draft, registrationId, dirty, executable);
+        return true;
+    }
+
+    private RuntimeView.PublicationSlotData requireExpectedPublicationSlot(
+            RuntimeView.Draft draft,
+            String slotId,
+            String contextId,
+            CapabilityKey<?> key,
+            long expectedEpoch,
+            String expectedRegistrationId,
+            String operation) {
+        // 视图为 active-only：存在即 PUBLISHED；不存在即已终态（调用方以 Stale 重试）。
+        RuntimeView.PublicationSlotData slot = draft.publicationSlots.get(slotId);
+        if (slot == null
+                || !slot.contextId().equals(contextId)
+                || !slot.capabilityName().equals(key.name())
+                || !slot.typeName().equals(key.typeName())
+                || slot.epoch() != expectedEpoch
+                || !Objects.equals(slot.currentRegistrationId(), expectedRegistrationId)) {
+            throw new StalePublicationSlotException(
+                    "publication slot " + slotId + " changed before " + operation);
+        }
+        return slot;
     }
 
     private boolean applyChildContext(
@@ -1366,11 +1579,82 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             ExecutableCommitPlan executable) {
         RuntimeView.RegistrationData registration =
                 draft.registrations.remove(registrationId);
+        if (registration == null) {
+            return;
+        }
+        executable.retiredRegistrations.putIfAbsent(
+                registrationId,
+                registration.leases());
+        if (registration.publicationSlotId() != null) {
+            // 外部 raw 移除 / Context 处置 / runtime 关闭：槽位淘汰而非复活。
+            terminalizePublicationSlot(
+                    draft, executable, registration.publicationSlotId(),
+                    PublicationState.DISPLACED);
+        }
+    }
+
+    // Publication UPDATE 专用：只退休旧注册，槽位保持活跃并由调用方换上新 current。
+    private void retireRegistrationForSlotSwap(
+            RuntimeView.Draft draft,
+            String registrationId,
+            ExecutableCommitPlan executable) {
+        RuntimeView.RegistrationData registration =
+                draft.registrations.remove(registrationId);
         if (registration != null) {
             executable.retiredRegistrations.putIfAbsent(
                     registrationId,
                     registration.leases());
         }
+    }
+
+    /**
+     * 终态化活跃 Publication 槽位：视图与坐标索引一并移除（active-only），
+     * 终态效果记录进 executable，由 final commit 在 published 赋值前完成 ref。
+     */
+    private void terminalizePublicationSlot(
+            RuntimeView.Draft draft,
+            ExecutableCommitPlan executable,
+            String slotId,
+            PublicationState state) {
+        RuntimeView.PublicationSlotData slot = draft.publicationSlots.get(slotId);
+        if (slot == null) {
+            return;
+        }
+        PublicationSlotTerminalRef terminalRef =
+                activePublicationSlotRef(executable, slotId);
+        terminalizePublicationSlotInView(draft, slot);
+        executable.terminalPublicationSlots.putIfAbsent(
+                slotId,
+                new ExecutableCommitPlan.PublicationTerminalEffect(
+                        terminalRef,
+                        new PublicationSlotTerminalRef.TerminalData(
+                                state, draft.generation + 1)));
+    }
+
+    private void terminalizePublicationSlotInView(
+            RuntimeView.Draft draft,
+            RuntimeView.PublicationSlotData slot) {
+        draft.publicationSlots.remove(slot.slotId());
+        draft.activePublicationSlots.remove(
+                new RuntimeView.PublicationSlotKey(
+                        slot.contextId(), slot.capabilityName()));
+    }
+
+    /** 同一 slotId 的所有句柄共享同一 ref；活跃槽位的 ref 来自本代索引或本事务新建记录。 */
+    private PublicationSlotTerminalRef activePublicationSlotRef(
+            ExecutableCommitPlan executable, String slotId) {
+        PublicationSlotTerminalRef created =
+                executable.createdPublicationSlots.get(slotId);
+        if (created != null) {
+            return created;
+        }
+        PublicationSlotTerminalRef live =
+                published.index.publicationSlotRefs.get(slotId);
+        if (live == null) {
+            throw new IllegalStateException(
+                    "active publication slot missing terminal ref: " + slotId);
+        }
+        return live;
     }
 
     private CommittedLeaseRetirement retireCommittedRegistrations(
@@ -1382,8 +1666,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         for (Map.Entry<String, ProviderLeaseRuntime> entry
                 : retiredRegistrations.entrySet()) {
             try {
-                runProviderLeaseRetireFaultProbe(leaseIndex++);
+                // 故障注入点必须在真实 retire 之后：probe 异常只模拟 retire 已完成
+                // 后的 postcommit 阶段故障，不能遗留未登记、未 retire 的孤立租约。
                 drains.add(retireProviderLease(entry.getKey(), entry.getValue()));
+                runProviderLeaseRetireFaultProbe(leaseIndex++);
             } catch (Throwable retireError) {
                 failure = appendPostCommitFailure(failure, postCommitFailure(
                         failureScope,
@@ -1449,6 +1735,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             indexDraft.components().remove(handleId);
             indexDraft.componentHandles().remove(handleId);
         }
+        syncPublicationSlotRefs(executable, indexDraft);
 
         for (MountIntent mount : executable.mounts.values()) {
             String handleId = mount.handle().handleId();
@@ -1494,6 +1781,16 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 case RevokeIntent revoke ->
                         indexDraft.registrationHandles().remove(
                                 revoke.handle().registrationId());
+                case PublicationProvideIntent provide -> {
+                    if (next.registrations.containsKey(
+                            provide.handle().registrationId())) {
+                        indexDraft.registrationHandles().put(
+                                provide.handle().registrationId(),
+                                provide.handle());
+                    }
+                }
+                case PublicationUnpublishIntent ignored -> {
+                }
                 case ChildContextIntent child -> {
                     if (next.contexts.containsKey(child.handle().contextId())) {
                         indexDraft.contextHandles().put(
@@ -1509,6 +1806,21 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 }
             }
         }
+    }
+
+    /**
+     * 同步 Publication 槽位 ref 到索引草稿：先登记新建/既有槽位的共享 ref，
+     * 再移除终态槽位；同一事务内 create+terminalize 同一坐标时以终态移除为准。
+     */
+    private static void syncPublicationSlotRefs(
+            ExecutableCommitPlan executable, KernelStateDraft indexDraft) {
+        if (executable.createdPublicationSlots.isEmpty()
+                && executable.terminalPublicationSlots.isEmpty()) {
+            return;
+        }
+        Map<String, PublicationSlotTerminalRef> refs = indexDraft.publicationSlotRefs();
+        executable.createdPublicationSlots.forEach(refs::putIfAbsent);
+        executable.terminalPublicationSlots.keySet().forEach(refs::remove);
     }
 
     // 先在协调器内按最新视图预约并合并过渡，再离开锁提交虚拟线程执行用户代码。
@@ -2145,6 +2457,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             if (candidate != null && nextState != null) {
                 // 单一 final publish：赋值即不可逆提交点，此后不得回滚已提交结构或换回旧状态。
+                // 终态 ref 必须先完成再发布：读到新代际的旧句柄立即观察到终态。
+                candidate.completePublicationTerminals();
                 published = nextState;
                 try {
                     candidate.applyEffects(activation);
@@ -2245,7 +2559,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             ActivationRuntime activation) {
         ActivationCommitCandidate candidate = prepareEmergencyActivationCandidate(
                 runtime, activation, "emergency activation rollback", false);
-        published = candidate.nextState();
+        PublishedKernelState nextState = candidate.nextState();
+        candidate.completePublicationTerminals();
+        published = nextState;
         candidate.applyEffects(activation);
     }
 
@@ -2570,7 +2886,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         Map.copyOf(executable.retiredRegistrations)),
                 executable.staleActivations,
                 false,
-                "");
+                "",
+                executable);
     }
 
     // prepublish 失败后的中止候选：从最新已发布代际构造一次 STOPPING 收敛发布。
@@ -2604,7 +2921,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         Map.copyOf(executable.retiredRegistrations)),
                 executable.staleActivations,
                 true,
-                "");
+                "",
+                executable);
     }
 
     // 紧急回滚候选：FAILED 视图、failedCleanup 归属与 CLEANUP retry 意图在同一协调器裁决。
@@ -2638,6 +2956,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 true,
                 fatalPath ? message : runtime.lastStartError(),
                 runtime.lastStartFailure());
+        ExecutableCommitPlan executable = new ExecutableCommitPlan();
         return new ActivationCommitCandidate(
                 draft,
                 indexDraft,
@@ -2646,7 +2965,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 ActivationPostCommitEffects.empty(),
                 Set.of(),
                 true,
-                message);
+                message,
+                executable);
     }
 
     // owner/activation 效果在 prepublish 冻结为纯值，final publish 后统一 apply。
@@ -2714,6 +3034,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             indexDraft.components().put(handleId, child);
             indexDraft.componentHandles().put(handleId, plan.handle());
         }
+        syncPublicationSlotRefs(executable, indexDraft);
         syncProviderLeases(indexDraft, draft.registrations);
     }
 
@@ -3102,7 +3423,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 diagnostics.refresh(draft);
                 RuntimeView next = draft.publishOnce();
                 commitExecutable(next, List.of(), executable, indexDraft);
-                this.published = indexDraft.publish(next);
+                PublishedKernelState candidate = indexDraft.publish(next);
+                completeTerminalPublicationRefs(executable);
+                this.published = candidate;
                 published = true;
                 retiredRegistrations = Map.copyOf(executable.retiredRegistrations);
                 runTransitionPublicationProbe();

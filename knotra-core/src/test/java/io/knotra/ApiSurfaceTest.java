@@ -54,9 +54,16 @@ final class ApiSurfaceTest {
                 .anyMatch(method -> method.getName().equals("find")
                         && Arrays.equals(method.getParameterTypes(), new Class<?>[]{Class.class})));
         assertTrue(Arrays.stream(Publication.class.getMethods())
-                .noneMatch(method -> method.getName().equals("currentRegistration")));
+                .noneMatch(method -> method.getName().equals("currentRegistration")
+                        || method.getName().equals("currentInternal")
+                        || method.getName().equals("slotId")));
         assertTrue(Arrays.stream(PublicationChange.class.getMethods())
                 .noneMatch(method -> method.getName().equals("registration")));
+        // 公共 Registration 类型已删除：Publication 是注册演进的唯一稳定入口。
+        assertThrows(ClassNotFoundException.class,
+                () -> Class.forName("io.knotra.Registration"));
+        assertThrows(ClassNotFoundException.class,
+                () -> Class.forName("io.knotra.internal.RegistrationImpl"));
         assertTrue(Arrays.stream(SettlementReport.class.getMethods())
                 .noneMatch(method -> method.getName().equals("allAffectedActive")));
         assertTrue(Arrays.stream(SettlementReport.class.getMethods())

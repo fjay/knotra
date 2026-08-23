@@ -27,6 +27,11 @@ import java.util.Set;
  * inside the coordinator lock. Lock-free readers that retain an older snapshot therefore
  * still see one self-consistent structural combination. Tentative capabilities, child
  * mounts, and state transitions in a Draft never affect an older generation.</p>
+ *
+ * <p>{@code publicationSlots} 与 {@code activePublicationSlots} 只包含活跃（PUBLISHED）
+ * 槽位且一一对应。槽位终态化在视图中表现为“槽位移除”：持有旧代际视图的读者按
+ * active-first 语义仍观察到 PUBLISHED；读到新代际（槽位已移除）的读者通过该槽位
+ * 共享的 {@link PublicationSlotTerminalRef} 精确观察终态。历史终态槽位不再随视图复制。</p>
  */
 final class RuntimeView implements RuntimeViewReader {
     // Every successful publish advances the whole value; rejected transactions reuse the
@@ -34,20 +39,25 @@ final class RuntimeView implements RuntimeViewReader {
     final long generation;
     final Map<String, ContextData> contexts;
     final Map<String, RegistrationData> registrations;
+    final Map<String, PublicationSlotData> publicationSlots;
+    final Map<PublicationSlotKey, PublicationSlotData> activePublicationSlots;
     final Map<String, ComponentData> components;
     final Map<String, ActivationData> activations;
     final List<RuntimeDiagnostic> diagnostics;
-
     private RuntimeView(
             long generation,
             Map<String, ContextData> contexts,
             Map<String, RegistrationData> registrations,
+            Map<String, PublicationSlotData> publicationSlots,
+            Map<PublicationSlotKey, PublicationSlotData> activePublicationSlots,
             Map<String, ComponentData> components,
             Map<String, ActivationData> activations,
             List<RuntimeDiagnostic> diagnostics) {
         this.generation = generation;
         this.contexts = Map.copyOf(contexts);
         this.registrations = Map.copyOf(registrations);
+        this.publicationSlots = Map.copyOf(publicationSlots);
+        this.activePublicationSlots = Map.copyOf(activePublicationSlots);
         this.components = Map.copyOf(components);
         this.activations = Map.copyOf(activations);
         this.diagnostics = List.copyOf(diagnostics);
@@ -61,6 +71,8 @@ final class RuntimeView implements RuntimeViewReader {
         return new RuntimeView(
                 0,
                 contexts,
+                Map.of(),
+                Map.of(),
                 Map.of(),
                 Map.of(),
                 Map.of(),
@@ -279,7 +291,43 @@ final class RuntimeView implements RuntimeViewReader {
             String contextId,
             OwnerData owner,
             Object value,
-            ProviderLeaseRuntime leases) {
+            ProviderLeaseRuntime leases,
+            String publicationSlotId) {
+    }
+
+    /** Publication 槽位坐标：同一 Context 内每个能力名占用一个逻辑槽。 */
+    record PublicationSlotKey(
+            String contextId,
+            String capabilityName) {
+    }
+
+    /**
+     * 稳定发布槽位的纯字符串活跃结构。
+     *
+     * <p>槽位数据随 RuntimeView 同代发布，不持有 Class、value、handle 或 future；
+     * 类型只保存二进制名，因此不会阻止旧插件 ClassLoader 回收。视图只保存活跃
+     * （PUBLISHED）槽位：槽位进入终态（UNPUBLISHED / DISPLACED）时连同坐标索引一起
+     * 从视图移除，终态语义由共享的 {@link PublicationSlotTerminalRef} 承载，同名重新
+     * 发布会创建全新 slotId 与新 ref，旧槽位不复活。</p>
+     */
+    record PublicationSlotData(
+            String slotId,
+            String contextId,
+            String capabilityName,
+            String typeName,
+            String currentRegistrationId,
+            String lastRegistrationId,
+            long epoch,
+            long lastChangedGeneration) {
+
+        PublicationSlotData withCurrent(
+                String registrationId,
+                long nextEpoch,
+                long changedGeneration) {
+            return new PublicationSlotData(
+                    slotId, contextId, capabilityName, typeName,
+                    registrationId, currentRegistrationId, nextEpoch, changedGeneration);
+        }
     }
 
     record ComponentData(
@@ -376,6 +424,8 @@ final class RuntimeView implements RuntimeViewReader {
         final long generation;
         final Map<String, ContextData> contexts;
         final Map<String, RegistrationData> registrations;
+        final Map<String, PublicationSlotData> publicationSlots;
+        final Map<PublicationSlotKey, PublicationSlotData> activePublicationSlots;
         final Map<String, ComponentData> components;
         final Map<String, ActivationData> activations;
         // Capability name/type identity remains fixed while a live registration or
@@ -389,6 +439,8 @@ final class RuntimeView implements RuntimeViewReader {
             this.generation = view.generation;
             this.contexts = new HashMap<>(view.contexts);
             this.registrations = new HashMap<>(view.registrations);
+            this.publicationSlots = new HashMap<>(view.publicationSlots);
+            this.activePublicationSlots = new HashMap<>(view.activePublicationSlots);
             this.components = new HashMap<>(view.components);
             this.activations = new HashMap<>(view.activations);
             this.capabilityTypes = liveCapabilityTypes(view);
@@ -505,6 +557,8 @@ final class RuntimeView implements RuntimeViewReader {
                     generation + 1,
                     contexts,
                     registrations,
+                    publicationSlots,
+                    activePublicationSlots,
                     components,
                     activations,
                     diagnostics);

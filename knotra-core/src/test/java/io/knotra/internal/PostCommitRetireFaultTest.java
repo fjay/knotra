@@ -26,7 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Final publish 后 provider lease retire 故障必须隔离，并继续驱动已提交过渡。 */
+/** provider lease 真实 retire 之后的 postcommit 阶段故障必须隔离，且不得回滚或遗留孤立租约。 */
 final class PostCommitRetireFaultTest {
     private final KnotraRuntime publicRuntime = KnotraRuntime.create();
     private final DefaultKnotraRuntime runtime =
@@ -92,7 +92,7 @@ final class PostCommitRetireFaultTest {
         assertNoPendingLease(secondProvider.registrationId());
         assertEquals(ComponentState.ACTIVE, settledState(first));
         assertEquals(ComponentState.ACTIVE, settledState(second));
-        assertEquals(2, attempts.get(), "remaining lease must still be retired");
+        assertEquals(2, attempts.get(), "postcommit fault must not skip retire of any lease");
     }
 
     @Test
@@ -147,7 +147,7 @@ final class PostCommitRetireFaultTest {
         assertNoPendingLease(secondProvider.registrationId());
         assertEquals(ComponentState.DISPOSED, settledState(first));
         assertEquals(ComponentState.DISPOSED, settledState(second));
-        assertEquals(2, attempts.get(), "remaining lease must still be retired");
+        assertEquals(2, attempts.get(), "postcommit fault must not skip retire of any lease");
     }
 
     private MountHandle mountConsumer(

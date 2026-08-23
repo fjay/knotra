@@ -35,7 +35,8 @@ final class PublishedKernelState {
                 Map.of(),
                 Map.of(),
                 Map.of(),
-                Map.of("ctx-root", root));
+                Map.of("ctx-root", root),
+                Map.of());
         return new PublishedKernelState(view, index);
     }
 
@@ -130,6 +131,69 @@ final class PublishedKernelState {
                 || index.contextHandles.get("ctx-root") == null) {
             throw new IllegalStateException("root context must remain published");
         }
+        validatePublicationSlots(view, index);
+    }
+
+    /**
+     * 校验 Publication 槽位与注册/ref 的同代一致：
+     * 视图与坐标索引只含活跃（PUBLISHED）槽位且一一对应；
+     * 活跃槽位的 current 注册必须存在于本代视图且 slotId/context/name/type 双向匹配；
+     * ExecutionIndex 的 publicationSlotRefs 与活跃槽位 ID 一一对应（同 slotId 同 ref 实例）；
+     * raw 注册（slotId null）不进入槽位结构。
+     */
+    private static void validatePublicationSlots(
+            RuntimeView view, ExecutionIndex index) {
+        Set<RuntimeView.PublicationSlotKey> activeKeys = new HashSet<>();
+        for (RuntimeView.PublicationSlotData slot : view.publicationSlots.values()) {
+            activeKeys.add(new RuntimeView.PublicationSlotKey(
+                    slot.contextId(), slot.capabilityName()));
+            RuntimeView.RegistrationData current =
+                    view.registrations.get(slot.currentRegistrationId());
+            if (current == null
+                    || !slot.slotId().equals(current.publicationSlotId())
+                    || !slot.contextId().equals(current.contextId())
+                    || !slot.capabilityName().equals(current.key().name())
+                    || !slot.typeName().equals(current.key().typeName())) {
+                throw new IllegalStateException(
+                        "published slot current registration mismatch: "
+                                + slot.slotId());
+            }
+        }
+        if (!activeKeys.equals(view.activePublicationSlots.keySet())) {
+            throw new IllegalStateException(
+                    "active publication slot coordinates differ from published slots");
+        }
+        view.activePublicationSlots.forEach((key, slot) -> {
+            if (view.publicationSlots.get(slot.slotId()) != slot
+                    || !key.equals(new RuntimeView.PublicationSlotKey(
+                            slot.contextId(), slot.capabilityName()))) {
+                throw new IllegalStateException(
+                        "active publication slot identity mismatch: " + slot.slotId());
+            }
+        });
+        view.registrations.forEach((registrationId, registration) -> {
+            String slotId = registration.publicationSlotId();
+            if (slotId == null) {
+                return;
+            }
+            RuntimeView.PublicationSlotData slot = view.publicationSlots.get(slotId);
+            if (slot == null
+                    || !registrationId.equals(slot.currentRegistrationId())) {
+                throw new IllegalStateException(
+                        "registration references a non-current publication slot: "
+                                + registrationId);
+            }
+        });
+        requireSameKeys(
+                "publication slot refs",
+                view.publicationSlots.keySet(),
+                index.publicationSlotRefs.keySet());
+        index.publicationSlotRefs.forEach((slotId, ref) -> {
+            if (!slotId.equals(ref.slotId)) {
+                throw new IllegalStateException(
+                        "publication slot ref identity mismatch: " + slotId);
+            }
+        });
     }
 
     private static void requireSameKeys(String name, Set<?> first, Set<?> second) {

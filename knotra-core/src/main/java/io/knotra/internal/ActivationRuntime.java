@@ -75,7 +75,8 @@ final class ActivationRuntime {
                 owner.contextId(),
                 new RuntimeView.OwnerData.Activation(activationId),
                 value,
-                new ProviderLeaseRuntime(id, pendingTime));
+                new ProviderLeaseRuntime(id, pendingTime),
+                null);
         stagedRegistrations.put(key.name(), registration);
         return registration;
     }

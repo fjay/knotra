@@ -12,6 +12,14 @@ package io.knotra;
  * </ul>
  * </p>
  *
+ * <p><b>槽位与句柄语义</b>：slot 由 {@code (context, capability key)} 坐标标识，
+ * slotId 语义在坐标存续期间保持稳定。{@code runtime.publish} 对同一坐标是
+ * get-or-update 语义：命中活跃槽位即原子更新其内容并返回同一逻辑槽位的句柄。
+ * 因此不同 handle 对象的 identity 不代表不同 slot——两次 publish 同一坐标返回的
+ * 句柄可能不是同一对象，但都指向同一个稳定槽位。终态槽位（UNPUBLISHED /
+ * DISPLACED）不会复活：对其调用 {@link #update(Object)} 会被拒绝；同一坐标重新
+ * {@code runtime.publish} 会创建全新槽位，旧句柄保持终态不变。</p>
+ *
  * @param <T> 能力接口类型
  */
 public interface Publication<T> {
@@ -27,6 +35,10 @@ public interface Publication<T> {
 
     /**
      * 更新插槽中的能力提供实例，原子发布新一代注册并返回本次操作变更。
+     *
+     * <p>槽位处于终态（UNPUBLISHED / DISPLACED）时抛出
+     * {@link io.knotra.TransactionRejectedException}，不会复活旧槽位。
+     * 并发 update 按提交总序线性化，全部成功。</p>
      *
      * @param value 新的能力实例
      * @return 包含本次操作结果与结算等待的变更对象

@@ -383,7 +383,7 @@ final class RuntimeGraphTest {
         RuntimeView.Draft draft = draft();
         draft.registrations.put("isolated", new RuntimeView.RegistrationData(
                 "isolated", isolatedKey, "ctx-root",
-                new RuntimeView.OwnerData.Activation("act-isolated"), new Object(), null));
+                new RuntimeView.OwnerData.Activation("act-isolated"), new Object(), null, null));
         draft.components.put("consumer", component("consumer", "ctx-root",
                 ComponentDescriptor.named("consumer", CapabilityRequirement.required(isolatedKey)),
                 "act-consumer", ActivationState.ACTIVE,
@@ -412,7 +412,7 @@ final class RuntimeGraphTest {
         RuntimeView.OwnerData owner = activationId == null
                 ? RuntimeView.OwnerData.Host.INSTANCE
                 : new RuntimeView.OwnerData.Activation(activationId);
-        return new RuntimeView.RegistrationData(id, key, contextId, owner, new Object(), null);
+        return new RuntimeView.RegistrationData(id, key, contextId, owner, new Object(), null, null);
     }
 
     private static RuntimeView.ComponentData component(

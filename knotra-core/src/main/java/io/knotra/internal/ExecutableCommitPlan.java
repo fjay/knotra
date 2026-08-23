@@ -1,6 +1,7 @@
 package io.knotra.internal;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -22,9 +23,20 @@ final class ExecutableCommitPlan {
     final Set<String> resetAutoRestart = new LinkedHashSet<>();
     final Set<String> contextDisposals = new LinkedHashSet<>();
     final Map<String, ProviderLeaseRuntime> retiredRegistrations = new HashMap<>();
+    // Publication 槽位效果：新槽位登记共享 ref；终态槽位记录 (ref, 终态数据)，
+    // 由 final commit 路径在 published 赋值前统一完成。
+    final Map<String, PublicationSlotTerminalRef> createdPublicationSlots =
+            new LinkedHashMap<>();
+    final Map<String, PublicationTerminalEffect> terminalPublicationSlots =
+            new LinkedHashMap<>();
     record ConfigUpdate(Object config, long revision) {
     }
 
     record RemovedMount(String mountId) {
+    }
+
+    record PublicationTerminalEffect(
+            PublicationSlotTerminalRef ref,
+            PublicationSlotTerminalRef.TerminalData terminalData) {
     }
 }

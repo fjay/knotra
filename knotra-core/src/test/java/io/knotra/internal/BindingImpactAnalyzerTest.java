@@ -57,6 +57,7 @@ final class BindingImpactAnalyzerTest {
                 "ctx-root",
                 new RuntimeView.OwnerData.Host(),
                 id,
+                null,
                 null);
     }
 

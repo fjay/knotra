@@ -19,6 +19,7 @@ final class KernelStateDraft {
     private Map<String, RegistrationHandleImpl> registrationHandles;
     private Map<String, ProviderLeaseRuntime> providerLeases;
     private Map<String, ContextHandleImpl> contextHandles;
+    private Map<String, PublicationSlotTerminalRef> publicationSlotRefs;
 
     KernelStateDraft(PublishedKernelState base) {
         this.base = base;
@@ -66,6 +67,13 @@ final class KernelStateDraft {
         return contextHandles;
     }
 
+    Map<String, PublicationSlotTerminalRef> publicationSlotRefs() {
+        if (publicationSlotRefs == null) {
+            publicationSlotRefs = new HashMap<>(base.index.publicationSlotRefs);
+        }
+        return publicationSlotRefs;
+    }
+
     PublishedKernelState publish(RuntimeView next) {
         syncProviderLeases(next);
         return new PublishedKernelState(
@@ -82,7 +90,10 @@ final class KernelStateDraft {
                         providerLeases == null ? base.index.providerLeases : providerLeases,
                         contextHandles == null
                                 ? base.index.contextHandles
-                                : contextHandles));
+                                : contextHandles,
+                        publicationSlotRefs == null
+                                ? base.index.publicationSlotRefs
+                                : publicationSlotRefs));
     }
 
     private void syncProviderLeases(RuntimeView next) {

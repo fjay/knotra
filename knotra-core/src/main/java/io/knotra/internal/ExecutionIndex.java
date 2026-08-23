@@ -16,6 +16,7 @@ final class ExecutionIndex {
     final Map<String, RegistrationHandleImpl> registrationHandles;
     final Map<String, ProviderLeaseRuntime> providerLeases;
     final Map<String, ContextHandleImpl> contextHandles;
+    final Map<String, PublicationSlotTerminalRef> publicationSlotRefs;
 
     ExecutionIndex(
             Map<String, ComponentRuntime> components,
@@ -23,17 +24,19 @@ final class ExecutionIndex {
             Map<String, ActivationRuntime> activations,
             Map<String, RegistrationHandleImpl> registrationHandles,
             Map<String, ProviderLeaseRuntime> providerLeases,
-            Map<String, ContextHandleImpl> contextHandles) {
+            Map<String, ContextHandleImpl> contextHandles,
+            Map<String, PublicationSlotTerminalRef> publicationSlotRefs) {
         this.components = Map.copyOf(components);
         this.componentHandles = Map.copyOf(componentHandles);
         this.activations = Map.copyOf(activations);
         this.registrationHandles = Map.copyOf(registrationHandles);
         this.providerLeases = Map.copyOf(providerLeases);
         this.contextHandles = Map.copyOf(contextHandles);
+        this.publicationSlotRefs = Map.copyOf(publicationSlotRefs);
     }
 
     static ExecutionIndex empty() {
         return new ExecutionIndex(
-                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
     }
 }

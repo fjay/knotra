@@ -23,6 +23,7 @@ final class ActivationCommitCandidate {
     private final Set<String> staleActivations;
     private final boolean abortedCandidate;
     private final String emergencyMessage;
+    private final List<ExecutableCommitPlan.PublicationTerminalEffect> publicationTerminals;
 
     ActivationCommitCandidate(
             RuntimeView.Draft draft,
@@ -32,7 +33,8 @@ final class ActivationCommitCandidate {
             ActivationPostCommitEffects postCommitEffects,
             Set<String> staleActivations,
             boolean abortedCandidate,
-            String emergencyMessage) {
+            String emergencyMessage,
+            ExecutableCommitPlan executable) {
         this.draft = draft;
         this.indexDraft = indexDraft;
         this.reservations = List.copyOf(reservations);
@@ -41,11 +43,22 @@ final class ActivationCommitCandidate {
         this.staleActivations = Set.copyOf(staleActivations);
         this.abortedCandidate = abortedCandidate;
         this.emergencyMessage = emergencyMessage;
+        this.publicationTerminals = List.copyOf(executable.terminalPublicationSlots.values());
     }
 
     /** 唯一的 final publish 计算点；把返回值赋给 published 即为不可逆提交。 */
     PublishedKernelState nextState() {
         return indexDraft.publish(draft.publishOnce());
+    }
+
+    /**
+     * final commit 专用：在把 nextState() 赋给 published 前完成全部终态 ref。
+     * 纯赋值，不得抛出；prepublish 失败的候选永远不会到达这里。
+     */
+    void completePublicationTerminals() {
+        for (ExecutableCommitPlan.PublicationTerminalEffect effect : publicationTerminals) {
+            effect.ref().completeForCommit(effect.terminalData());
+        }
     }
 
     /** final publish 之后在协调器内显式落地 owner/activation 效果；纯赋值，不可抛出。 */

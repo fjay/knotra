@@ -61,10 +61,7 @@ final class TransactionRecorder implements RuntimeTransaction {
         ensureOpen();
         Objects.requireNonNull(registration, "registration");
         RegistrationHandleImpl handle;
-        if (registration instanceof RegistrationImpl<?> typed) {
-            typed.requireFresh("revoke");
-            handle = typed.registration();
-        } else if (registration instanceof StagedRegistrationImpl<?> staged) {
+        if (registration instanceof StagedRegistrationImpl<?> staged) {
             handle = staged.registration();
         } else if (registration instanceof RegistrationHandleImpl internal) {
             handle = internal;
@@ -78,6 +75,18 @@ final class TransactionRecorder implements RuntimeTransaction {
                     "registration handle does not belong to this runtime");
         }
         record(new RevokeIntent(handle));
+    }
+
+    /** 仅供内部 Publication 服务使用：记录发布/更新意图并回传预分配的注册句柄。 */
+    void recordPublicationIntent(PublicationProvideIntent intent) {
+        ensureOpen();
+        record(intent);
+    }
+
+    /** 仅供内部 Publication 服务使用：记录主动撤销意图。 */
+    void recordPublicationIntent(PublicationUnpublishIntent intent) {
+        ensureOpen();
+        record(intent);
     }
 
     @Override

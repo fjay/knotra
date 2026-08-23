@@ -125,14 +125,13 @@ final class RegistrationPublicationTest {
 
 
     @Test
-    void stagedRegistrationIsTypedAndDoesNotImpersonateACommittedRegistration() throws Exception {
+    void stagedRegistrationIsTypedAndCommitsThroughHostTransaction() throws Exception {
         TransactionReceipt<StagedRegistration<String>> receipt =
                 runtime.advanced().transact(transaction ->
                         transaction.provide(runtime.root(), TEXT, "expert"));
         StagedRegistration<String> staged = receipt.value();
         assertEquals(TEXT, staged.key());
         assertEquals(runtime.root(), staged.context());
-        assertFalse(staged instanceof Registration);
         receipt.awaitSettled(Duration.ofSeconds(10));
         assertEquals("expert", runtime.root().view().require(TEXT));
         runtime.advanced().transact(transaction -> {

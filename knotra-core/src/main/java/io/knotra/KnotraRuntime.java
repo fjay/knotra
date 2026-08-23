@@ -47,7 +47,12 @@ public interface KnotraRuntime extends AutoCloseable {
         return publish(root(), key, value);
     }
 
-    /** 在指定上下文中发布能力。 */
+    /**
+     * 在指定上下文中发布能力。同一 {@code (context, key)} 坐标命中活跃槽位时是
+     * get-or-update 语义：原子更新该槽位并返回指向同一逻辑槽位的句柄（句柄对象
+     * identity 不保证相同）；坐标无活跃槽位时创建新槽位。终态槽位不复活，同坐标
+     * 重新 publish 会创建全新槽位。
+     */
     default <T> PublicationChange<T> publish(ContextHandle context, CapabilityKey<T> key, T value) {
         return advanced().publication(context, key, value);
     }

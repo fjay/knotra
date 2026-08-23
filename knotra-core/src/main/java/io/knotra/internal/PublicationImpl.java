@@ -6,7 +6,6 @@ import io.knotra.Publication;
 import io.knotra.PublicationChange;
 import io.knotra.PublicationOperation;
 import io.knotra.PublicationState;
-import io.knotra.Registration;
 import io.knotra.Settlement;
 import io.knotra.TransactionRejectedException;
 import io.knotra.RuntimeDiagnostic;
@@ -14,30 +13,35 @@ import io.knotra.DiagnosticCode;
 
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
-/** 稳定发布槽位实现。每个槽位的结构化操作均线性化执行。 */
+/**
+ * 稳定发布槽位的纯句柄。
+ *
+ * <p>句柄只保存 runtime、共享 {@link PublicationSlotTerminalRef}、key 与 context；槽位状态
+ * 与 current 注册始终通过 runtime 对 published 的单次读取观察：active-only 视图命中即为
+ * PUBLISHED，未命中读共享 ref 的终态数据。update/unpublish 以
+ * (epoch, currentRegistrationId) 作为乐观期望提交，协调器内验证失败抛内部 Stale 异常，
+ * 句柄在锁外重读后重试，因此并发操作按提交总序线性化：并发 update 全部成功、
+ * update/unpublish 按先后、并发 unpublish 只有一个真实事务其余返回幂等终态结果。
+ * 终态槽位不复活，同名重新发布由 runtime.publish 创建新槽位与新 ref，旧句柄永不观察新槽位。</p>
+ */
 final class PublicationImpl<T> implements Publication<T> {
     private final DefaultKnotraRuntime runtime;
+    private final PublicationSlotTerminalRef slot;
     private final CapabilityKey<T> key;
+    // 纯结果缓存：unpublish 的幂等终态返回；不参与事务，也绝不在锁内读写。
+    private volatile PublicationChange<T> terminalUnpublishChange;
     private final ContextHandle context;
-    private RegistrationImpl<T> current;
-    private PublicationState state = PublicationState.PUBLISHED;
-    private PublicationChange<T> unpublishChange;
 
     PublicationImpl(
             DefaultKnotraRuntime runtime,
+            PublicationSlotTerminalRef slot,
             CapabilityKey<T> key,
-            ContextHandle context,
-            Registration<T> initial) {
+            ContextHandle context) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
+        this.slot = Objects.requireNonNull(slot, "slot");
         this.key = Objects.requireNonNull(key, "key");
         this.context = Objects.requireNonNull(context, "context");
-        if (!(initial instanceof RegistrationImpl<T> registration)
-                || registration.runtime() != runtime) {
-            throw new IllegalArgumentException("registration does not belong to this runtime");
-        }
-        this.current = registration;
     }
 
     static <T> PublicationChange<T> publish(
@@ -45,13 +49,17 @@ final class PublicationImpl<T> implements Publication<T> {
             ContextHandle context,
             CapabilityKey<T> key,
             T value) {
-        Registration<T> registration = runtime.register(context, key, value);
-        PublicationImpl<T> publication = new PublicationImpl<>(runtime, key, context, registration);
-        PublicationChange<T> change = publication.change(
-                PublicationOperation.PUBLISH,
-                registration,
-                registration);
-        return change;
+        if (!(context instanceof ContextHandleImpl internal)
+                || internal.runtime != runtime) {
+            throw new IllegalArgumentException(
+                    "context handle does not belong to this runtime");
+        }
+        DefaultKnotraRuntime.PublicationServiceResult result =
+                runtime.createOrUpdatePublication(internal, key, value);
+        PublicationProvideOutcome outcome = result.outcome();
+        PublicationImpl<T> publication =
+                new PublicationImpl<>(runtime, outcome.terminalRef(), key, context);
+        return publication.change(outcome.operation(), result.settlement());
     }
 
     @Override
@@ -66,95 +74,112 @@ final class PublicationImpl<T> implements Publication<T> {
 
     @Override
     public PublicationState state() {
-        synchronized (this) {
-            refreshDisplacementLocked();
-            return state;
-        }
+        return runtime.publicationSlotObservation(slot).state();
     }
 
-    Registration<T> currentInternal() {
-        synchronized (this) {
-            refreshDisplacementLocked();
-            return state == PublicationState.PUBLISHED ? current : null;
-        }
+    String slotId() {
+        return slot.slotId;
+    }
+
+    PublicationSlotTerminalRef terminalRef() {
+        return slot;
     }
 
     @Override
     public PublicationChange<T> update(T value) {
         Objects.requireNonNull(value, "value");
-        Registration<T> replacement;
-        synchronized (this) {
-            refreshDisplacementLocked();
-            requirePublished("update");
-            replacement = runtime.replace(current, value);
-            current = (RegistrationImpl<T>) replacement;
-            return change(PublicationOperation.UPDATE, replacement, replacement);
+        while (true) {
+            DefaultKnotraRuntime.PublicationSlotObservation observation =
+                    runtime.publicationSlotObservation(slot);
+            requirePublished("update", observation.state());
+            try {
+                Settlement settlement = runtime.updatePublication(
+                        slot.slotId,
+                        observation.epoch(),
+                        observation.currentRegistrationId(),
+                        contextHandle(),
+                        key,
+                        value);
+                return change(PublicationOperation.UPDATE, settlement);
+            } catch (StalePublicationSlotException stale) {
+                // 另一个操作先线性化：锁外重读最新槽位后重试。
+            }
         }
     }
 
     @Override
     public PublicationChange<T> unpublish() {
-        synchronized (this) {
-            refreshDisplacementLocked();
-            if (state == PublicationState.UNPUBLISHED) {
-                return unpublishChange;
+        PublicationChange<T> cached = terminalUnpublishChange;
+        if (cached != null) {
+            return cached;
+        }
+        while (true) {
+            DefaultKnotraRuntime.PublicationSlotObservation observation =
+                    runtime.publicationSlotObservation(slot);
+            if (observation.state() == PublicationState.DISPLACED) {
+                throw rejection("unpublish", PublicationState.DISPLACED);
             }
-            if (state != PublicationState.PUBLISHED) {
-                throw rejection("unpublish", state);
+            if (observation.state() == PublicationState.UNPUBLISHED) {
+                // 并发 unpublish 的幂等分支：没有新的真实事务，返回已收敛的终态结果。
+                PublicationChange<T> terminal = change(
+                        PublicationOperation.UNPUBLISH,
+                        DefaultSettlement.empty(observation.lastChangedGeneration()));
+                terminalUnpublishChange = terminal;
+                return terminal;
             }
-            Settlement settlement = runtime.revoke(current);
-            current.markStale();
-            Registration<T> removed = current;
-            current = null;
-            state = PublicationState.UNPUBLISHED;
-            unpublishChange = change(PublicationOperation.UNPUBLISH, removed, settlement);
-            return unpublishChange;
+            try {
+                Settlement settlement = runtime.unpublishPublication(
+                        slot.slotId,
+                        observation.epoch(),
+                        observation.currentRegistrationId(),
+                        contextHandle(),
+                        key);
+                PublicationChange<T> change = change(
+                        PublicationOperation.UNPUBLISH, settlement);
+                terminalUnpublishChange = change;
+                return change;
+            } catch (StalePublicationSlotException stale) {
+                // 重读最新槽位：可能已 UNPUBLISHED（幂等返回）或 DISPLACED（拒绝）。
+            }
         }
     }
 
-    private void requirePublished(String operation) {
+    private ContextHandleImpl contextHandle() {
+        return (ContextHandleImpl) context;
+    }
+
+    private void requirePublished(String operation, PublicationState state) {
         if (state != PublicationState.PUBLISHED) {
             throw rejection(operation, state);
         }
     }
 
-    private TransactionRejectedException rejection(String operation, PublicationState currentState) {
+    private TransactionRejectedException rejection(
+            String operation,
+            PublicationState currentState) {
         return new TransactionRejectedException(List.of(new RuntimeDiagnostic(
                 DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
                 key.name(),
                 "publication is " + currentState + "; cannot " + operation)));
     }
 
-    private void refreshDisplacementLocked() {
-        if (state == PublicationState.PUBLISHED
-                && !runtime.hasLiveRegistration(current.registrationId())) {
-            current.markStale();
-            current = null;
-            state = PublicationState.DISPLACED;
-        }
-    }
-
     private PublicationChange<T> change(
             PublicationOperation operation,
-            Registration<T> registration,
             Settlement settlement) {
-        return new Change<>(operation, this, registration, settlement);
+        return new Change<>(operation, this, settlement);
     }
 
     private static final class Change<T> implements PublicationChange<T> {
         private final PublicationOperation operation;
         private final Publication<T> publication;
-        private final Registration<T> registration;
         private final Settlement settlement;
 
         private Change(
                 PublicationOperation operation,
                 Publication<T> publication,
-                Registration<T> registration,
                 Settlement settlement) {
             this.operation = Objects.requireNonNull(operation, "operation");
             this.publication = Objects.requireNonNull(publication, "publication");
-            this.registration = registration;
             this.settlement = Objects.requireNonNull(settlement, "settlement");
         }
 

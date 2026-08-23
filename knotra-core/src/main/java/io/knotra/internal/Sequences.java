@@ -13,6 +13,7 @@ final class Sequences {
     private static final AtomicLong REGISTRATIONS = new AtomicLong();
     private static final AtomicLong ACTIVATIONS = new AtomicLong();
     private static final AtomicLong HANDLES = new AtomicLong();
+    private static final AtomicLong PUBLICATION_SLOTS = new AtomicLong();
     private static final AtomicLong CONTEXTS = new AtomicLong();
 
     private Sequences() {
@@ -22,6 +23,9 @@ final class Sequences {
         return "registration-" + REGISTRATIONS.incrementAndGet();
     }
 
+    static String publicationSlot() {
+        return "publication-slot-" + PUBLICATION_SLOTS.incrementAndGet();
+    }
     static String activation() {
         return "activation-" + ACTIVATIONS.incrementAndGet();
     }
