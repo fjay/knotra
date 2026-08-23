@@ -72,7 +72,7 @@ final class ActivationRuntime {
         RuntimeView.RegistrationData registration = new RuntimeView.RegistrationData(
                 id,
                 key,
-                owner.contextId,
+                owner.contextId(),
                 new RuntimeView.OwnerData.Activation(activationId),
                 value,
                 new ProviderLeaseRuntime(id, pendingTime));

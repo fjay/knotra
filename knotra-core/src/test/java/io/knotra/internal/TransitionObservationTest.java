@@ -190,7 +190,9 @@ final class TransitionObservationTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         ComponentRuntime component = runtime.publishedState()
                 .index.components.get(suppressed.handleId());
-        component.suppressAutoRestart = true;
+        synchronized (runtime.coordinator) {
+            component.suppressAutoRestartLocked(true);
+        }
 
         AtomicReference<io.knotra.RegistrationHandle> edge =
                 new AtomicReference<>();
@@ -201,15 +203,17 @@ final class TransitionObservationTest {
                     "dynamic-edge",
                     componentFactory(CapabilityRequirement.dynamicOptional(optional)));
         });
-        assertFalse(component.suppressAutoRestart,
+        assertFalse(component.suppressAutoRestart(),
                 () -> publicRuntime.advanced().snapshot().toString());
 
-        component.suppressAutoRestart = true;
+        synchronized (runtime.coordinator) {
+            component.suppressAutoRestartLocked(true);
+        }
         publicRuntime.advanced().transact(transaction -> {
             transaction.revoke(edge.get());
             return null;
         });
-        assertFalse(component.suppressAutoRestart,
+        assertFalse(component.suppressAutoRestart(),
                 () -> publicRuntime.advanced().snapshot().toString());
     }
 
@@ -233,7 +237,9 @@ final class TransitionObservationTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         ComponentRuntime component = runtime.publishedState()
                 .index.components.get(suppressed.handleId());
-        component.suppressAutoRestart = true;
+        synchronized (runtime.coordinator) {
+            component.suppressAutoRestartLocked(true);
+        }
 
         MountHandle consumer = publicRuntime.advanced().transact(transaction -> transaction.mount(
                 child,
@@ -250,7 +256,7 @@ final class TransitionObservationTest {
                 .value();
         assertEquals(ComponentState.ACTIVE, provider.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        assertFalse(component.suppressAutoRestart,
+        assertFalse(component.suppressAutoRestart(),
                 () -> publicRuntime.advanced().snapshot().toString());
     }
 
@@ -340,11 +346,14 @@ final class TransitionObservationTest {
 
         ComponentRuntime component = runtime.publishedState()
                 .index.components.get(handle.handleId());
-        ActivationRuntime activation = component.current;
+        ActivationRuntime activation = component.current();
         ComponentRuntime.Reservation reservation = component.replaceTransition(
                 System.nanoTime(), "test transition");
-        component.pendingStartFailure = true;
         synchronized (runtime.coordinator) {
+            component.recordStartFailureLocked(
+                    true,
+                    component.lastStartError(),
+                    component.lastStartFailure());
             runtime.emergencyRollbackActivation(component, activation);
         }
         component.failTransition(

@@ -64,7 +64,7 @@ final class ActivationContextImpl implements ActivationContext {
         ensureOpen();
         ensureNotStale();
         Objects.requireNonNull(key, "key");
-        CapabilityRequirement requirement = activation.owner.prepared.descriptor()
+        CapabilityRequirement requirement = activation.owner.prepared().descriptor()
                 .requirement(key)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "capability is not declared by component: " + key.name()));
@@ -115,7 +115,7 @@ final class ActivationContextImpl implements ActivationContext {
                 factory,
                 config,
                 options == null
-                        ? new MountOptions(activation.owner.prepared.options().origin())
+                        ? new MountOptions(activation.owner.prepared().options().origin())
                         : options);
         return stageChild(mountId, prepared, (id, identity) ->
                 new ConfiguredMountHandleImpl<>(runtime, id, identity));
@@ -137,7 +137,7 @@ final class ActivationContextImpl implements ActivationContext {
                 factory,
                 NoConfig.INSTANCE,
                 options == null
-                        ? new MountOptions(activation.owner.prepared.options().origin())
+                        ? new MountOptions(activation.owner.prepared().options().origin())
                         : options);
         return stageChild(mountId, prepared, (id, identity) ->
                 new PlainMountHandleImpl(runtime, id, identity));
@@ -152,7 +152,7 @@ final class ActivationContextImpl implements ActivationContext {
     @Override
     public ContextInfo info() {
         ensureOpen();
-        return runtime.contextInfo(activation.owner.contextId);
+        return runtime.contextInfo(activation.owner.contextId());
     }
 
     List<ChildMountPlan> plans() {
@@ -172,7 +172,7 @@ final class ActivationContextImpl implements ActivationContext {
                 throw new IllegalArgumentException("mountId is already staged: " + mountId);
             }
         }
-        if (runtime.mountIdReserved(activation.owner.contextId, mountId)) {
+        if (runtime.mountIdReserved(activation.owner.contextId(), mountId)) {
             throw new IllegalArgumentException("mountId is already in use: " + mountId);
         }
         H handle = handleFactory.create(
@@ -181,7 +181,7 @@ final class ActivationContextImpl implements ActivationContext {
                         mountId,
                         prepared.descriptor().componentId(),
                         prepared.factoryId(),
-                        activation.owner.contextId));
+                        activation.owner.contextId()));
         childPlans.add(new ChildMountPlan(handle, mountId, prepared));
         return handle;
     }

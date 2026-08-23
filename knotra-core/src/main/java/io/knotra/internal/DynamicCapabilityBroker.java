@@ -22,7 +22,7 @@ final class DynamicCapabilityBroker {
                 return false;
             }
             RuntimeView current = state.view;
-            return current.resolve(activation.owner.contextId, key).isPresent();
+            return current.resolve(activation.owner.contextId(), key).isPresent();
         }
     }
 
@@ -40,7 +40,7 @@ final class DynamicCapabilityBroker {
             RuntimeView current = state.view;
             RuntimeView.RegistrationData registration =
                     consumerActive
-                            ? current.resolve(activation.owner.contextId, key).orElse(null)
+                            ? current.resolve(activation.owner.contextId(), key).orElse(null)
                             : null;
             ProviderLeaseRuntime leases =
                     registration == null
@@ -74,7 +74,7 @@ final class DynamicCapabilityBroker {
             PublishedKernelState state) {
         RuntimeView current = state.view;
         RuntimeView.ComponentData component =
-                current.components.get(activation.owner.handleId);
+                current.components.get(activation.owner.handleId());
         if (component == null || !activation.activationId.equals(component.currentActivationId())) {
             return false;
         }

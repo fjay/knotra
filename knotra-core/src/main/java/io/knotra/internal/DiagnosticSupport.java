@@ -51,8 +51,11 @@ final class DiagnosticSupport {
     void refresh(RuntimeView.Draft draft) {
         java.util.List<RuntimeDiagnostic> diagnostics = new java.util.ArrayList<>();
         ExecutionIndex index = runtime.publishedState().index;
+        RuntimeGraph graph = draft.graph();
+        RuntimeGraph.ResolutionCache resolutions = RuntimeGraph.resolutionCache();
         for (RuntimeView.ComponentData component : draft.components.values()) {
-            collectComponentDiagnostics(draft, component, diagnostics, index);
+            collectComponentDiagnostics(
+                    draft, graph, resolutions, component, diagnostics, index);
         }
         draft.diagnostics.clear();
         draft.diagnostics.addAll(diagnostics.stream().sorted().toList());
@@ -60,12 +63,15 @@ final class DiagnosticSupport {
 
     private void collectComponentDiagnostics(
             RuntimeView.Draft draft,
+            RuntimeGraph graph,
+            RuntimeGraph.ResolutionCache resolutions,
             RuntimeView.ComponentData component,
             java.util.List<RuntimeDiagnostic> diagnostics,
             ExecutionIndex index) {
         if (component.state() == io.knotra.ComponentState.WAITING
                 && component.goal() == io.knotra.ComponentGoal.RUNNING) {
-            collectWaitingDiagnostics(draft, component, diagnostics, index);
+            collectWaitingDiagnostics(
+                    draft, graph, resolutions, component, diagnostics, index);
         }
         if (component.state() == io.knotra.ComponentState.FAILED) {
             collectFailureDiagnostics(component, diagnostics, index);
@@ -74,6 +80,8 @@ final class DiagnosticSupport {
 
     private void collectWaitingDiagnostics(
             RuntimeView.Draft draft,
+            RuntimeGraph graph,
+            RuntimeGraph.ResolutionCache resolutions,
             RuntimeView.ComponentData component,
             java.util.List<RuntimeDiagnostic> diagnostics,
             ExecutionIndex index) {
@@ -82,7 +90,10 @@ final class DiagnosticSupport {
             if (requirement.mode() != io.knotra.CapabilityRequirement.Mode.REQUIRED) {
                 continue;
             }
-            boolean present = draft.resolve(
+            boolean present = graph.resolve(
+                    draft,
+                    java.util.Map.of(),
+                    resolutions,
                     component.contextId(),
                     requirement.key()).isPresent();
             if (!present) {
@@ -94,7 +105,7 @@ final class DiagnosticSupport {
             }
         }
         ComponentRuntime runtimeComponent = index.components.get(component.handleId());
-        if (runtimeComponent != null && runtimeComponent.blockedNonConvergent) {
+        if (runtimeComponent != null && runtimeComponent.blockedNonConvergent()) {
             diagnostics.add(new RuntimeDiagnostic(
                     DiagnosticCode.NON_CONVERGENT_RECONCILE,
                     component.handleId(),
@@ -102,12 +113,12 @@ final class DiagnosticSupport {
                             + runtime.configuration.maxReconcileIterations()
                             + " attempts"));
         }
-        if (runtimeComponent != null && runtimeComponent.suppressAutoRestart
-                && runtimeComponent.lastStartError.startsWith("binding cycle")) {
+        if (runtimeComponent != null && runtimeComponent.suppressAutoRestart()
+                && runtimeComponent.lastStartError().startsWith("binding cycle")) {
             diagnostics.add(new RuntimeDiagnostic(
                     DiagnosticCode.BINDING_CYCLE,
                     component.handleId(),
-                    runtimeComponent.lastStartError));
+                    runtimeComponent.lastStartError()));
         }
     }
 
@@ -116,21 +127,21 @@ final class DiagnosticSupport {
             java.util.List<RuntimeDiagnostic> diagnostics,
             ExecutionIndex index) {
         ComponentRuntime runtimeComponent = index.components.get(component.handleId());
-        String startError = runtimeComponent == null ? "" : runtimeComponent.lastStartError;
-        String cleanupError = runtimeComponent == null ? "" : runtimeComponent.lastCleanupError;
+        String startError = runtimeComponent == null ? "" : runtimeComponent.lastStartError();
+        String cleanupError = runtimeComponent == null ? "" : runtimeComponent.lastCleanupError();
         if (!startError.isBlank()) {
             diagnostics.add(new RuntimeDiagnostic(
                     DiagnosticCode.ACTIVATION_FAILED,
                     component.handleId(),
                     startError,
-                    runtimeComponent.lastStartFailure));
+                    runtimeComponent.lastStartFailure()));
         }
         if (!cleanupError.isBlank()) {
             diagnostics.add(new RuntimeDiagnostic(
                     DiagnosticCode.CLEANUP_FAILED,
                     component.handleId(),
                     cleanupError,
-                    runtimeComponent.lastCleanupFailure));
+                    runtimeComponent.lastCleanupFailure()));
         }
         if (startError.isBlank() && cleanupError.isBlank()) {
             diagnostics.add(new RuntimeDiagnostic(
@@ -139,7 +150,7 @@ final class DiagnosticSupport {
                     "component failed",
                     runtimeComponent == null
                             ? io.knotra.FailureInfo.EMPTY
-                            : runtimeComponent.lastStartFailure));
+                            : runtimeComponent.lastStartFailure()));
         }
     }
 

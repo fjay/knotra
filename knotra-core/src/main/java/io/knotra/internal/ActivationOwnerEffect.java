@@ -23,14 +23,14 @@ record ActivationOwnerEffect(
         if (markStale) {
             activation.markStale();
         }
-        runtime.pendingStartFailure = pendingStartFailure;
-        runtime.suppressAutoRestart = suppressAutoRestart;
-        runtime.lastStartError = lastStartError;
-        runtime.lastStartFailure = lastStartFailure;
+        runtime.recordStartFailureLocked(
+                pendingStartFailure,
+                lastStartError,
+                lastStartFailure);
+        runtime.suppressAutoRestartLocked(suppressAutoRestart);
         if (retainFailedCleanup) {
-            runtime.current = activation;
-            runtime.failedCleanup = activation;
-            runtime.requestRetry(ComponentRuntime.RetryIntent.CLEANUP);
+            runtime.retainFailedCleanupLocked(activation);
+            runtime.requestRetryLocked(ComponentRuntime.RetryIntent.CLEANUP);
         }
     }
 }

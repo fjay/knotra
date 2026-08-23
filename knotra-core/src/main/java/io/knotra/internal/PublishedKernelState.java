@@ -91,9 +91,9 @@ final class PublishedKernelState {
         view.components.forEach((handleId, data) -> {
             ComponentRuntime runtime = index.components.get(handleId);
             if (runtime == null
-                    || !handleId.equals(runtime.handleId)
-                    || !data.contextId().equals(runtime.contextId)
-                    || !data.mountId().equals(runtime.mountId)) {
+                    || !handleId.equals(runtime.handleId())
+                    || !data.contextId().equals(runtime.contextId())
+                    || !data.mountId().equals(runtime.mountId())) {
                 throw new IllegalStateException(
                         "component runtime identity mismatch: " + handleId);
             }
@@ -110,7 +110,7 @@ final class PublishedKernelState {
             ActivationRuntime runtime = index.activations.get(activationId);
             if (runtime == null
                     || !activationId.equals(runtime.activationId)
-                    || !data.handleId().equals(runtime.owner.handleId)
+                    || !data.handleId().equals(runtime.owner.handleId())
                     || index.components.get(data.handleId()) != runtime.owner) {
                 throw new IllegalStateException(
                         "activation runtime identity mismatch: " + activationId);

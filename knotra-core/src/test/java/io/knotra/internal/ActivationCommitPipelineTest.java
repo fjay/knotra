@@ -223,9 +223,9 @@ final class ActivationCommitPipelineTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         ComponentRuntime cyclicRuntime = runtime.publishedState().index.components
                 .get(cyclic.handleId());
-        assertFalse(cyclicRuntime.pendingStartFailure,
+        assertFalse(cyclicRuntime.pendingStartFailure(),
                 "cycle rejection must stay suppressed until topology changes");
-        assertTrue(cyclicRuntime.suppressAutoRestart,
+        assertTrue(cyclicRuntime.suppressAutoRestart(),
                 "cycle rejection must suppress automatic restart");
     }
 
@@ -485,13 +485,15 @@ final class ActivationCommitPipelineTest {
 
         ComponentRuntime component = runtime.publishedState()
                 .index.components.get(handle.handleId());
-        ActivationRuntime activation = component.current;
-        component.suppressAutoRestart = true;
+        ActivationRuntime activation = component.current();
+        synchronized (runtime.coordinator) {
+            component.suppressAutoRestartLocked(true);
+        }
         synchronized (runtime.coordinator) {
             runtime.emergencyRollbackActivation(component, activation);
         }
 
-        assertTrue(component.suppressAutoRestart,
+        assertTrue(component.suppressAutoRestart(),
                 "emergency rollback must not reset cycle suppression");
         assertEquals(ComponentState.FAILED, handle.state());
     }

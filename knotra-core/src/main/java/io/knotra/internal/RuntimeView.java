@@ -15,26 +15,22 @@ import io.knotra.RuntimeSnapshot;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.TreeMap;
-import java.util.stream.Collectors;
-
 
 /**
- * 已提交 Runtime 状态的不可变快照，代际由 {@code generation} 标识。
+ * Immutable committed Runtime state snapshot; the generation identifies its lineage.
  *
- * <p>{@link DefaultKnotraRuntime} 只在协调器锁内通过 {@link Draft#publishOnce} 替换整份视图，
- * 无锁读取方拿到旧快照时仍能看到一个自洽的结构组合。草稿中的暂存 Capability、子挂载和状态迁移
- * 不会影响旧代际。视图持有 Capability 值和组件合约数据，但不持有 LifecycleScope 或释放器。</p>
+ * <p>DefaultKnotraRuntime replaces the whole view through {@link Draft#publishOnce}
+ * inside the coordinator lock. Lock-free readers that retain an older snapshot therefore
+ * still see one self-consistent structural combination. Tentative capabilities, child
+ * mounts, and state transitions in a Draft never affect an older generation.</p>
  */
-final class RuntimeView {
-    // 每次成功发布整体递增；拒绝的事务复用旧视图，不产生代际。
+final class RuntimeView implements RuntimeViewReader {
+    // Every successful publish advances the whole value; rejected transactions reuse the
+    // old view and do not create a generation.
     final long generation;
     final Map<String, ContextData> contexts;
     final Map<String, RegistrationData> registrations;
@@ -69,6 +65,34 @@ final class RuntimeView {
                 Map.of(),
                 Map.of(),
                 List.of());
+    }
+
+    public long generation() {
+        return generation;
+    }
+
+    @Override
+    public Map<String, ContextData> contexts() {
+        return contexts;
+    }
+
+    @Override
+    public Map<String, RegistrationData> registrations() {
+        return registrations;
+    }
+
+    @Override
+    public Map<String, ComponentData> components() {
+        return components;
+    }
+
+    @Override
+    public Map<String, ActivationData> activations() {
+        return activations;
+    }
+
+    public List<RuntimeDiagnostic> diagnostics() {
+        return diagnostics;
     }
 
     RuntimeSnapshot snapshotWithoutScopes() {
@@ -170,348 +194,62 @@ final class RuntimeView {
         return resolve(contextId, key, Map.of());
     }
 
-    // 从当前 Context 向根解析；子 Context 中的注册先于父注册被采纳，从而形成遮蔽。
+    // Resolution walks the current Context to its root; child registrations shadow parent
+    // registrations, while tentative registrations remain level-local.
     Optional<RegistrationData> resolve(
             String contextId,
             CapabilityKey<?> key,
             Map<String, RegistrationData> tentative) {
-        String current = contextId;
-        while (current != null) {
-            // 提交前验证允许暂存注册参与解析；仍按当前层级过滤，不能跨过更近的提交注册。
-            for (RegistrationData registration : tentative.values()) {
-                if (registration.contextId().equals(current)
-                        && registration.key().equals(key)) {
-                    return Optional.of(registration);
-                }
-            }
-            RegistrationData committed = null;
-            // 事务阶段保证同一 Context 的 Capability 槽位唯一；这里保留首个候选作为已提交代际。
-            for (RegistrationData candidate : registrations.values()) {
-                if (candidate.contextId().equals(current)
-                        && candidate.key().equals(key)) {
-                    committed = candidate;
-                    break;
-                }
-            }
-            if (committed != null) {
-                return Optional.of(committed);
-            }
-            ContextData context = contexts.get(current);
-            current = context == null ? null : context.parentId();
-        }
-        return Optional.empty();
+        return RuntimeGraph.resolveDirect(this, tentative, contextId, key);
     }
 
     Map<String, BindingData> effectiveBindings(
             ComponentData component,
             Map<String, RegistrationData> tentative) {
-        Map<String, BindingData> bindings = new TreeMap<>();
-        for (CapabilityRequirement requirement : component.descriptor().sortedRequirements()) {
-            RegistrationData registration = resolve(
-                    component.contextId(),
-                    requirement.key(),
-                    tentative)
-                    .orElse(null);
-            bindings.put(
-                    requirement.key().name(),
-                    requirement.binding().equals(
-                            CapabilityRequirement.CapabilityBinding.DYNAMIC)
-                            ? new BindingData(null, false, requirement.mode(), requirement.binding())
-                            : new BindingData(
-                                    registration == null ? null : registration.registrationId(),
-                                    registration != null,
-                                    requirement.mode(),
-                                    requirement.binding()));
-        }
-        return bindings;
+        return RuntimeGraph.effectiveBindingsDirect(this, tentative, component);
     }
 
-    // 只有仍在跟踪依赖图的 Activation 参与环检测；STOPPING 的绑定已被脱离，不能继续约束新图。
     Map<String, Set<String>> dependencyGraph(Map<String, RegistrationData> tentative) {
-        Map<String, Set<String>> graph = new TreeMap<>();
-        Map<String, String> activationOwner = new HashMap<>();
-        activations.values().forEach(activation ->
-                activationOwner.put(activation.activationId(), activation.handleId()));
-
-        for (ComponentData component : components.values()) {
-            if (component.currentActivationId == null) {
-                continue;
-            }
-            ActivationData activation = activations.get(component.currentActivationId);
-            if (activation == null || !activationTracksGraph(activation.state())) {
-                continue;
-            }
-            Set<String> providers = new LinkedHashSet<>();
-            Map<String, BindingData> source = tentative.isEmpty()
-                    ? activation.bindings()
-                    : effectiveBindings(component, tentative);
-            for (CapabilityRequirement requirement :
-                    component.descriptor().sortedRequirements()) {
-                RegistrationData registration;
-                if (requirement.binding() ==
-                        CapabilityRequirement.CapabilityBinding.DYNAMIC) {
-                    registration = resolve(
-                            component.contextId(),
-                            requirement.key(),
-                            tentative)
-                            .orElse(null);
-                } else {
-                    BindingData binding = source.get(requirement.key().name());
-                    if (binding == null || !binding.present()) {
-                        continue;
-                    }
-                    registration = registrations.get(binding.registrationId());
-                    if (registration == null) {
-                        registration = tentative.values().stream()
-                                .filter(candidate -> candidate.registrationId()
-                                        .equals(binding.registrationId()))
-                                .findFirst()
-                                .orElse(null);
-                    }
-                }
-                if (registration != null
-                        && registration.owner() instanceof OwnerData.Activation owner) {
-                    String provider = activationOwner.get(owner.activationId());
-                    if (provider != null) {
-                        providers.add(provider);
-                    }
-                }
-            }
-            graph.put(component.handleId(), providers);
-        }
-        return graph;
-    }
-
-    // Tarjan 强连通分量检测；非候选图外节点忽略，因此只判定本次提交可能形成的依赖环。
-    static boolean hasCycle(Map<String, Set<String>> graph) {
-        Map<String, Integer> index = new HashMap<>();
-        Map<String, Integer> low = new HashMap<>();
-        Map<String, Boolean> onStack = new HashMap<>();
-        List<String> stack = new ArrayList<>();
-        int[] counter = new int[1];
-        for (String node : graph.keySet()) {
-            if (!index.containsKey(node) && strongConnect(
-                    node,
-                    graph,
-                    index,
-                    low,
-                    onStack,
-                    stack,
-                    counter)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean strongConnect(
-            String node,
-            Map<String, Set<String>> graph,
-            Map<String, Integer> index,
-            Map<String, Integer> low,
-            Map<String, Boolean> onStack,
-            List<String> stack,
-            int[] counter) {
-        index.put(node, counter[0]);
-        low.put(node, counter[0]);
-        counter[0]++;
-        stack.add(node);
-        onStack.put(node, true);
-        for (String provider : graph.getOrDefault(node, Set.of())) {
-            if (!graph.containsKey(provider)) {
-                continue;
-            }
-            if (!index.containsKey(provider)) {
-                if (strongConnect(provider, graph, index, low, onStack, stack, counter)) {
-                    return true;
-                }
-                low.put(node, Math.min(low.get(node), low.get(provider)));
-            } else if (Boolean.TRUE.equals(onStack.get(provider))) {
-                low.put(node, Math.min(low.get(node), index.get(provider)));
-            }
-        }
-        if (low.get(node).equals(index.get(node))) {
-            int size = 0;
-            String member;
-            do {
-                member = stack.removeLast();
-                onStack.put(member, false);
-                size++;
-            } while (!member.equals(node));
-            if (size > 1 || graph.getOrDefault(node, Set.of()).contains(node)) {
-                return true;
-            }
-        }
-        return false;
+        return RuntimeGraph.of(this, tentative).dependencyGraph(this, tentative);
     }
 
     Set<String> contextSubtree(String contextId) {
-        return contexts.values().stream()
-                .map(ContextData::contextId)
-                .filter(id -> id.equals(contextId) || isInSubtree(id, contextId))
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+        return RuntimeGraph.of(this).contextSubtree(this, contextId);
     }
 
     boolean isInSubtree(String candidate, String root) {
-        String parent = contexts.get(candidate).parentId();
-        while (parent != null) {
-            if (parent.equals(root)) {
-                return true;
-            }
-            parent = contexts.get(parent).parentId();
-        }
-        return false;
+        return RuntimeGraph.of(this).isInSubtree(candidate, root);
     }
 
-    // 父 Activation 拥有其提交的整棵子挂载树；换代时必须一起处置，不能只断开直接子节点。
     Set<String> ownershipDescendants(String handleId) {
-        Set<String> result = new LinkedHashSet<>();
-        collectOwnershipDescendants(handleId, null, result);
-        return result;
+        return RuntimeGraph.of(this).ownershipDescendants(this, handleId);
     }
 
     Set<String> ownershipDescendantsForActivation(
             String handleId,
             String ownerActivationId) {
-        Set<String> result = new LinkedHashSet<>();
-        collectOwnershipDescendants(handleId, ownerActivationId, result);
-        return result;
+        return RuntimeGraph.of(this)
+                .ownershipDescendantsForActivation(this, handleId, ownerActivationId);
     }
 
-    private void collectOwnershipDescendants(
-            String handleId,
-            String ownerActivationId,
-            Set<String> result) {
-        if (!result.add(handleId)) {
-            return;
-        }
-        ComponentData parent = components.get(handleId);
-        if (parent == null) {
-            return;
-        }
-        for (ComponentData component : components.values()) {
-            if (handleId.equals(component.parentHandleId())
-                    && (ownerActivationId == null
-                            || Objects.equals(
-                                    ownerActivationId,
-                                    component.ownerActivationId()))) {
-                collectOwnershipDescendants(
-                        component.handleId(),
-                        component.currentActivationId(),
-                        result);
-            }
-        }
-    }
-
-    // 从直接受影响组件闭包到全部传递依赖方，保证提供方释放前所有依赖方都已脱离。
     Set<String> dependentsClosure(Set<String> initial) {
-        Set<String> result = new LinkedHashSet<>(initial);
-        boolean changed = true;
-        while (changed) {
-            changed = false;
-            for (ComponentData component : components.values()) {
-                if (result.contains(component.handleId())
-                        || component.currentActivationId == null) {
-                    continue;
-                }
-                ActivationData activation = activations.get(component.currentActivationId);
-                if (activation == null || !activationTracksGraph(activation.state())) {
-                    continue;
-                }
-                boolean depends = activation.bindings.values().stream()
-                        .filter(binding -> binding.present()
-                                && binding.binding() ==
-                                        CapabilityRequirement.CapabilityBinding.PINNED)
-                        .map(BindingData::registrationId)
-                        .map(registrations::get)
-                        .filter(Objects::nonNull)
-                        .anyMatch(registration -> {
-                            if (!(registration.owner()
-                                    instanceof OwnerData.Activation owner)) {
-                                return false;
-                            }
-                            ActivationData ownerActivation =
-                                    activations.get(owner.activationId());
-                            return ownerActivation != null
-                                    && result.contains(ownerActivation.handleId());
-                        });
-                if (depends) {
-                    result.add(component.handleId());
-                    changed = true;
-                }
-            }
-        }
-        return result;
+        return RuntimeGraph.of(this).dependentsClosure(this, initial);
     }
 
     List<String> dependentsBeforeProviders(Set<String> handles) {
-        Map<String, Set<String>> graph = dependencyGraph(Map.of());
-        List<String> ordered = new ArrayList<>();
-        Set<String> visited = new HashSet<>();
-        for (String handle : handles.stream().sorted().toList()) {
-            visitDependentsFirst(handle, graph, handles, visited, ordered);
-        }
-        handles.stream()
-                .filter(handle -> !visited.contains(handle))
-                .sorted()
-                .forEach(ordered::add);
-        return ordered.stream().distinct().toList();
-    }
-
-    private void visitDependentsFirst(
-            String handle,
-            Map<String, Set<String>> graph,
-            Set<String> handles,
-            Set<String> visited,
-            List<String> ordered) {
-        if (!visited.add(handle)) {
-            return;
-        }
-        for (String provider : graph.getOrDefault(handle, Set.of())) {
-            if (!provider.equals(handle) && handles.contains(provider)) {
-                visitDependentsFirst(provider, graph, handles, visited, ordered);
-            }
-        }
-        ordered.add(handle);
+        return RuntimeGraph.of(this).dependentsBeforeProviders(this, Map.of(), handles);
     }
 
     List<String> registrationsOwnedBy(Set<String> handleIds) {
-        Set<String> activationIds = activations.values().stream()
-                .filter(activation -> handleIds.contains(activation.handleId()))
-                .map(ActivationData::activationId)
-                .collect(Collectors.toSet());
-        return registrations.values().stream()
-                .filter(registration -> registration.owner()
-                        instanceof OwnerData.Activation owner
-                        && activationIds.contains(owner.activationId()))
-                .map(RegistrationData::registrationId)
-                .sorted()
-                .toList();
+        return RuntimeGraph.of(this).registrationsOwnedBy(this, handleIds);
     }
 
     String canonicalPath(String contextId) {
-        List<String> segments = new ArrayList<>();
-        String current = contextId;
-        while (current != null) {
-            ContextData data = contexts.get(current);
-            if (data == null) {
-                break;
-            }
-            segments.add(data.name());
-            current = data.parentId();
-        }
-        if (segments.isEmpty()) {
-            return "/" + contextId;
-        }
-        StringBuilder path = new StringBuilder();
-        for (int i = segments.size() - 1; i >= 0; i--) {
-            path.append('/').append(segments.get(i));
-        }
-        return path.toString();
+        return RuntimeGraph.of(this).canonicalPath(this, contextId);
     }
 
     static boolean activationTracksGraph(ActivationState state) {
-        return state == ActivationState.STARTING || state == ActivationState.ACTIVE;
+        return RuntimeGraph.activationTracksGraph(state);
     }
 
     record ContextData(
@@ -626,24 +364,36 @@ final class RuntimeView {
         }
     }
 
-
     /**
-     * 协调器临界区内的私有可变草稿。
+     * Private mutable Draft owned by the coordinator critical section.
      *
-     * <p>草稿复制当前视图后可反复试算绑定、所有权和依赖闭包；任意校验失败都直接丢弃，
-     * 只有 {@link #publishOnce()} 才会生成新代际并替换 Runtime 的 volatile 视图。</p>
+     * <p>A Draft starts as a shallow copy of the current view and may repeatedly evaluate
+     * bindings, ownership, and dependency closures. Any validation failure discards it;
+     * only {@link #publishOnce()} creates a new generation and replaces the Runtime's
+     * volatile view.</p>
      */
-    static final class Draft {
+    static final class Draft implements RuntimeViewReader {
         final long generation;
         final Map<String, ContextData> contexts;
         final Map<String, RegistrationData> registrations;
         final Map<String, ComponentData> components;
         final Map<String, ActivationData> activations;
-        // 名称/类型身份只在仍有 live 注册或需求占用期间固定；全部释放后，允许由新
-        // ClassLoader 的同名类型重新绑定。草稿是协调器内短生命周期对象，可临时持有
-        // Class；发布后的 RuntimeView 不得保留任何 Class/ClassLoader 引用。
+        // Capability name/type identity remains fixed while a live registration or
+        // requirement occupies it; after all release, another ClassLoader may reuse the
+        // same type name. Drafts are short-lived coordinator objects and may temporarily
+        // retain Class; published RuntimeViews must not retain Class or ClassLoader.
         final Map<String, Class<?>> capabilityTypes;
         final List<RuntimeDiagnostic> diagnostics;
+
+        Draft(RuntimeView view) {
+            this.generation = view.generation;
+            this.contexts = new HashMap<>(view.contexts);
+            this.registrations = new HashMap<>(view.registrations);
+            this.components = new HashMap<>(view.components);
+            this.activations = new HashMap<>(view.activations);
+            this.capabilityTypes = liveCapabilityTypes(view);
+            this.diagnostics = new ArrayList<>(view.diagnostics);
+        }
 
         private static Map<String, Class<?>> liveCapabilityTypes(RuntimeView view) {
             Map<String, Class<?>> result = new HashMap<>();
@@ -659,77 +409,97 @@ final class RuntimeView {
             return result;
         }
 
-        Draft(RuntimeView view) {
-            this.generation = view.generation;
-            this.contexts = new HashMap<>(view.contexts);
-            this.registrations = new HashMap<>(view.registrations);
-            this.components = new HashMap<>(view.components);
-            this.activations = new HashMap<>(view.activations);
-            this.capabilityTypes = liveCapabilityTypes(view);
-            this.diagnostics = new ArrayList<>(view.diagnostics);
-    }
+        public long generation() {
+            return generation;
+        }
 
-        // 复用 RuntimeView 的不可变快照语义做图计算，保证草稿查询与最终发布使用同一解析规则。
-        RuntimeView asView() {
-            return new RuntimeView(
-                    generation,
-                    contexts,
-                    registrations,
-                    components,
-                    activations,
-                    diagnostics);
+        @Override
+        public Map<String, ContextData> contexts() {
+            return contexts;
+        }
+
+        @Override
+        public Map<String, RegistrationData> registrations() {
+            return registrations;
+        }
+
+        @Override
+        public Map<String, ComponentData> components() {
+            return components;
+        }
+
+        @Override
+        public Map<String, ActivationData> activations() {
+            return activations;
+        }
+
+        public List<RuntimeDiagnostic> diagnostics() {
+            return diagnostics;
+        }
+
+        /**
+         * Builds a graph for the Draft's current stable phase.
+         *
+         * <p>Drafts do not cache graphs. Any mutation makes every previously returned graph
+         * stale; callers must drop it and call this method again. The returned graph and
+         * its caller-supplied tentative map must also be discarded together.</p>
+         */
+        RuntimeGraph graph() {
+            return RuntimeGraph.of(this);
         }
 
         Optional<RegistrationData> resolve(String contextId, CapabilityKey<?> key) {
-            return asView().resolve(contextId, key, Map.of());
+            return RuntimeGraph.resolveDirect(this, Map.of(), contextId, key);
         }
 
         Optional<RegistrationData> resolve(
                 String contextId,
                 CapabilityKey<?> key,
                 Map<String, RegistrationData> tentative) {
-            return asView().resolve(contextId, key, tentative);
+            return RuntimeGraph.resolveDirect(this, tentative, contextId, key);
         }
 
         Map<String, BindingData> effectiveBindings(
                 ComponentData component,
                 Map<String, RegistrationData> tentative) {
-            return asView().effectiveBindings(component, tentative);
+            return RuntimeGraph.effectiveBindingsDirect(this, tentative, component);
         }
 
         Set<String> contextSubtree(String contextId) {
-            return asView().contextSubtree(contextId);
+            return graph().contextSubtree(this, contextId);
         }
 
         String canonicalPath(String contextId) {
-            return asView().canonicalPath(contextId);
+            return graph().canonicalPath(this, contextId);
         }
 
         Set<String> ownershipDescendants(String handleId) {
-            return asView().ownershipDescendants(handleId);
+            return graph().ownershipDescendants(this, handleId);
         }
 
         Set<String> ownershipDescendantsForActivation(
                 String handleId,
                 String ownerActivationId) {
-            return asView().ownershipDescendantsForActivation(
+            return graph().ownershipDescendantsForActivation(
+                    this,
                     handleId,
                     ownerActivationId);
         }
 
         Set<String> dependentsClosure(Set<String> initial) {
-            return asView().dependentsClosure(initial);
+            return graph().dependentsClosure(this, initial);
         }
 
         List<String> dependentsBeforeProviders(Set<String> handles) {
-            return asView().dependentsBeforeProviders(handles);
+            return graph().dependentsBeforeProviders(this, Map.of(), handles);
         }
 
         List<String> registrationsOwnedBy(Set<String> handleIds) {
-            return asView().registrationsOwnedBy(handleIds);
+            return graph().registrationsOwnedBy(this, handleIds);
         }
 
-        // 唯一发布点：构造不可变拷贝并推进代际；调用方随后在同一个协调器临界区替换 volatile 引用。
+        // The single publish point constructs immutable copies and advances the generation;
+        // the caller then replaces the volatile reference in the same coordinator section.
         RuntimeView publishOnce() {
             return new RuntimeView(
                     generation + 1,

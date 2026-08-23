@@ -279,7 +279,7 @@ final class TransactionRecorder implements RuntimeTransaction {
         ComponentRuntime runtimeComponent =
                 runtime.publishedState().index.components.get(handle.handleId());
         if (runtimeComponent != null) {
-            return runtimeComponent.prepared;
+            return runtimeComponent.prepared();
         }
         throw new IllegalArgumentException(
                 "component handle does not belong to this runtime");

@@ -4,6 +4,7 @@ import io.knotra.CapabilityRequirement;
 import io.knotra.ComponentGoal;
 import io.knotra.ComponentState;
 
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -23,6 +24,28 @@ final class BindingImpactAnalyzer {
             Set<String> dirty,
             ExecutableCommitPlan executable) {
         PublishedKernelState state = runtime.publishedState();
+        Phase oldPhase = Phase.of(state.view);
+        Phase nextPhase = Phase.of(draft);
+        Set<String> impacted = findChangedBindings(draft, state, nextPhase, executable);
+
+        if (!impacted.isEmpty()) {
+            Set<String> detachTargets = collectDetachTargets(draft, impacted, executable);
+            // disposeOwnershipForActivation has just mutated the Draft. Its graph and binding
+            // caches are a new stable phase; the earlier nextPhase must not be read again.
+            Phase disposalPhase = Phase.of(draft);
+            Set<String> closure = disposalPhase.graph()
+                    .dependentsClosure(draft, detachTargets);
+            runtime.detachInView(draft, closure, dirty, executable);
+        }
+
+        resetSuppressedReconcile(draft, state, oldPhase, dirty, executable);
+    }
+
+    private Set<String> findChangedBindings(
+            RuntimeView.Draft draft,
+            PublishedKernelState state,
+            Phase phase,
+            ExecutableCommitPlan executable) {
         Set<String> impacted = new LinkedHashSet<>();
         for (RuntimeView.ComponentData component : draft.components.values()) {
             if (component.currentActivationId() == null) {
@@ -42,67 +65,68 @@ final class BindingImpactAnalyzer {
                             && (component.state() == ComponentState.STOPPING
                                 || (component.state() == ComponentState.FAILED
                                     && executableRuntime != null
-                                    && executableRuntime.failedCleanup != null));
+                                    && executableRuntime.failedCleanup() != null));
             if (!tracksGraph && !cleaningForRestart) {
                 continue;
             }
             ActivationRuntime executableActivation =
                     state.index.activations.get(component.currentActivationId());
-            Map<String, RuntimeView.BindingData> previousBindings =
-                    tracksGraph || executableActivation == null
-                            ? activation.bindings()
-                            : executableActivation.bindings;
+            Map<String, RuntimeView.BindingData> previousBindings = phase.previousBindings(
+                    activation,
+                    executableActivation,
+                    tracksGraph);
             Map<String, RuntimeView.BindingData> effective =
-                    draft.effectiveBindings(component, Map.of());
-            for (CapabilityRequirement requirement
-                    : component.descriptor().sortedRequirements()) {
-                RuntimeView.BindingData old =
-                        previousBindings.get(requirement.key().name());
-                RuntimeView.BindingData next =
-                        effective.get(requirement.key().name());
-                if (!bindingIdentityEqual(old, next)) {
-                    impacted.add(component.handleId());
-                    executable.staleActivations.add(activation.activationId());
-                    break;
-                }
+                    phase.effectiveBindings(draft, component);
+            if (hasBindingIdentityChange(component, previousBindings, effective)) {
+                impacted.add(component.handleId());
+                executable.staleActivations.add(activation.activationId());
             }
         }
-        if (!impacted.isEmpty()) {
-            Set<String> detachTargets = new LinkedHashSet<>();
-            for (String handleId : impacted) {
-                RuntimeView.ComponentData component =
-                        draft.components.get(handleId);
-                if (component == null || component.currentActivationId() == null) {
-                    detachTargets.add(handleId);
-                    continue;
-                }
-                detachTargets.addAll(runtime.disposeOwnershipForActivation(
-                        draft,
-                        handleId,
-                        component.currentActivationId(),
-                        executable));
-            }
-            Set<String> closure = draft.dependentsClosure(detachTargets);
-            runtime.detachInView(draft, closure, dirty, executable);
-        }
+        return impacted;
+    }
 
-        // 曾因拓扑失败而压制的 WAITING 组件，只有在相关拓扑确实变化后才能重置重试预算。
+    private Set<String> collectDetachTargets(
+            RuntimeView.Draft draft,
+            Set<String> impacted,
+            ExecutableCommitPlan executable) {
+        Set<String> detachTargets = new LinkedHashSet<>();
+        for (String handleId : impacted) {
+            RuntimeView.ComponentData component = draft.components.get(handleId);
+            if (component == null || component.currentActivationId() == null) {
+                detachTargets.add(handleId);
+                continue;
+            }
+            detachTargets.addAll(runtime.disposeOwnershipForActivation(
+                    draft,
+                    handleId,
+                    component.currentActivationId(),
+                    executable));
+        }
+        return detachTargets;
+    }
+
+    private void resetSuppressedReconcile(
+            RuntimeView.Draft draft,
+            PublishedKernelState state,
+            Phase oldPhase,
+            Set<String> dirty,
+            ExecutableCommitPlan executable) {
         RuntimeView old = state.view;
-        boolean dynamicTopologyChanged = !globalDynamicDependencyFingerprint(old)
-                .equals(globalDynamicDependencyFingerprint(draft.asView()));
+        // detachInView is another mutation. Rebuild once for this final read-only phase.
+        Phase resetPhase = Phase.of(draft);
+        boolean dynamicTopologyChanged = !oldPhase.dynamicDependencyEdges(old)
+                .equals(resetPhase.dynamicDependencyEdges(draft));
         for (RuntimeView.ComponentData component : draft.components.values()) {
             if (component.state() == ComponentState.WAITING
                     && component.goal() == ComponentGoal.RUNNING) {
-                RuntimeView.ComponentData previous = old.components.get(
-                        component.handleId());
+                RuntimeView.ComponentData previous = old.components.get(component.handleId());
                 boolean topologyChanged = previous == null;
                 if (!topologyChanged) {
                     Map<String, RuntimeView.BindingData> before =
-                            old.effectiveBindings(previous, Map.of());
+                            oldPhase.effectiveBindings(old, previous);
                     Map<String, RuntimeView.BindingData> after =
-                            draft.effectiveBindings(component, Map.of());
-                    topologyChanged = !bindingsEqual(before, after)
-                            || dynamicTopologyChanged;
+                            resetPhase.effectiveBindings(draft, component);
+                    topologyChanged = !bindingsEqual(before, after) || dynamicTopologyChanged;
                 }
                 if (topologyChanged) {
                     executable.resetAutoRestart.add(component.handleId());
@@ -112,38 +136,78 @@ final class BindingImpactAnalyzer {
         }
     }
 
-    // 环可能由其他组件的 DYNAMIC 边触发；指纹只记录存在的 provider owner 边。
-    private static String globalDynamicDependencyFingerprint(RuntimeView view) {
-        return view.components.values().stream()
-                .flatMap(component -> component.descriptor().sortedRequirements().stream()
-                        .filter(requirement -> requirement.binding()
-                                == CapabilityRequirement.CapabilityBinding.DYNAMIC)
-                        .map(requirement -> dynamicDependencyEdge(view, component, requirement)))
-                .filter(edge -> edge != null)
-                .sorted()
-                .collect(java.util.stream.Collectors.joining(";"));
+    private static boolean hasBindingIdentityChange(
+            RuntimeView.ComponentData component,
+            Map<String, RuntimeView.BindingData> previousBindings,
+            Map<String, RuntimeView.BindingData> effective) {
+        for (CapabilityRequirement requirement
+                : component.descriptor().sortedRequirements()) {
+            RuntimeView.BindingData old =
+                    previousBindings.get(requirement.key().name());
+            RuntimeView.BindingData next =
+                    effective.get(requirement.key().name());
+            if (!bindingIdentityEqual(old, next)) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    private static String dynamicDependencyEdge(
-            RuntimeView view,
-            RuntimeView.ComponentData component,
-            CapabilityRequirement requirement) {
-        RuntimeView.RegistrationData registration =
-                view.resolve(component.contextId(), requirement.key()).orElse(null);
-        if (registration == null) {
-            return null;
+    /**
+     * One stable Draft phase. A Phase and its caches are method-local and must be discarded
+     * after every structural mutation to the reader that produced it.
+     */
+    static final class Phase {
+        private final RuntimeGraph graph;
+        private final RuntimeGraph.ResolutionCache resolutions =
+                RuntimeGraph.resolutionCache();
+        private final Map<String, Map<String, RuntimeView.BindingData>> effectiveByHandle =
+                new HashMap<>();
+        private final Map<String, Map<String, RuntimeView.BindingData>> bindingsByActivation =
+                new HashMap<>();
+        private Set<RuntimeGraph.DynamicEdge> dynamicEdges;
+
+        private Phase(RuntimeViewReader reader) {
+            this.graph = RuntimeGraph.of(reader);
         }
-        String owner;
-        if (registration.owner() instanceof RuntimeView.OwnerData.Activation activationOwner) {
-            RuntimeView.ActivationData activation =
-                    view.activations.get(activationOwner.activationId());
-            owner = activation == null
-                    ? "activation:" + activationOwner.activationId()
-                    : "mount:" + activation.handleId();
-        } else {
-            owner = "host:" + registration.contextId();
+
+        static Phase of(RuntimeViewReader reader) {
+            return new Phase(reader);
         }
-        return requirement.key().name() + "=" + owner;
+
+        RuntimeGraph graph() {
+            return graph;
+        }
+
+        Map<String, RuntimeView.BindingData> effectiveBindings(
+                RuntimeViewReader reader,
+                RuntimeView.ComponentData component) {
+            return effectiveByHandle.computeIfAbsent(
+                    component.handleId(),
+                    ignored -> graph.effectiveBindings(
+                            reader, Map.of(), resolutions, component));
+        }
+
+        Map<String, RuntimeView.BindingData> previousBindings(
+                RuntimeView.ActivationData activation,
+                ActivationRuntime executableActivation,
+                boolean tracksGraph) {
+            if (tracksGraph || executableActivation == null) {
+                return activation.bindings();
+            }
+            return bindingsByActivation.computeIfAbsent(
+                    activation.activationId(),
+                    ignored -> executableActivation.bindings);
+        }
+
+        Set<RuntimeGraph.DynamicEdge> dynamicDependencyEdges(RuntimeViewReader reader) {
+            Set<RuntimeGraph.DynamicEdge> result = dynamicEdges;
+            if (result == null) {
+                result = graph.dynamicDependencyEdges(reader);
+                dynamicEdges = result;
+            }
+            return result;
+        }
     }
 
     static boolean bindingsEqual(
