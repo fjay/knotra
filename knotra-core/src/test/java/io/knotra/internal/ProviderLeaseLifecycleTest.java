@@ -41,7 +41,7 @@ final class ProviderLeaseLifecycleTest {
 
     @AfterEach
     void tearDown() {
-        internal.activationPostPublishEffectProbe = null;
+        internal.activationCoordinator().activationPostPublishEffectProbe = null;
         runtime.close();
     }
 
@@ -136,7 +136,7 @@ final class ProviderLeaseLifecycleTest {
         String oldRegistrationId = onlyRegistrationId();
 
         AtomicBoolean injected = new AtomicBoolean();
-        internal.activationPostPublishEffectProbe = () -> {
+        internal.activationCoordinator().activationPostPublishEffectProbe = () -> {
             if (!injected.getAndSet(true)) {
                 throw new IllegalStateException("injected effect fault");
             }
@@ -180,7 +180,7 @@ final class ProviderLeaseLifecycleTest {
         String registrationId = onlyRegistrationId();
 
         AtomicBoolean injected = new AtomicBoolean();
-        internal.activationPrepublishProbe = () -> {
+        internal.activationCoordinator().activationPrepublishProbe = () -> {
             if (!injected.getAndSet(true)) {
                 throw new IllegalStateException("injected prepublish failure");
             }
@@ -194,7 +194,7 @@ final class ProviderLeaseLifecycleTest {
         release.complete(null);
         assertEquals("v1", call.get(10, TimeUnit.SECONDS));
         assertEquals(ComponentState.FAILED, reconfigured.get(10, TimeUnit.SECONDS));
-        internal.activationPrepublishProbe = null;
+        internal.activationCoordinator().activationPrepublishProbe = null;
 
         PublishedKernelState state = internal.publishedState();
         state.validateInvariants();

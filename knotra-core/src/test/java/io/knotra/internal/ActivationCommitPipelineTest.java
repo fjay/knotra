@@ -39,13 +39,13 @@ final class ActivationCommitPipelineTest {
 
     @AfterEach
     void tearDown() {
-        runtime.activationPrepublishProbe = null;
-        runtime.activationFinalPublishProbe = null;
-        runtime.activationPostPublishEffectProbe = null;
-        runtime.transitionScheduler.transitionReservationFaultProbe = null;
-        runtime.transitionScheduler.transitionReservationProbe = null;
-        runtime.transitionPublicationProbe = null;
-        runtime.activationRollbackCommitProbe = null;
+        runtime.activationCoordinator().activationPrepublishProbe = null;
+        runtime.activationCoordinator().activationFinalPublishProbe = null;
+        runtime.activationCoordinator().activationPostPublishEffectProbe = null;
+        runtime.activationCoordinator().scheduler().transitionReservationFaultProbe = null;
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
+        runtime.activationCoordinator().transitionPublicationProbe = null;
+        runtime.activationCoordinator().activationRollbackCommitProbe = null;
         publicRuntime.close();
     }
 
@@ -59,7 +59,7 @@ final class ActivationCommitPipelineTest {
                 Collections.synchronizedList(new ArrayList<>());
         CountDownLatch startEntered = new CountDownLatch(1);
         CountDownLatch releaseStart = new CountDownLatch(1);
-        runtime.transitionPublicationProbe = () -> {
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
             PublishedKernelState state = runtime.publishedState();
             state.validateInvariants();
             generations.add(state);
@@ -134,7 +134,7 @@ final class ActivationCommitPipelineTest {
         CapabilityKey<String> key =
                 CapabilityKey.of("prepublish-capability", String.class);
         AtomicReference<String> childId = new AtomicReference<>();
-        runtime.activationPrepublishProbe = () -> {
+        runtime.activationCoordinator().activationPrepublishProbe = () -> {
             throw new IllegalStateException("injected prepublish failure");
         };
 
@@ -256,7 +256,7 @@ final class ActivationCommitPipelineTest {
         AtomicBoolean injected = new AtomicBoolean();
         CountDownLatch shadowStartEntered = new CountDownLatch(1);
         CountDownLatch releaseShadowStart = new CountDownLatch(1);
-        runtime.transitionPublicationProbe = () -> {
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
             PublishedKernelState state = runtime.publishedState();
             if (activationOwnerHandle(state, key.name()) != null
                     && !injected.getAndSet(true)) {
@@ -318,7 +318,7 @@ final class ActivationCommitPipelineTest {
         awaitState(second.handleId(), ComponentState.ACTIVE);
 
         AtomicBoolean injected = new AtomicBoolean();
-        runtime.activationFinalPublishProbe = () -> {
+        runtime.activationCoordinator().activationFinalPublishProbe = () -> {
             if (!injected.getAndSet(true)) {
                 throw new IllegalStateException("injected final publish fault");
             }
@@ -355,7 +355,7 @@ final class ActivationCommitPipelineTest {
                 CapabilityKey.of("effect-fault-capability", String.class);
         AtomicReference<String> childId = new AtomicReference<>();
         AtomicBoolean injected = new AtomicBoolean();
-        runtime.activationPostPublishEffectProbe = () -> {
+        runtime.activationCoordinator().activationPostPublishEffectProbe = () -> {
             if (!injected.getAndSet(true)) {
                 throw new IllegalStateException("injected effect fault");
             }
@@ -417,7 +417,7 @@ final class ActivationCommitPipelineTest {
         AtomicReference<CompletableFuture<ComponentState>> captured =
                 new AtomicReference<>();
         AtomicBoolean injected = new AtomicBoolean();
-        runtime.transitionScheduler.transitionReservationFaultProbe = index -> {
+        runtime.activationCoordinator().scheduler().transitionReservationFaultProbe = index -> {
             if (index == 1 && !injected.getAndSet(true)) {
                 reservationReached.countDown();
                 try {
@@ -496,11 +496,11 @@ final class ActivationCommitPipelineTest {
 
         java.util.concurrent.atomic.AtomicInteger attempts =
                 new java.util.concurrent.atomic.AtomicInteger();
-        runtime.transitionScheduler.transitionReservationProbe = () -> {
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             if (attempts.incrementAndGet() < 3) {
                 throw new IllegalStateException("injected candidate preparation failure");
             }
-            runtime.transitionScheduler.transitionReservationProbe = null;
+            runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
         };
         releaseStart.complete(null);
 

@@ -51,7 +51,7 @@ final class ActivationCandidateFactoryTest {
 
     @AfterEach
     void tearDown() {
-        runtime.transitionScheduler.transitionReservationProbe = null;
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
         releaseStart.countDown();
         publicRuntime.close();
     }
@@ -460,7 +460,7 @@ final class ActivationCandidateFactoryTest {
         ActivationRuntime activation =
                 state.index.activations.get(shadowData.currentActivationId());
         assertNotNull(activation);
-        runtime.transitionScheduler.transitionReservationProbe =
+        runtime.activationCoordinator().scheduler().transitionReservationProbe =
                 () -> reservationProbeInvoked.set(true);
         return new BlockedShadow(
                 state,

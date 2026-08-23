@@ -62,8 +62,8 @@ final class ContextCleanupIntentCommitTest {
                 .index.components.get(handle.handleId());
         assertSame(ComponentRuntime.RetryIntent.NONE, component.peekRetryIntent());
 
-        runtime.transitionPublicationProbe = () -> {
-            runtime.transitionPublicationProbe = null;
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
+            runtime.activationCoordinator().transitionPublicationProbe = null;
             assertSame(ComponentRuntime.RetryIntent.CLEANUP, component.peekRetryIntent(),
                     "cleanup retry intent must first become visible after the disposal commit");
         };

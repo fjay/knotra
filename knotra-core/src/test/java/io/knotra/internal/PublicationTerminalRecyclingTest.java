@@ -42,8 +42,8 @@ final class PublicationTerminalRecyclingTest {
 
     @AfterEach
     void tearDown() {
-        internal.transitionScheduler.transitionReservationProbe = null;
-        internal.providerLeaseRetireFaultProbe = null;
+        internal.activationCoordinator().scheduler().transitionReservationProbe = null;
+        internal.activationCoordinator().providerLeaseRetireFaultProbe = null;
         runtime.close();
     }
 
@@ -191,7 +191,7 @@ final class PublicationTerminalRecyclingTest {
                 CapabilityKey.of("prepublish-fail-slot", String.class);
         PublicationImpl<String> publication =
                 (PublicationImpl<String>) runtime.publish(key, "one").publication();
-        internal.transitionScheduler.transitionReservationProbe = () -> {
+        internal.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             throw new IllegalStateException("injected prepublish failure");
         };
         assertThrows(IllegalStateException.class, publication::unpublish);
@@ -203,7 +203,7 @@ final class PublicationTerminalRecyclingTest {
                 .get(publication.slotId()));
         internal.publishedState().validateInvariants();
 
-        internal.transitionScheduler.transitionReservationProbe = null;
+        internal.activationCoordinator().scheduler().transitionReservationProbe = null;
         publication.unpublish().awaitSettled(Duration.ofSeconds(10));
         assertEquals(PublicationState.UNPUBLISHED, publication.state());
         assertEquals(PublicationState.UNPUBLISHED,
@@ -219,7 +219,7 @@ final class PublicationTerminalRecyclingTest {
                 (PublicationImpl<String>) runtime.publish(key, "one").publication();
 
         AtomicInteger attempts = new AtomicInteger();
-        internal.providerLeaseRetireFaultProbe = index -> {
+        internal.activationCoordinator().providerLeaseRetireFaultProbe = index -> {
             if (index == 0 && attempts.getAndIncrement() == 0) {
                 throw new IllegalStateException("injected terminal retire fault");
             }

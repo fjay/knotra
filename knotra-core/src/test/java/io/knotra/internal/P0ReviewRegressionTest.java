@@ -32,9 +32,9 @@ final class P0ReviewRegressionTest {
 
     @AfterEach
     void tearDown() {
-        runtime.transitionScheduler.transitionReservationProbe = null;
-        runtime.transitionPublicationProbe = null;
-        runtime.activationRollbackCommitProbe = null;
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
+        runtime.activationCoordinator().transitionPublicationProbe = null;
+        runtime.activationCoordinator().activationRollbackCommitProbe = null;
         publicRuntime.close();
     }
 
@@ -97,7 +97,7 @@ final class P0ReviewRegressionTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
         AtomicReference<CompletableFuture<ComponentState>> observed = new AtomicReference<>();
-        runtime.transitionScheduler.transitionReservationProbe = () -> {
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             observed.set(handle.whenSettled().toCompletableFuture());
             throw new IllegalStateException("reservation commit failed");
         };
@@ -146,13 +146,13 @@ final class P0ReviewRegressionTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
         AtomicInteger publicationCalls = new AtomicInteger();
-        runtime.transitionPublicationProbe = () -> {
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
             if (publicationCalls.incrementAndGet() == 2) {
                 throw new IllegalStateException("injected activation commit failure");
             }
         };
         if (failRollbackCommit) {
-            runtime.activationRollbackCommitProbe = () -> {
+            runtime.activationCoordinator().activationRollbackCommitProbe = () -> {
                 throw new IllegalStateException("injected rollback commit failure");
             };
         }
@@ -201,7 +201,7 @@ final class P0ReviewRegressionTest {
                 .index.components.get(queued.handleId());
         ComponentRuntime.Reservation queuedReservation = queuedRuntime.reserveTransition(
                 System.nanoTime(), "test transition");
-        runtime.transitionScheduler.driveReservation(queuedReservation);
+        runtime.activationCoordinator().scheduler().driveReservation(queuedReservation);
         ExecutionException queuedFailure = assertThrows(
                 ExecutionException.class,
                 () -> queuedReservation.future().get(10, TimeUnit.SECONDS));
@@ -213,7 +213,7 @@ final class P0ReviewRegressionTest {
         ComponentRuntime.Reservation immediateReservation =
                 immediateRuntime.reserveTransition(
                         System.nanoTime(), "test transition");
-        runtime.driveTransition(immediateRuntime, immediateReservation.future());
+        runtime.activationCoordinator().driveTransition(immediateRuntime, immediateReservation.future());
         assertEquals(ComponentState.ACTIVE, immediateReservation.future()
                 .get(10, TimeUnit.SECONDS));
         assertTrue(immediateRuntime.noLongerOwnsTransition(immediateReservation.future()));
@@ -235,7 +235,7 @@ final class P0ReviewRegressionTest {
         handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         ComponentRuntime.Reservation reservation = component.reserveTransition(
                 System.nanoTime(), "test transition");
-        runtime.driveTransition(component, reservation.future());
+        runtime.activationCoordinator().driveTransition(component, reservation.future());
         assertEquals(ComponentState.DISPOSED, reservation.future()
                 .get(10, TimeUnit.SECONDS));
         assertTrue(component.noLongerOwnsTransition(reservation.future()));

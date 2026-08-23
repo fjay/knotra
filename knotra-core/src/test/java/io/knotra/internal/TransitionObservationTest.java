@@ -32,9 +32,9 @@ final class TransitionObservationTest {
 
     @AfterEach
     void tearDown() throws Exception {
-        runtime.transitionPublicationProbe = null;
-        runtime.transitionScheduler.transitionReservationProbe = null;
-        runtime.activationDecisionProbe = null;
+        runtime.activationCoordinator().transitionPublicationProbe = null;
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
+        runtime.activationCoordinator().activationDecisionProbe = null;
         publicRuntime.close();
     }
 
@@ -43,7 +43,7 @@ final class TransitionObservationTest {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicReference<CompletableFuture<ComponentState>> observed = new AtomicReference<>();
-        runtime.transitionPublicationProbe = () -> {
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
             MountHandleImpl handle = runtime.publishedState()
                     .index.componentHandles.values().stream()
                     .filter(candidate -> candidate.mountId().equals("observed"))
@@ -100,12 +100,12 @@ final class TransitionObservationTest {
         AtomicReference<CompletableFuture<ComponentState>> reserved =
                 new AtomicReference<>();
 
-        runtime.transitionScheduler.transitionReservationProbe = () -> {
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             reserved.set(handle.whenSettled().toCompletableFuture());
             reserveEntered.countDown();
             await(releaseReserve);
         };
-        runtime.transitionPublicationProbe = () -> {
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
             publishEntered.countDown();
             await(releasePublish);
         };
@@ -133,8 +133,8 @@ final class TransitionObservationTest {
         } finally {
             releaseReserve.countDown();
             releasePublish.countDown();
-            runtime.transitionScheduler.transitionReservationProbe = null;
-            runtime.transitionPublicationProbe = null;
+            runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
+            runtime.activationCoordinator().transitionPublicationProbe = null;
             executor.shutdown();
             assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
         }
@@ -150,7 +150,7 @@ final class TransitionObservationTest {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicReference<CompletableFuture<ComponentState>> observed = new AtomicReference<>();
-        runtime.transitionPublicationProbe = () -> {
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
             observed.set(handle.whenSettled().toCompletableFuture());
             entered.countDown();
             try {
@@ -351,11 +351,11 @@ final class TransitionObservationTest {
 
         java.util.concurrent.atomic.AtomicInteger attempts =
                 new java.util.concurrent.atomic.AtomicInteger();
-        runtime.transitionScheduler.transitionReservationProbe = () -> {
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             if (attempts.incrementAndGet() < 3) {
                 throw new IllegalStateException("injected candidate preparation failure");
             }
-            runtime.transitionScheduler.transitionReservationProbe = null;
+            runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
         };
         releaseStart.complete(null);
 

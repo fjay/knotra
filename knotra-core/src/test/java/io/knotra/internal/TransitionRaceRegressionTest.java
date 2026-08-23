@@ -44,7 +44,7 @@ final class TransitionRaceRegressionTest {
 
         CountDownLatch decisionEntered = new CountDownLatch(1);
         CountDownLatch releaseDecision = new CountDownLatch(1);
-        runtime.activationDecisionProbe = () -> {
+        runtime.activationCoordinator().activationDecisionProbe = () -> {
             decisionEntered.countDown();
             try {
                 assertTrue(releaseDecision.await(10, TimeUnit.SECONDS));
@@ -72,7 +72,7 @@ final class TransitionRaceRegressionTest {
                     .toCompletableFuture().get(10, TimeUnit.SECONDS));
         } finally {
             releaseDecision.countDown();
-            runtime.activationDecisionProbe = null;
+            runtime.activationCoordinator().activationDecisionProbe = null;
             executor.shutdown();
             assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
         }

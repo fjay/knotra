@@ -221,7 +221,7 @@ final class TransitionSchedulerTest {
                 context -> { });
         awaitActive(handle);
         AtomicReference<CompletableFuture<ComponentState>> observer = new AtomicReference<>();
-        runtime.transitionScheduler.transitionReservationProbe = () -> {
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             observer.set(handle.whenSettled().toCompletableFuture());
             throw new IllegalStateException("publish failed after reservation");
         };
@@ -238,7 +238,7 @@ final class TransitionSchedulerTest {
                 ExecutionException.class,
                 () -> pending.get(1, TimeUnit.SECONDS));
         assertTrue(failure.getCause() instanceof TransitionCancelledStateException);
-        runtime.transitionScheduler.transitionReservationProbe = null;
+        runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
     }
 
     @Test
@@ -254,7 +254,7 @@ final class TransitionSchedulerTest {
 
         ComponentRuntime.Reservation reservation =
                 component.reserveTransition(runtime.pendingTime(), "stale component");
-        runtime.transitionScheduler.drive(TransitionPlan.of(
+        runtime.activationCoordinator().scheduler().drive(TransitionPlan.of(
                 List.of(reservation),
                 List.of(component.handleId()),
                 List.of(component.handleId())));

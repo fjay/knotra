@@ -22,7 +22,7 @@ import java.util.stream.Collectors;
  * 组件过渡的预约、拓扑排序与锁外驱动器。
  *
  * <p>调度器只拥有协调器锁标识、执行器和 {@link TransitionDriver} 回调；不持有 runtime、
- * KernelStateStore 或已发布状态。结构草稿和执行索引仍由 runtime 构造/发布；本类在
+ * KernelStateStore 或已发布状态。结构草稿和执行索引仍由 ActivationCoordinator 或宿主事务构造/发布；本类在
  * coordinator 临界区内只创建可取消的 transition slot，用户状态机和 future 回调一律在锁外
  * 提交。锁顺序固定为 coordinator -> chainLock -> pendingLock。</p>
  */

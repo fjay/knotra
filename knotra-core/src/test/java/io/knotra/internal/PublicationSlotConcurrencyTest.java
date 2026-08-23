@@ -47,7 +47,7 @@ final class PublicationSlotConcurrencyTest {
 
     @AfterEach
     void tearDown() {
-        internal.providerLeaseRetireFaultProbe = null;
+        internal.activationCoordinator().providerLeaseRetireFaultProbe = null;
         runtime.close();
     }
 
@@ -356,7 +356,7 @@ final class PublicationSlotConcurrencyTest {
         initial.awaitSettled(Duration.ofSeconds(10));
 
         AtomicInteger attempts = new AtomicInteger();
-        internal.providerLeaseRetireFaultProbe = index -> {
+        internal.activationCoordinator().providerLeaseRetireFaultProbe = index -> {
             if (index == 0 && attempts.getAndIncrement() == 0) {
                 throw new IllegalStateException("injected publication retire fault");
             }

@@ -45,7 +45,7 @@ final class KernelStateInvariantTest {
     void structuralTransactionPublishesContextRegistrationAndMountTogether() throws Exception {
         CountDownLatch publicationEntered = new CountDownLatch(1);
         CountDownLatch releasePublication = new CountDownLatch(1);
-        internal.transitionPublicationProbe = () -> {
+        internal.activationCoordinator().transitionPublicationProbe = () -> {
             publicationEntered.countDown();
             try {
                 assertTrue(releasePublication.await(10, TimeUnit.SECONDS));
@@ -77,7 +77,7 @@ final class KernelStateInvariantTest {
             assertNotNull(barrier.index.components.get(barrierHandle));
             assertFalse(internal.whenSettled(barrierHandle).toCompletableFuture().isDone());
             releasePublication.countDown();
-            internal.transitionPublicationProbe = null;
+            internal.activationCoordinator().transitionPublicationProbe = null;
             while (!finished.get()) {
                 PublishedKernelState state = internal.publishedState();
                 state.validateInvariants();
@@ -115,7 +115,7 @@ final class KernelStateInvariantTest {
                     .whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS));
         } finally {
             releasePublication.countDown();
-            internal.transitionPublicationProbe = null;
+            internal.activationCoordinator().transitionPublicationProbe = null;
             executor.shutdown();
             assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
         }
@@ -338,7 +338,7 @@ final class KernelStateInvariantTest {
         assertNotNull(consumerActivation);
 
         AtomicBoolean removalPublished = new AtomicBoolean();
-        internal.transitionPublicationProbe = () -> {
+        internal.activationCoordinator().transitionPublicationProbe = () -> {
             PublishedKernelState state = internal.publishedState();
             state.validateInvariants();
             removalPublished.set(!state.view.components.containsKey(childId));
@@ -352,7 +352,7 @@ final class KernelStateInvariantTest {
                     .toCompletableFuture().get(10, TimeUnit.SECONDS));
             assertTrue(removalPublished.get());
         } finally {
-            internal.transitionPublicationProbe = null;
+            internal.activationCoordinator().transitionPublicationProbe = null;
         }
 
         PublishedKernelState after = internal.publishedState();

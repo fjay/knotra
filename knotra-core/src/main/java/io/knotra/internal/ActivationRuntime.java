@@ -11,7 +11,7 @@ import java.util.function.LongSupplier;
 /**
  * 一次组件 Activation 的内核侧执行状态。
  *
- * <p>对象由 {@link DefaultKnotraRuntime} 在协调器锁内创建，并被所属的
+ * <p>对象由 {@link ActivationCoordinator} 在协调器锁内创建，并被所属的
  * {@link ComponentRuntime} 以 {@code current} 或 {@code failedCleanup} 引用。它在启动前捕获
  * 固定的 {@link RuntimeView.BindingData}，用户 {@code start()} 期间产生的 Capability 注册和子挂载先
  * 保存在这里，提交验证成功后才进入 {@link RuntimeView}。{@link LifecycleScopeImpl} 的根作用域

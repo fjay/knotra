@@ -33,8 +33,8 @@ final class TransitionCompletionReentryTest {
 
     @AfterEach
     void tearDown() {
-        runtime.activationPostPublishEffectProbe = null;
-        runtime.transitionPublicationProbe = null;
+        runtime.activationCoordinator().activationPostPublishEffectProbe = null;
+        runtime.activationCoordinator().transitionPublicationProbe = null;
         // RED 阶段的旧实现会把回调线程留在 chainLock 自锁上；此时不能在测试线程再等 close。
         if (callbackTransaction == null || callbackTransaction.isDone()) {
             runtime.close();
@@ -68,8 +68,8 @@ final class TransitionCompletionReentryTest {
                 gatedFactory(startEntered, releaseStart))).value();
         assertTrue(startEntered.await(10, TimeUnit.SECONDS));
         attachReenteringCallback(handle, "failed-finish-callback", true);
-        runtime.activationPostPublishEffectProbe = () -> {
-            runtime.activationPostPublishEffectProbe = null;
+        runtime.activationCoordinator().activationPostPublishEffectProbe = () -> {
+            runtime.activationCoordinator().activationPostPublishEffectProbe = null;
             throw new IllegalStateException("injected postpublish failure");
         };
 
@@ -84,8 +84,8 @@ final class TransitionCompletionReentryTest {
         runtime.executor.shutdown();
         AtomicReference<CompletableFuture<ComponentState>> observed =
                 new AtomicReference<>();
-        runtime.transitionPublicationProbe = () -> {
-            runtime.transitionPublicationProbe = null;
+        runtime.activationCoordinator().transitionPublicationProbe = () -> {
+            runtime.activationCoordinator().transitionPublicationProbe = null;
             MountHandleImpl pending = runtime.publishedState()
                     .index.componentHandles.values().stream()
                     .filter(candidate -> candidate.mountId().equals("rejected-transition"))

@@ -156,7 +156,7 @@ final class KernelStateStoreTest {
 
     @Test
     void staleActivationFinalPublishConvergesOriginalFuture() throws Exception {
-        internal.activationFinalPublishProbe = () ->
+        internal.activationCoordinator().activationFinalPublishProbe = () ->
                 commitUnrelatedGeneration(internal);
         try {
             MountHandle handle = runtime.advanced().transact(transaction -> transaction.mount(
@@ -179,7 +179,7 @@ final class KernelStateStoreTest {
             PublishedKernelState state = internal.publishedState();
             state.validateInvariants();
         } finally {
-            internal.activationFinalPublishProbe = null;
+            internal.activationCoordinator().activationFinalPublishProbe = null;
         }
     }
 
@@ -187,7 +187,7 @@ final class KernelStateStoreTest {
     void staleActivationFinalPublishRecoversThroughCleanupAndRetry() throws Exception {
         CountDownLatch scopeCleanup = new CountDownLatch(1);
         AtomicBoolean injected = new AtomicBoolean();
-        internal.activationFinalPublishProbe = () -> {
+        internal.activationCoordinator().activationFinalPublishProbe = () -> {
             if (!injected.getAndSet(true)) {
                 commitUnrelatedGeneration(internal);
             }
@@ -228,7 +228,7 @@ final class KernelStateStoreTest {
             assertEquals(ComponentState.ACTIVE, handle.retryAsync()
                     .toCompletableFuture().get(10, TimeUnit.SECONDS));
         } finally {
-            internal.activationFinalPublishProbe = null;
+            internal.activationCoordinator().activationFinalPublishProbe = null;
         }
     }
 
@@ -237,12 +237,12 @@ final class KernelStateStoreTest {
         CountDownLatch scopeCleanup = new CountDownLatch(1);
         AtomicBoolean staleInjected = new AtomicBoolean();
         AtomicBoolean recoveryFaulted = new AtomicBoolean();
-        internal.activationFinalPublishProbe = () -> {
+        internal.activationCoordinator().activationFinalPublishProbe = () -> {
             if (!staleInjected.getAndSet(true)) {
                 commitUnrelatedGeneration(internal);
             }
         };
-        internal.transitionScheduler.transitionReservationProbe = () -> {
+        internal.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             // 只在恢复候选构造期间注入故障，避免影响挂载事务与首候选。
             if (staleInjected.get() && !recoveryFaulted.getAndSet(true)) {
                 throw new IllegalStateException("injected recovery fault");
@@ -283,8 +283,8 @@ final class KernelStateStoreTest {
             assertTrue(runtime.advanced().pendingOperations().operations().stream()
                     .noneMatch(operation -> operation.targetId().equals(handle.handleId())));
         } finally {
-            internal.activationFinalPublishProbe = null;
-            internal.transitionScheduler.transitionReservationProbe = null;
+            internal.activationCoordinator().activationFinalPublishProbe = null;
+            internal.activationCoordinator().scheduler().transitionReservationProbe = null;
         }
     }
 
@@ -292,7 +292,7 @@ final class KernelStateStoreTest {
     void cleanupCommitFailureCompletesFutureOutsideCoordinator() throws Exception {
         ExecutorService reentry = Executors.newSingleThreadExecutor();
         AtomicBoolean injected = new AtomicBoolean();
-        internal.cleanupFinalCommitProbe = () -> {
+        internal.activationCoordinator().cleanupFinalCommitProbe = () -> {
             if (!injected.getAndSet(true)) {
                 commitUnrelatedGeneration(internal);
             }
@@ -336,7 +336,7 @@ final class KernelStateStoreTest {
                     "completion callback must not run under coordinator");
             assertNull(reentryFailure.get());
         } finally {
-            internal.cleanupFinalCommitProbe = null;
+            internal.activationCoordinator().cleanupFinalCommitProbe = null;
             reentry.shutdown();
             assertTrue(reentry.awaitTermination(10, TimeUnit.SECONDS));
         }
@@ -346,7 +346,7 @@ final class KernelStateStoreTest {
     void contextFinalizationCommitFailureCompletesOutsideCoordinator() throws Exception {
         ExecutorService reentry = Executors.newSingleThreadExecutor();
         AtomicBoolean injected = new AtomicBoolean();
-        internal.contextFinalCommitProbe = () -> {
+        internal.contextCoordinator().contextFinalCommitProbe = () -> {
             if (!injected.getAndSet(true)) {
                 commitUnrelatedGeneration(internal);
             }
@@ -390,7 +390,7 @@ final class KernelStateStoreTest {
                     "completion callback must not run under coordinator");
             assertNull(reentryFailure.get());
         } finally {
-            internal.contextFinalCommitProbe = null;
+            internal.contextCoordinator().contextFinalCommitProbe = null;
             reentry.shutdown();
             assertTrue(reentry.awaitTermination(10, TimeUnit.SECONDS));
         }

@@ -34,7 +34,7 @@ final class PostCommitRetireFaultTest {
 
     @AfterEach
     void tearDown() {
-        runtime.providerLeaseRetireFaultProbe = null;
+        runtime.activationCoordinator().providerLeaseRetireFaultProbe = null;
         publicRuntime.close();
     }
 
@@ -59,7 +59,7 @@ final class PostCommitRetireFaultTest {
         awaitActive(second);
 
         AtomicInteger attempts = new AtomicInteger();
-        runtime.providerLeaseRetireFaultProbe = index -> {
+        runtime.activationCoordinator().providerLeaseRetireFaultProbe = index -> {
             int attempt = attempts.getAndIncrement();
             if (index == 0 && attempt == 0) {
                 throw new IllegalStateException(
@@ -117,7 +117,7 @@ final class PostCommitRetireFaultTest {
         awaitActive(second);
 
         AtomicInteger attempts = new AtomicInteger();
-        runtime.providerLeaseRetireFaultProbe = index -> {
+        runtime.activationCoordinator().providerLeaseRetireFaultProbe = index -> {
             int attempt = attempts.getAndIncrement();
             if (index == 0 && attempt == 0) {
                 throw new IllegalStateException(
