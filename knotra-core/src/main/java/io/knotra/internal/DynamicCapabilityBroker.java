@@ -42,9 +42,14 @@ final class DynamicCapabilityBroker {
                     consumerActive
                             ? current.resolve(activation.owner.contextId, key).orElse(null)
                             : null;
+            ProviderLeaseRuntime leases =
+                    registration == null
+                            ? null
+                            : state.index.providerLeases.get(registration.registrationId());
             if (registration == null
-                    || registration.leases().isRetired()
-                    || !registration.leases().tryAcquire()) {
+                    || leases == null
+                    || leases.isRetired()
+                    || !leases.tryAcquire()) {
                 activation.dynamicCalls.release();
                 throw new CapabilityUnavailableException(
                         "dynamic capability is not available: " + key.name(),
@@ -52,14 +57,14 @@ final class DynamicCapabilityBroker {
             }
             Object value = registration.value();
             if (!key.type().isInstance(value)) {
-                registration.leases().release();
+                leases.release();
                 activation.dynamicCalls.release();
                 throw new IllegalStateException(
                         "capability registration type mismatch: " + key.name());
             }
             return new DynamicLease<>(
                     key.type().cast(value),
-                    registration.leases(),
+                    leases,
                     activation.dynamicCalls);
         }
     }

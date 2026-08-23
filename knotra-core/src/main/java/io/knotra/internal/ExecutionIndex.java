@@ -14,6 +14,7 @@ final class ExecutionIndex {
     final Map<String, MountHandleImpl> componentHandles;
     final Map<String, ActivationRuntime> activations;
     final Map<String, RegistrationHandleImpl> registrationHandles;
+    final Map<String, ProviderLeaseRuntime> providerLeases;
     final Map<String, ContextHandleImpl> contextHandles;
 
     ExecutionIndex(
@@ -21,16 +22,18 @@ final class ExecutionIndex {
             Map<String, MountHandleImpl> componentHandles,
             Map<String, ActivationRuntime> activations,
             Map<String, RegistrationHandleImpl> registrationHandles,
+            Map<String, ProviderLeaseRuntime> providerLeases,
             Map<String, ContextHandleImpl> contextHandles) {
         this.components = Map.copyOf(components);
         this.componentHandles = Map.copyOf(componentHandles);
         this.activations = Map.copyOf(activations);
         this.registrationHandles = Map.copyOf(registrationHandles);
+        this.providerLeases = Map.copyOf(providerLeases);
         this.contextHandles = Map.copyOf(contextHandles);
     }
 
     static ExecutionIndex empty() {
         return new ExecutionIndex(
-                Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
     }
 }

@@ -26,9 +26,11 @@ final class PublishedKernelState {
             validateInvariants();
         }
     }
+
     static PublishedKernelState initial(ContextHandleImpl root) {
         RuntimeView view = RuntimeView.initial();
         ExecutionIndex index = new ExecutionIndex(
+                Map.of(),
                 Map.of(),
                 Map.of(),
                 Map.of(),
@@ -74,6 +76,16 @@ final class PublishedKernelState {
                     || handle.runtime != owner) {
                 throw new IllegalStateException(
                         "registration handle identity mismatch: " + registrationId);
+            }
+        });
+        requireSameKeys(
+                "provider leases",
+                view.registrations.keySet(),
+                index.providerLeases.keySet());
+        view.registrations.forEach((registrationId, registration) -> {
+            if (index.providerLeases.get(registrationId) != registration.leases()) {
+                throw new IllegalStateException(
+                        "provider lease identity mismatch: " + registrationId);
             }
         });
         view.components.forEach((handleId, data) -> {

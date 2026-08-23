@@ -17,6 +17,7 @@ final class KernelStateDraft {
     private Map<String, MountHandleImpl> componentHandles;
     private Map<String, ActivationRuntime> activations;
     private Map<String, RegistrationHandleImpl> registrationHandles;
+    private Map<String, ProviderLeaseRuntime> providerLeases;
     private Map<String, ContextHandleImpl> contextHandles;
 
     KernelStateDraft(PublishedKernelState base) {
@@ -51,6 +52,13 @@ final class KernelStateDraft {
         return registrationHandles;
     }
 
+    Map<String, ProviderLeaseRuntime> providerLeases() {
+        if (providerLeases == null) {
+            providerLeases = new HashMap<>(base.index.providerLeases);
+        }
+        return providerLeases;
+    }
+
     Map<String, ContextHandleImpl> contextHandles() {
         if (contextHandles == null) {
             contextHandles = new HashMap<>(base.index.contextHandles);
@@ -59,6 +67,7 @@ final class KernelStateDraft {
     }
 
     PublishedKernelState publish(RuntimeView next) {
+        syncProviderLeases(next);
         return new PublishedKernelState(
                 next,
                 new ExecutionIndex(
@@ -70,8 +79,19 @@ final class KernelStateDraft {
                         registrationHandles == null
                                 ? base.index.registrationHandles
                                 : registrationHandles,
+                        providerLeases == null ? base.index.providerLeases : providerLeases,
                         contextHandles == null
                                 ? base.index.contextHandles
                                 : contextHandles));
+    }
+
+    private void syncProviderLeases(RuntimeView next) {
+        if (base.index.providerLeases.isEmpty() && next.registrations.isEmpty()) {
+            return;
+        }
+        Map<String, ProviderLeaseRuntime> leases = providerLeases();
+        leases.keySet().retainAll(next.registrations.keySet());
+        next.registrations.forEach((registrationId, registration) ->
+                leases.put(registrationId, registration.leases()));
     }
 }

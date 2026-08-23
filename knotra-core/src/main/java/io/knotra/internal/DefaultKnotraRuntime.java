@@ -62,6 +62,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.IntConsumer;
 import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -71,9 +72,14 @@ import java.util.stream.Stream;
  *
  * <p>已提交结构保存在 volatile 的 {@link RuntimeView} 中；所有草稿校验、代际发布和可执行索引同步
  * 都在 {@code coordinator} 临界区内完成。Factory、normalizer 和用户 {@code start()} 不持有协调器锁，因此
- * 慢用户代码只能阻塞自身 Activation，不能阻塞其他宿主事务或 Snapshot。Activation 提交前把注册和
- * 子挂载留在 {@link ActivationRuntime}，验证成功后随同一代际发布；stale 候选则回滚其 LifecycleScope，
- * 并按最新 BindingSet 重新调度。</p>
+ * 慢用户代码只能阻塞自身 Activation，不能阻塞其他宿主事务或 Snapshot。</p>
+ *
+ * <p>Activation 最终提交采用固定管线：prepublish 阶段在协调器内校验候选、冻结暂存注册与子挂载、
+ * 构造视图/索引草稿并预留 dirty 过渡（除可取消预约外不修改 live 对象）；随后把
+ * {@link ActivationCommitCandidate#nextState()} 赋给 {@code published} 作为唯一不可逆 final publish；
+ * owner/activation 效果在发布后以纯赋值显式 apply，预约驱动、lease 排空与额外调度在协调器外执行。
+ * final publish 之后的任何故障都不回滚已提交 child/registration/owner，原始过渡 future 以阶段文本
+ * 异常完成；prepublish 失败则取消本候选预约，并从最新代际构造一次 STOPPING 中止候选供清理收敛。</p>
  *
  * <p>锁顺序约定：协调器锁优先；Context 处置临界区会在协调器内再取 {@code contextFutures}；
  * 完成组件过渡时协调器可嵌套 {@link ComponentRuntime} 的过渡链锁。LifecycleScope 释放器、
@@ -97,8 +103,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             new ConcurrentHashMap<>();
     private final Map<String, ContextDisposalPending> contextDisposalPending =
             new ConcurrentHashMap<>();
-    private final Map<String, ProviderLeaseRuntime> providerLeases =
-            new ConcurrentHashMap<>();
+    private final RetiredProviderLeaseRegistry retiredProviderLeases =
+            new RetiredProviderLeaseRegistry();
     // close 先于新事务置位；失败的未来可被替换以便重试关闭，成功后复用同一结果。
     private final AtomicBoolean closing = new AtomicBoolean();
     private final AtomicReference<CompletableFuture<Void>> closeFuture =
@@ -112,11 +118,21 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     volatile Runnable activationDecisionProbe;
     // 包内测试探针：在发布前预约完成后暂停，用于构造 reserve/publish/drive 竞态。
     volatile Runnable transitionReservationProbe;
+    // 包内测试探针：在 Activation prepublish 候选构造完成后、final publish 前注入故障。
+    volatile Runnable activationPrepublishProbe;
+    // 包内测试探针：在 final publish 计算前注入故障，覆盖 nextState() 抛出的恢复路径。
+    volatile Runnable activationFinalPublishProbe;
+    // 包内测试探针：在 final publish 赋值后、效果 apply 前注入提交后效果故障。
+    volatile Runnable activationPostPublishEffectProbe;
     // 包内测试探针：在非终态视图发布后、过渡驱动前观察 whenSettled 的可见行为。
     volatile Runnable transitionPublicationProbe;
     // 包内测试探针：在 whenSettled 读取 published 后、进入 chainLock 前暂停；探针须先清空自身再阻塞。
     volatile Runnable whenSettledObservationProbe;
-    // 包内测试探针：在 Activation 回滚视图发布后、索引提交前注入提交故障。
+    // 包内测试探针：在第 N 个过渡预约创建前注入故障；参数为即将创建的预约序号。
+    volatile IntConsumer transitionReservationFaultProbe;
+    // 包内测试探针：在第 N 个已提交 provider lease retire 前注入故障。
+    volatile IntConsumer providerLeaseRetireFaultProbe;
+    // 包内测试探针：在中止候选 final publish 后注入提交后故障。
     volatile Runnable activationRollbackCommitProbe;
     private final DiagnosticSupport diagnostics = new DiagnosticSupport(this);
 
@@ -299,9 +315,11 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         long committedGeneration = 0;
         Set<String> postCommitDirty = new LinkedHashSet<>();
         Set<String> contextDisposals = new LinkedHashSet<>();
+        String postCommitFailure = null;
         List<CompletableFuture<Void>> registrationDrains = List.of();
+        Map<String, ProviderLeaseRuntime> retiredRegistrations = Map.of();
         ExecutableCommitPlan executable = new ExecutableCommitPlan();
-        List<ComponentRuntime.Reservation> reservations = List.of();
+        List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
         boolean published = false;
         RuntimeView committedView = null;
         try {
@@ -333,11 +351,12 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                                 callbackValue,
                                 DefaultSettlement.empty(state.view.generation));
                     }
-                    reservations = reserveDraftTransitions(
+                    reserveDraftTransitions(
                             draft,
                             dirty,
                             executable,
-                            indexDraft);
+                            indexDraft,
+                            reservations);
                     runTransitionReservationProbe();
                     diagnostics.refresh(draft);
                     RuntimeView next = draft.publishOnce();
@@ -345,7 +364,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     this.published = indexDraft.publish(next);
                     committedView = next;
                     published = true;
-                    registrationDrains = retireCommittedRegistrations(executable);
+                    retiredRegistrations = Map.copyOf(executable.retiredRegistrations);
                     committedGeneration = next.generation;
                     postCommitDirty.addAll(dirty);
                     contextDisposals.addAll(executable.contextDisposals);
@@ -356,7 +375,17 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             }
         } finally {
             if (published) {
-                executeReservedTransitions(reservations);
+                CommittedLeaseRetirement retirement =
+                        retireCommittedRegistrations(
+                                retiredRegistrations,
+                                "host transaction postcommit");
+                registrationDrains = retirement.drains();
+                postCommitFailure = appendPostCommitFailure(
+                        postCommitFailure,
+                        retirement.failure());
+                postCommitFailure = appendPostCommitFailure(
+                        postCommitFailure,
+                        executeReservedTransitions(reservations));
             } else {
                 completeCancelledTransitions(
                         cancelCreatedReservationFutures(reservations));
@@ -380,6 +409,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 operationSettlement.await(postCommitDirty);
         List<CompletableFuture<?>> settlements = new ArrayList<>();
         settlements.add(componentSettlement);
+        if (postCommitFailure != null) {
+            settlements.add(failedFuture(postCommitFailure));
+        }
         settlements.addAll(registrationDrains);
         for (String contextId : ContextTrees.outermostDisposals(
                 committedView, contextDisposals)) {
@@ -467,7 +499,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                                 + " activation=" + activation.activationId));
             }
         }
-        for (ProviderLeaseRuntime leases : providerLeases.values()) {
+        for (ProviderLeaseRuntime leases : retiredProviderLeases.pending()) {
             ProviderLeaseRuntime.LeaseSnapshot snapshot =
                     leases.pendingSnapshot();
             if (snapshot.retired() && snapshot.leases() > 0 && snapshot.started()) {
@@ -1339,20 +1371,58 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
-    private List<CompletableFuture<Void>> retireCommittedRegistrations(
-            ExecutableCommitPlan executable) {
-        return executable.retiredRegistrations.entrySet().stream()
-                .map(entry -> retireProviderLease(entry.getKey(), entry.getValue()))
-                .toList();
+    private CommittedLeaseRetirement retireCommittedRegistrations(
+            Map<String, ProviderLeaseRuntime> retiredRegistrations,
+            String failureScope) {
+        List<CompletableFuture<Void>> drains = new ArrayList<>();
+        String failure = null;
+        int leaseIndex = 0;
+        for (Map.Entry<String, ProviderLeaseRuntime> entry
+                : retiredRegistrations.entrySet()) {
+            try {
+                runProviderLeaseRetireFaultProbe(leaseIndex++);
+                drains.add(retireProviderLease(entry.getKey(), entry.getValue()));
+            } catch (Throwable retireError) {
+                failure = appendPostCommitFailure(failure, postCommitFailure(
+                        failureScope,
+                        "provider lease retire",
+                        retireError));
+            }
+        }
+        return new CommittedLeaseRetirement(List.copyOf(drains), failure);
+    }
+
+    private static String postCommitFailure(
+            String scope,
+            String stage,
+            Throwable error) {
+        return scope + " failed at " + stage + ": "
+                + LifecycleScopeImpl.safeError(error);
+    }
+
+    private static String appendPostCommitFailure(String current, String failure) {
+        if (failure == null || failure.isBlank()) {
+            return current;
+        }
+        return current == null ? failure : current + "; " + failure;
+    }
+
+    private record CommittedLeaseRetirement(
+            List<CompletableFuture<Void>> drains,
+            String failure) {
+    }
+
+    private void runProviderLeaseRetireFaultProbe(int leaseIndex) {
+        IntConsumer probe = providerLeaseRetireFaultProbe;
+        if (probe != null) {
+            probe.accept(leaseIndex);
+        }
     }
 
     private CompletableFuture<Void> retireProviderLease(
             String registrationId,
             ProviderLeaseRuntime leases) {
-        CompletableFuture<Void> drain = leases.retire();
-        drain.whenComplete((ignored, error) ->
-                providerLeases.remove(registrationId, leases));
-        return drain;
+        return retiredProviderLeases.retire(registrationId, leases);
     }
 
     // 在同一个协调器临界区内先更新索引草稿，再与 next 一起原子发布。
@@ -1438,25 +1508,22 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 }
             }
         }
-        next.registrations.values().forEach(registration ->
-                providerLeases.putIfAbsent(
-                        registration.registrationId(),
-                        registration.leases()));
     }
 
     // 先在协调器内按最新视图预约并合并过渡，再离开锁提交虚拟线程执行用户代码。
     List<CompletableFuture<ComponentState>> schedule(Set<String> dirty) {
-        List<ComponentRuntime.Reservation> reservations = List.of();
+        List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
         List<CompletableFuture<ComponentState>> cancelled = List.of();
         try {
             synchronized (coordinator) {
                 PublishedKernelState state = published;
                 KernelStateDraft indexDraft = new KernelStateDraft(state);
-                reservations = reserveDraftTransitions(
+                reserveDraftTransitions(
                         new RuntimeView.Draft(state.view),
                         dirty,
                         new ExecutableCommitPlan(),
-                        indexDraft);
+                        indexDraft,
+                        reservations);
                 runTransitionReservationProbe();
             }
         } catch (Throwable error) {
@@ -1473,11 +1540,13 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     // 非终态视图发布前必须先占用过渡槽；观察者因此只能挂到已预约的收敛 Future 上。
-    private List<ComponentRuntime.Reservation> reserveDraftTransitions(
+    // reservations 由调用方持有：预约中途抛出时，已创建预约对调用方的取消逻辑可见，不泄漏槽位。
+    private void reserveDraftTransitions(
             RuntimeView.Draft draft,
             Set<String> dirty,
             ExecutableCommitPlan executable,
-            KernelStateDraft indexDraft) {
+            KernelStateDraft indexDraft,
+            List<ComponentRuntime.Reservation> reservations) {
         for (MountIntent mount : executable.mounts.values()) {
             String handleId = mount.handle().handleId();
             if (!draft.components.containsKey(handleId)
@@ -1508,7 +1577,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             }
         }
 
-        List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
         for (String handleId : orderForStop(
                 draft.asView(), stopping, indexDraft.activations())) {
             RuntimeView.ComponentData data = draft.components.get(handleId);
@@ -1528,7 +1596,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     startDetail(data),
                     indexDraft);
         }
-        return reservations;
     }
 
     private String stopDetail(RuntimeView.ComponentData data) {
@@ -1555,20 +1622,49 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         ComponentRuntime runtime = executable.componentRuntimes
                 .computeIfAbsent(handleId, indexDraft.components()::get);
         if (runtime != null) {
+            runTransitionReservationFaultProbe(reservations.size());
             reservations.add(runtime.reserveTransition(pendingTime(), detail));
         }
     }
 
-    private void executeReservedTransitions(
+    private void runTransitionReservationFaultProbe(int reservationIndex) {
+        IntConsumer probe = transitionReservationFaultProbe;
+        if (probe != null) {
+            probe.accept(reservationIndex);
+        }
+    }
+
+    private String executeReservedTransitions(
             List<ComponentRuntime.Reservation> reservations) {
+        String failure = null;
         for (ComponentRuntime.Reservation reservation : reservations) {
-            if (reservation.created()) {
+            if (!reservation.created()) {
+                continue;
+            }
+            try {
                 reservation.component().executeReserved(
                         this,
                         executor,
                         reservation.future());
+            } catch (Throwable driveError) {
+                String message = postCommitFailure(
+                        "postcommit transition drive",
+                        "reservation execute",
+                        driveError);
+                failure = appendPostCommitFailure(failure, message);
+                try {
+                    reservation.component().failTransition(
+                            reservation.future(),
+                            new IllegalStateException(message));
+                } catch (Throwable completeError) {
+                    failure = appendPostCommitFailure(failure, postCommitFailure(
+                            "postcommit transition drive",
+                            "reservation failure completion",
+                            completeError));
+                }
             }
         }
+        return failure;
     }
 
     private List<CompletableFuture<ComponentState>> cancelCreatedReservationFutures(
@@ -1588,15 +1684,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         for (CompletableFuture<ComponentState> future : cancelled) {
             future.completeExceptionally(new TransitionCancelledStateException());
         }
-    }
-
-    private List<ComponentRuntime.Reservation> concatReservations(
-            List<ComponentRuntime.Reservation> first,
-            List<ComponentRuntime.Reservation> second) {
-        List<ComponentRuntime.Reservation> result =
-                new ArrayList<>(first);
-        result.addAll(second);
-        return result;
     }
 
     private List<CompletableFuture<ComponentState>> concatFutures(
@@ -1948,7 +2035,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return activation;
     }
 
-    // Activation 事务：锁外执行 start()，重新获取协调器后基于最新视图做提交或回滚裁决。
+    // Activation 事务：锁外执行 start()，重新获取协调器后按 validate -> 候选构造 ->
+    // 单一 final publish -> 提交后效果收敛。final publish 之后任何故障都不回滚已提交结构。
     private void runActivation(
             ComponentRuntime runtime,
             ActivationRuntime activation,
@@ -1972,136 +2060,99 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         activation.closed.set(true);
 
-        // 无论 start() 成功或失败都先关闭上下文，提交临界区是最后一次能消费暂存副作用的窗口。
-        PostCommitPlan postCommit;
-        CommitDecision decision;
+        // 上下文已关闭，暂存副作用不再变化；候选构造只消费冻结副本。
+        List<ChildMountPlan> frozenPlans = List.copyOf(plans);
+        Map<String, RuntimeView.RegistrationData> frozenRegistrations =
+                Map.copyOf(activation.stagedRegistrations);
+
+        ActivationCommitCandidate candidate = null;
         boolean emergencyRollback = false;
         boolean cleanupRequired = false;
-        List<ComponentRuntime.Reservation> committedReservations = List.of();
         List<CompletableFuture<ComponentState>> cancelledTransitions = List.of();
-        // 重新获取协调器后，先验证候选代际，再一次性发布注册、子挂载和组件状态。
+        String postCommitFailure = null;
+        String emergencyFailure = null;
         synchronized (coordinator) {
-            boolean firstViewPublished = false;
+            List<ComponentRuntime.Reservation> createdReservations = new ArrayList<>();
+            PublishedKernelState nextState = null;
             try {
                 PublishedKernelState state = published;
-                decision = validateActivation(
+                CommitDecision decision = validateActivation(
                         runtime,
                         activation,
-                        plans,
+                        frozenPlans,
+                        frozenRegistrations,
                         startError,
                         state);
-                RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
-                KernelStateDraft indexDraft = new KernelStateDraft(state);
-                postCommit = publishActivationDecision(
-                        draft,
+                candidate = prepareActivationCandidate(
+                        state,
                         runtime,
                         activation,
                         decision,
-                        plans);
-                precreateChildRuntimes(
-                        draft, plans, postCommit.executable(), indexDraft);
-                List<ComponentRuntime.Reservation> reservations =
-                        reserveDraftTransitions(
-                                draft,
-                                postCommit.dirty(),
-                                postCommit.executable(),
-                                indexDraft);
-                runTransitionReservationProbe();
-                committedReservations = reservations;
-                diagnostics.refresh(draft);
-                RuntimeView next = draft.publishOnce();
-                commitActivationExecutable(
-                        next,
-                        runtime,
-                        activation,
-                        decision,
-                        postCommit,
-                        indexDraft);
-                published = indexDraft.publish(next);
-                firstViewPublished = true;
-                retireCommittedRegistrations(postCommit.executable());
-                cleanupRequired = decisionCleanupRequired(runtime);
-                runTransitionPublicationProbe();
-            } catch (Throwable unexpected) {
-                // 视图一旦发布就不再换回旧代际；回滚草稿在最新代际上收敛，并保留所有 dirty 过渡。
-                cleanupRequired = true;
-                if (!firstViewPublished) {
-                    cancelledTransitions =
-                            cancelCreatedReservationFutures(committedReservations);
-                    committedReservations = List.of();
-                }
-                discardProvisionalChildren(plans);
-                activation.markStale();
-                decision = CommitDecision.commitFailed("activation commit failed: "
-                                + LifecycleScopeImpl.safeError(unexpected));
-                boolean rollbackViewPublished = false;
-                List<ComponentRuntime.Reservation> rollbackReservations = List.of();
+                        frozenPlans,
+                        frozenRegistrations,
+                        createdReservations);
+                runActivationPrepublishProbe();
+                runActivationFinalPublishProbe();
+                nextState = candidate.nextState();
+            } catch (Throwable prepublishError) {
+                // prepublish/final publish 计算失败：取消本候选已创建的预约，
+                // 不发布任何成功 child/registration。
+                cancelledTransitions =
+                        cancelCreatedReservationFutures(createdReservations);
+                String message = "activation commit failed: "
+                        + LifecycleScopeImpl.safeError(prepublishError);
                 try {
-                    PublishedKernelState rollbackState = published;
-                    RuntimeView.Draft rollback =
-                            new RuntimeView.Draft(rollbackState.view);
-                    KernelStateDraft rollbackIndex =
-                            new KernelStateDraft(rollbackState);
-                    // 首次提交可能已把临时子挂载发布进视图；回滚时必须一并撤掉。
-                    if (firstViewPublished) {
-                        for (ChildMountPlan plan : plans) {
-                            rollback.components.remove(plan.handle().handleId());
-                            rollbackIndex.components().remove(plan.handle().handleId());
-                            rollbackIndex.componentHandles().remove(plan.handle().handleId());
-                        }
-                    }
-                    postCommit = publishActivationDecision(
-                            rollback,
+                    candidate = prepareAbortedActivationCandidate(
                             runtime,
                             activation,
-                            decision,
-                            plans);
-                    rollbackReservations =
-                            reserveDraftTransitions(
-                                    rollback,
-                                    postCommit.dirty(),
-                                    postCommit.executable(),
-                                    rollbackIndex);
-                    runTransitionReservationProbe();
-                    diagnostics.refresh(rollback);
-                    RuntimeView rollbackView = rollback.publishOnce();
-                    commitActivationExecutable(
-                            rollbackView,
-                            runtime,
-                            activation,
-                            decision,
-                            postCommit,
-                            rollbackIndex);
-                    published = rollbackIndex.publish(rollbackView);
-                    rollbackViewPublished = true;
-                    committedReservations = concatReservations(
-                            committedReservations, rollbackReservations);
-                    retireCommittedRegistrations(postCommit.executable());
-                    Runnable rollbackCommitProbe = activationRollbackCommitProbe;
-                    if (rollbackCommitProbe != null) {
-                        rollbackCommitProbe.run();
-                    }
+                            frozenPlans,
+                            CommitDecision.commitFailed(message),
+                            createdReservations);
+                    nextState = candidate.nextState();
                 } catch (Throwable fatal) {
-                    if (!rollbackViewPublished) {
-                        cancelledTransitions = concatFutures(
-                                cancelledTransitions,
-                                cancelCreatedReservationFutures(rollbackReservations));
-                    }
-                    activation.markStale();
-                    runtime.pendingStartFailure = true;
-                    runtime.lastStartError = decision.message();
+                    cancelledTransitions = concatFutures(
+                            cancelledTransitions,
+                            cancelCreatedReservationFutures(createdReservations));
                     emergencyRollback = true;
                     try {
-                        emergencyRollbackActivation(runtime, activation);
-                    } catch (Throwable ignored) {
-                        // 下方的过渡 future 仍会以异常状态完成。
+                        candidate = prepareEmergencyActivationCandidate(
+                                runtime, activation, message, true);
+                        nextState = candidate.nextState();
+                    } catch (Throwable lastResort) {
+                        // 连紧急候选也无法构造/发布：保持最后已发布结构，
+                        // 下方仅以异常完成原始 future，绝不留下 pending。
+                        candidate = null;
+                        nextState = null;
+                        emergencyFailure = message + "; emergency publish failed: "
+                                + LifecycleScopeImpl.safeError(lastResort);
                     }
-                    postCommit = new PostCommitPlan(
-                            List.of(),
-                            Set.of(runtime.handleId),
-                            new ExecutableCommitPlan());
                 }
             }
+            if (candidate != null && nextState != null) {
+                // 单一 final publish：赋值即不可逆提交点，此后不得回滚已提交结构或换回旧状态。
+                published = nextState;
+                try {
+                    candidate.applyEffects(activation);
+                    runActivationPostPublishEffectProbe();
+                    cleanupRequired = decisionCleanupRequired(runtime);
+                    if (candidate.abortedCandidate()) {
+                        runActivationRollbackCommitProbe();
+                    }
+                    runTransitionPublicationProbe();
+                } catch (Throwable postpublishError) {
+                    // 已提交结构保持不变；预约在协调器外照常驱动，原始 future 异常完成。
+                    postCommitFailure = "activation postcommit failed after publish: "
+                            + LifecycleScopeImpl.safeError(postpublishError);
+                }
+            }
+        }
+        if (candidate != null) {
+            CommittedLeaseRetirement retirement = retireCommittedRegistrations(
+                    candidate.postCommitEffects().leasesToRetire(),
+                    "activation postcommit");
+            postCommitFailure = appendPostCommitFailure(
+                    postCommitFailure,
+                    retirement.failure());
         }
         completeCancelledTransitions(cancelledTransitions);
         Runnable decisionProbe = activationDecisionProbe;
@@ -2109,14 +2160,43 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             decisionProbe.run();
         }
 
-        executeReservedTransitions(committedReservations);
+        if (candidate == null) {
+            runtime.failTransition(
+                    future,
+                    new IllegalStateException(emergencyFailure));
+            return;
+        }
+
+        // 后续提交后效果若失败，lease 已登记 retired registry，结构保持 final publish。
+        postCommitFailure = appendPostCommitFailure(
+                postCommitFailure,
+                executeReservedTransitions(candidate.reservations()));
         if (emergencyRollback) {
             runtime.failTransition(
                     future,
-                    new IllegalStateException(decision.message()));
+                    new IllegalStateException(candidate.emergencyMessage()));
             return;
         }
-        scheduleAfterCommit(postCommit.dirty());
+        try {
+            scheduleAfterCommit(candidate.postCommitEffects().dirty());
+        } catch (Throwable scheduleError) {
+            postCommitFailure = postCommitFailure == null
+                    ? "activation postcommit failed at additional scheduling: "
+                            + LifecycleScopeImpl.safeError(scheduleError)
+                    : postCommitFailure + "; additional scheduling failed: "
+                            + LifecycleScopeImpl.safeError(scheduleError);
+        }
+        if (postCommitFailure != null) {
+            // 已提交结构保持不变；原始过渡 future 异常完成，不得永久 pending。
+            runtime.failTransition(
+                    future,
+                    new IllegalStateException(postCommitFailure));
+            if (cleanupRequired) {
+                finishCleanupAfterDependents(runtime, activation, future);
+            }
+            return;
+        }
+
         Runnable transitionCompletion = null;
         if (!cleanupRequired) {
             synchronized (coordinator) {
@@ -2144,44 +2224,14 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
-    // 常规回滚草稿也失败时的最后防线：保留可显式重试的失败清理，而不是留下无主 STOPPING。
+    // 常规中止候选也失败时的最后防线：FAILED 视图与 failedCleanup/retry 意图同代裁决。
     void emergencyRollbackActivation(
             ComponentRuntime runtime,
             ActivationRuntime activation) {
-        PublishedKernelState state = published;
-        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
-        KernelStateDraft indexDraft = new KernelStateDraft(state);
-        RuntimeView.ComponentData data = draft.components.get(runtime.handleId);
-        if (data != null) {
-            draft.components.put(
-                    runtime.handleId,
-                    data.withState(ComponentState.FAILED));
-        }
-        RuntimeView.ActivationData activationData =
-                draft.activations.get(activation.activationId);
-        if (activationData != null) {
-            draft.activations.put(
-                    activation.activationId,
-                    activationData.withState(ActivationState.FAILED));
-        }
-        runtime.current = activation;
-        runtime.failedCleanup = activation;
-        runtime.requestRetry(ComponentRuntime.RetryIntent.CLEANUP);
-        diagnostics.refresh(draft);
-        published = indexDraft.publish(draft.publishOnce());
-    }
-
-    // 父 Activation 失败时，未提交的临时子句柄立即转入终态，挂载 ID 可在后续代际复用。
-    private void discardProvisionalChildren(List<ChildMountPlan> plans) {
-        PublishedKernelState state = published;
-        for (ChildMountPlan plan : plans) {
-            ComponentRuntime child =
-                    state.index.components.get(plan.handle().handleId());
-            if (child != null) {
-                child.current = null;
-                child.failedCleanup = null;
-            }
-        }
+        ActivationCommitCandidate candidate = prepareEmergencyActivationCandidate(
+                runtime, activation, "emergency activation rollback", false);
+        published = candidate.nextState();
+        candidate.applyEffects(activation);
     }
 
     // 基于最新代际裁决候选；stale/配置/绑定检查排在用户 startError 之前，避免把召回误报为业务失败。
@@ -2189,6 +2239,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             ComponentRuntime runtime,
             ActivationRuntime activation,
             List<ChildMountPlan> plans,
+            Map<String, RuntimeView.RegistrationData> stagedRegistrations,
             Throwable startError,
             PublishedKernelState state) {
         RuntimeView current = state.view;
@@ -2230,14 +2281,14 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     activation.bindings.get(requirement.key().name());
             RuntimeView.BindingData effective = current.effectiveBindings(
                             data,
-                            activation.stagedRegistrations)
+                            stagedRegistrations)
                     .get(requirement.key().name());
             if (!BindingImpactAnalyzer.bindingIdentityEqual(captured, effective)) {
                 return CommitDecision.stale("binding changed: " + requirement.key().name());
             }
         }
         for (RuntimeView.RegistrationData staged
-                : activation.stagedRegistrations.values()) {
+                : stagedRegistrations.values()) {
             Class<?> existing = liveCapabilityType(
                     state,
                     staged.key().name());
@@ -2259,7 +2310,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             return CommitDecision.startFailed(childConflict);
         }
         if (RuntimeView.hasCycle(
-                current.dependencyGraph(activation.stagedRegistrations))) {
+                current.dependencyGraph(stagedRegistrations))) {
             return CommitDecision.cycleRejected("binding cycle rejected: " + runtime.handleId);
         }
         if (startError != null) {
@@ -2326,22 +2377,24 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return registrations;
     }
     // 把裁决写入草稿：成功时暂存注册、子挂载和 ACTIVE 状态同代际发布；失败时脱离并保留清理责任。
-    private PostCommitPlan publishActivationDecision(
+    // 只写草稿；owner/activation 的 live 效果由 ActivationOwnerEffect 在 final publish 后统一 apply。
+    private Set<String> publishActivationDecision(
             RuntimeView.Draft draft,
             ComponentRuntime runtime,
             ActivationRuntime activation,
             CommitDecision decision,
-            List<ChildMountPlan> plans) {
+            List<ChildMountPlan> plans,
+            Map<String, RuntimeView.RegistrationData> stagedRegistrations,
+            ExecutableCommitPlan executable) {
         RuntimeView.ComponentData data = draft.components.get(runtime.handleId);
         RuntimeView.ActivationData activationData =
                 draft.activations.get(activation.activationId);
         if (data == null || activationData == null) {
-            return new PostCommitPlan(List.of(), Set.of(), new ExecutableCommitPlan());
+            return Set.of();
         }
         if (decision.successful()) {
             // 提交成功才把暂存注册复制到已发布视图；子挂载同批进入 WAITING。
-            for (RuntimeView.RegistrationData staged
-                    : activation.stagedRegistrations.values()) {
+            for (RuntimeView.RegistrationData staged : stagedRegistrations.values()) {
                 draft.registrations.put(
                         staged.registrationId(),
                         staged);
@@ -2397,7 +2450,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 Map<String, RuntimeView.BindingData> effective =
                         draft.effectiveBindings(
                                 component,
-                                activation.stagedRegistrations);
+                                stagedRegistrations);
                 for (CapabilityRequirement requirement
                         : component.descriptor().sortedRequirements()) {
                     RuntimeView.BindingData old =
@@ -2410,7 +2463,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     }
                 }
             }
-            ExecutableCommitPlan executable = new ExecutableCommitPlan();
             Set<String> dirty = new LinkedHashSet<>();
             Set<String> detachTargets = new LinkedHashSet<>();
             for (String handleId : changed) {
@@ -2428,7 +2480,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             Set<String> closure = draft.dependentsClosure(detachTargets);
             detachInView(draft, closure, dirty, executable);
-            return new PostCommitPlan(plans, dirty, executable);
+            return dirty;
         }
 
         // 失败路径不发布暂存内容；Activation 脱离绑定后由 LifecycleScope 回滚已接受资源。
@@ -2438,9 +2490,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         draft.components.put(
                 runtime.handleId,
                 data.withState(ComponentState.STOPPING));
-        activation.markStale();
-        Set<String> dirty = new LinkedHashSet<>(Set.of(runtime.handleId));
-        return new PostCommitPlan(List.of(), dirty, new ExecutableCommitPlan());
+        return new LinkedHashSet<>(Set.of(runtime.handleId));
     }
 
     private void precreateChildRuntimes(
@@ -2463,69 +2513,216 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
-    // 与发布视图同一个索引草稿同步；stale 标记必须覆盖提交造成的所有外部消费方。
-    private void commitActivationExecutable(
-            RuntimeView next,
+    // prepublish：校验通过后的候选构造只写草稿与可取消预约，不修改 live 可变对象。
+    private ActivationCommitCandidate prepareActivationCandidate(
+            PublishedKernelState state,
             ComponentRuntime runtime,
             ActivationRuntime activation,
             CommitDecision decision,
-            PostCommitPlan postCommit,
-            KernelStateDraft indexDraft) {
-        activation.stale.set(!decision.successful() || decision.staleCandidate());
-        runtime.pendingStartFailure = !decision.successful() && !decision.staleCandidate() && !decision.suppressCycle();
-        runtime.suppressAutoRestart = decision.suppressCycle();
-        if (decision.successful() || decision.staleCandidate()) {
-            runtime.lastStartError = "";
-            runtime.lastStartFailure = FailureInfo.EMPTY;
+            List<ChildMountPlan> plans,
+            Map<String, RuntimeView.RegistrationData> stagedRegistrations,
+            List<ComponentRuntime.Reservation> createdReservations) {
+        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
+        KernelStateDraft indexDraft = new KernelStateDraft(state);
+        ExecutableCommitPlan executable = new ExecutableCommitPlan();
+        Set<String> dirty = publishActivationDecision(
+                draft, runtime, activation, decision, plans, stagedRegistrations, executable);
+        precreateChildRuntimes(draft, plans, executable, indexDraft);
+        reserveDraftTransitions(
+                draft, dirty, executable, indexDraft, createdReservations);
+        runTransitionReservationProbe();
+        diagnostics.refresh(draft);
+        applyIndexEffects(draft, indexDraft, executable, plans);
+        return new ActivationCommitCandidate(
+                draft,
+                indexDraft,
+                createdReservations,
+                ownerEffectFor(runtime, decision),
+                new ActivationPostCommitEffects(
+                        Set.copyOf(dirty),
+                        Map.copyOf(executable.retiredRegistrations)),
+                executable.staleActivations,
+                false,
+                "");
+    }
+
+    // prepublish 失败后的中止候选：从最新已发布代际构造一次 STOPPING 收敛发布。
+    private ActivationCommitCandidate prepareAbortedActivationCandidate(
+            ComponentRuntime runtime,
+            ActivationRuntime activation,
+            List<ChildMountPlan> plans,
+            CommitDecision decision,
+            List<ComponentRuntime.Reservation> createdReservations) {
+        PublishedKernelState state = published;
+        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
+        KernelStateDraft indexDraft = new KernelStateDraft(state);
+        ExecutableCommitPlan executable = new ExecutableCommitPlan();
+        Set<String> dirty = publishActivationDecision(
+                draft, runtime, activation, decision, plans, Map.of(), executable);
+        // 只驱动中止候选新建的预约；首候选已取消的预约是 no-op，不得混入驱动列表。
+        int reservationBaseline = createdReservations.size();
+        reserveDraftTransitions(
+                draft, dirty, executable, indexDraft, createdReservations);
+        runTransitionReservationProbe();
+        diagnostics.refresh(draft);
+        applyIndexEffects(draft, indexDraft, executable, List.of());
+        return new ActivationCommitCandidate(
+                draft,
+                indexDraft,
+                createdReservations.subList(
+                        reservationBaseline, createdReservations.size()),
+                ownerEffectFor(runtime, decision),
+                new ActivationPostCommitEffects(
+                        Set.copyOf(dirty),
+                        Map.copyOf(executable.retiredRegistrations)),
+                executable.staleActivations,
+                true,
+                "");
+    }
+
+    // 紧急回滚候选：FAILED 视图、failedCleanup 归属与 CLEANUP retry 意图在同一协调器裁决。
+    private ActivationCommitCandidate prepareEmergencyActivationCandidate(
+            ComponentRuntime runtime,
+            ActivationRuntime activation,
+            String message,
+            boolean fatalPath) {
+        PublishedKernelState state = published;
+        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
+        KernelStateDraft indexDraft = new KernelStateDraft(state);
+        RuntimeView.ComponentData data = draft.components.get(runtime.handleId);
+        if (data != null) {
+            draft.components.put(
+                    runtime.handleId,
+                    data.withState(ComponentState.FAILED));
+        }
+        RuntimeView.ActivationData activationData =
+                draft.activations.get(activation.activationId);
+        if (activationData != null) {
+            draft.activations.put(
+                    activation.activationId,
+                    activationData.withState(ActivationState.FAILED));
+        }
+        diagnostics.refresh(draft);
+        // 两条紧急路径都保留既有 suppressAutoRestart 语义：紧急回滚只召回清理，不重置周期抑制位。
+        ActivationOwnerEffect ownerEffect = new ActivationOwnerEffect(
+                fatalPath,
+                fatalPath || runtime.pendingStartFailure,
+                runtime.suppressAutoRestart,
+                true,
+                fatalPath ? message : runtime.lastStartError,
+                runtime.lastStartFailure);
+        return new ActivationCommitCandidate(
+                draft,
+                indexDraft,
+                List.of(),
+                ownerEffect,
+                ActivationPostCommitEffects.empty(),
+                Set.of(),
+                true,
+                message);
+    }
+
+    // owner/activation 效果在 prepublish 冻结为纯值，final publish 后统一 apply。
+    private ActivationOwnerEffect ownerEffectFor(
+            ComponentRuntime runtime,
+            CommitDecision decision) {
+        boolean successful = decision.successful();
+        boolean staleCandidate = decision.staleCandidate();
+        String lastStartError;
+        FailureInfo lastStartFailure;
+        if (successful || staleCandidate) {
+            lastStartError = "";
+            lastStartFailure = FailureInfo.EMPTY;
         } else {
-            runtime.lastStartError = decision.message();
-            if (FailureInfo.EMPTY.equals(runtime.lastStartFailure)) {
-                runtime.lastStartFailure = FailureCapture.capture(
-                        new IllegalStateException(decision.message()),
-                        FailurePhase.ACTIVATION,
-                        configuration.failureDetailPolicy(),
-                        null);
-            }
+            lastStartError = decision.message();
+            lastStartFailure = FailureInfo.EMPTY.equals(runtime.lastStartFailure)
+                    ? FailureCapture.capture(
+                            new IllegalStateException(decision.message()),
+                            FailurePhase.ACTIVATION,
+                            configuration.failureDetailPolicy(),
+                            null)
+                    : runtime.lastStartFailure;
         }
-        if (decision.successful()) {
-            activation.stagedRegistrations.forEach((registrationId, registration) ->
-                    providerLeases.putIfAbsent(
-                            registrationId,
-                            registration.leases()));
-        }
-        for (String activationId : postCommit.executable().staleActivations) {
-            ActivationRuntime impacted = indexDraft.activations().get(activationId);
-            if (impacted != null) {
-                impacted.markStale();
-            }
-        }
-        for (String handleId : postCommit.executable().removedComponents.keySet()) {
-            if (next.components.containsKey(handleId)) {
+        return new ActivationOwnerEffect(
+                !successful || staleCandidate,
+                !successful && !staleCandidate && !decision.suppressCycle(),
+                decision.suppressCycle(),
+                false,
+                lastStartError,
+                lastStartFailure);
+    }
+
+    // 索引侧效果在 prepublish 内随草稿一起构造，与视图同代发布；只操作草稿集合。
+    private void applyIndexEffects(
+            RuntimeView.Draft draft,
+            KernelStateDraft indexDraft,
+            ExecutableCommitPlan executable,
+            List<ChildMountPlan> plans) {
+        for (String handleId : executable.removedComponents.keySet()) {
+            if (draft.components.containsKey(handleId)) {
                 continue;
             }
             indexDraft.components().remove(handleId);
             indexDraft.componentHandles().remove(handleId);
         }
-        for (String registrationId : postCommit.executable().retiredRegistrations.keySet()) {
+        for (String registrationId : executable.retiredRegistrations.keySet()) {
             indexDraft.registrationHandles().remove(registrationId);
         }
-        for (ChildMountPlan plan : postCommit.children()) {
+        for (ChildMountPlan plan : plans) {
             String handleId = plan.handle().handleId();
-            if (!next.components.containsKey(handleId)) {
+            if (!draft.components.containsKey(handleId)) {
                 continue;
             }
-            ComponentRuntime child = postCommit.executable().componentRuntimes
+            ComponentRuntime child = executable.componentRuntimes
                     .computeIfAbsent(handleId, indexDraft.components()::get);
             if (child == null) {
                 child = new ComponentRuntime(
                         handleId,
-                        next.components.get(handleId).contextId(),
+                        draft.components.get(handleId).contextId(),
                         plan.mountId(),
                         plan.prepared());
-                postCommit.executable().componentRuntimes.put(handleId, child);
+                executable.componentRuntimes.put(handleId, child);
             }
             indexDraft.components().put(handleId, child);
             indexDraft.componentHandles().put(handleId, plan.handle());
+        }
+        syncProviderLeases(indexDraft, draft.registrations);
+    }
+
+    private void syncProviderLeases(
+            KernelStateDraft indexDraft,
+            Map<String, RuntimeView.RegistrationData> registrations) {
+        Map<String, ProviderLeaseRuntime> leases = indexDraft.providerLeases();
+        leases.keySet().retainAll(registrations.keySet());
+        registrations.forEach((registrationId, registration) ->
+                leases.put(registrationId, registration.leases()));
+    }
+
+
+    private void runActivationPrepublishProbe() {
+        Runnable probe = activationPrepublishProbe;
+        if (probe != null) {
+            probe.run();
+        }
+    }
+
+    private void runActivationFinalPublishProbe() {
+        Runnable probe = activationFinalPublishProbe;
+        if (probe != null) {
+            probe.run();
+        }
+    }
+
+    private void runActivationPostPublishEffectProbe() {
+        Runnable probe = activationPostPublishEffectProbe;
+        if (probe != null) {
+            probe.run();
+        }
+    }
+    private void runActivationRollbackCommitProbe() {
+        Runnable probe = activationRollbackCommitProbe;
+        if (probe != null) {
+            probe.run();
         }
     }
 
@@ -2801,8 +2998,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         Set<String> dirty;
         Set<String> subtree;
         CompletableFuture<Void> future = null;
+        String postCommitFailure = null;
         List<CompletableFuture<Void>> registrationDrains = List.of();
-        List<ComponentRuntime.Reservation> reservations = List.of();
+        Map<String, ProviderLeaseRuntime> retiredRegistrations = Map.of();
+        List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
         boolean published = false;
         try {
             synchronized (coordinator) {
@@ -2879,20 +3078,30 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         dirty.add(handleId);
                     }
                 }
-                reservations = reserveDraftTransitions(
-                        draft, dirty, executable, indexDraft);
+                reserveDraftTransitions(
+                        draft, dirty, executable, indexDraft, reservations);
                 runTransitionReservationProbe();
                 diagnostics.refresh(draft);
                 RuntimeView next = draft.publishOnce();
                 commitExecutable(next, List.of(), executable, indexDraft);
                 this.published = indexDraft.publish(next);
                 published = true;
-                registrationDrains = retireCommittedRegistrations(executable);
+                retiredRegistrations = Map.copyOf(executable.retiredRegistrations);
                 runTransitionPublicationProbe();
             }
         } finally {
             if (published) {
-                executeReservedTransitions(reservations);
+                CommittedLeaseRetirement retirement =
+                        retireCommittedRegistrations(
+                                retiredRegistrations,
+                                "context disposal postcommit");
+                registrationDrains = retirement.drains();
+                postCommitFailure = appendPostCommitFailure(
+                        postCommitFailure,
+                        retirement.failure());
+                postCommitFailure = appendPostCommitFailure(
+                        postCommitFailure,
+                        executeReservedTransitions(reservations));
             } else {
                 completeCancelledTransitions(
                         cancelCreatedReservationFutures(reservations));
@@ -2907,29 +3116,35 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         CompletableFuture<Void> contextFuture = future;
         List<CompletableFuture<?>> settlements =
                 new ArrayList<>(registrationDrains);
+        if (postCommitFailure != null) {
+            settlements.add(failedFuture(postCommitFailure));
+        }
         settlements.addAll(reservations.stream()
                 .map(ComponentRuntime.Reservation::future)
                 .toList());
         CompletableFuture<Void> settlement = CompletableFuture.allOf(
                 settlements.toArray(new CompletableFuture[0]));
+        String forcedFailure = postCommitFailure;
         settlement.whenComplete((ignored, error) ->
-                finalizeContext(subtree, contextFuture));
+                finalizeContext(subtree, contextFuture, forcedFailure));
         return future;
     }
 
     // 清理失败时保留 FAILED Context 与诊断供重试；成功时才释放名称和句柄索引。
     private void finalizeContext(
             Set<String> subtree,
-            CompletableFuture<Void> future) {
+            CompletableFuture<Void> future,
+            String postCommitFailure) {
         Runnable contextCompletion;
         synchronized (coordinator) {
             PublishedKernelState state = published;
             RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
             KernelStateDraft indexDraft = new KernelStateDraft(state);
-            boolean failed = draft.components.values().stream()
-                    .filter(component -> subtree.contains(component.contextId()))
-                    .anyMatch(component -> component.state()
-                            == ComponentState.FAILED);
+            boolean failed = postCommitFailure != null
+                    || draft.components.values().stream()
+                            .filter(component -> subtree.contains(component.contextId()))
+                            .anyMatch(component -> component.state()
+                                    == ComponentState.FAILED);
             for (String contextId : subtree) {
                 RuntimeView.ContextData data = draft.contexts.get(contextId);
                 if (data != null) {
@@ -2958,8 +3173,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             boolean finalFailed = failed;
             contextCompletion = () -> {
                 if (finalFailed) {
-                    future.completeExceptionally(
-                            new IllegalStateException("context cleanup failed"));
+                    future.completeExceptionally(new IllegalStateException(
+                            postCommitFailure == null
+                                    ? "context cleanup failed"
+                                    : postCommitFailure));
                 } else {
                     future.complete(null);
                 }
@@ -3016,7 +3233,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 ? subtreeSettlement
                 : CompletableFuture.allOf(prerequisite, subtreeSettlement);
         settlement.whenComplete((ignored, error) ->
-                finalizeContext(subtree, future));
+                finalizeContext(subtree, future, null));
         return future;
     }
 
