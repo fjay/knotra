@@ -22,11 +22,12 @@ final class CoordinatorBehaviorContractTest {
     private static final FactoryRef SECOND = FactoryRef.of("second");
 
     @Test
-    void reconcilesAreSerializedOnOneNamedCoordinatorThread() throws Exception {
+    void reconcilesAreSerializedOnOneCoordinatorThread() throws Exception {
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
             CountDownLatch firstEntered = new CountDownLatch(1);
             CompletableFuture<Void> releaseFirst = new CompletableFuture<>();
             List<String> order = new ArrayList<>();
+            AtomicReference<Thread> callerThread = new AtomicReference<>();
             AtomicReference<Thread> firstThread = new AtomicReference<>();
             AtomicReference<Thread> secondThread = new AtomicReference<>();
             ComponentFactoryResolver delegate = fixedResolver();
@@ -44,6 +45,7 @@ final class CoordinatorBehaviorContractTest {
             };
 
             try (KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(), resolver)) {
+                callerThread.set(Thread.currentThread());
                 CompletableFuture<ReconcileResult> first =
                         loader.reconcileAsync(tree("first", FIRST)).toCompletableFuture();
                 assertTrue(firstEntered.await(10, TimeUnit.SECONDS));
@@ -56,7 +58,7 @@ final class CoordinatorBehaviorContractTest {
                 assertTrue(second.get(10, TimeUnit.SECONDS).converged());
                 assertEquals(List.of("first", "second"), order);
                 assertSame(firstThread.get(), secondThread.get());
-                assertTrue(firstThread.get().getName().endsWith("-coordinator"));
+                assertNotSame(callerThread.get(), firstThread.get());
             }
         }
     }

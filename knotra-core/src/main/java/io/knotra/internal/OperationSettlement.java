@@ -4,6 +4,8 @@ import io.knotra.ComponentState;
 import io.knotra.SettlementReport;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,7 +30,25 @@ final class OperationSettlement {
     }
 
     CompletableFuture<Void> await(Set<String> initial) {
-        return awaitTransitions(new ArrayList<>(runtime.schedule(initial)));
+        return awaitTransitions(transitionsFor(initial));
+    }
+
+    private List<CompletionStage<ComponentState>> transitionsFor(Set<String> handles) {
+        List<CompletionStage<ComponentState>> transitions =
+                new ArrayList<>(runtime.schedule(handles));
+        Set<CompletableFuture<ComponentState>> seen =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        for (CompletionStage<ComponentState> transition : transitions) {
+            seen.add(transition.toCompletableFuture());
+        }
+        for (String handleId : handles) {
+            CompletableFuture<ComponentState> transition =
+                    runtime.whenSettled(handleId).toCompletableFuture();
+            if (seen.add(transition)) {
+                transitions.add(transition);
+            }
+        }
+        return transitions;
     }
 
     private CompletableFuture<Void> awaitTransitions(
@@ -48,9 +68,7 @@ final class OperationSettlement {
                     }
                     affectedMounts.addAll(next);
                     List<CompletionStage<ComponentState>> ownedTransitions =
-                            new ArrayList<>(runtime.schedule(next));
-                    next.forEach(handleId ->
-                            ownedTransitions.add(runtime.whenSettled(handleId)));
+                            new ArrayList<>(transitionsFor(next));
                     return awaitTransitions(ownedTransitions);
                 }, runtime.executor);
     }

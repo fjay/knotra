@@ -1,9 +1,11 @@
 package io.knotra.internal;
 
+import io.knotra.ComponentState;
 import io.knotra.FailureInfo;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -119,19 +121,23 @@ final class ComponentRuntime {
     void executeReserved(
             DefaultKnotraRuntime runtime,
             ExecutorService executor,
-            CompletableFuture<io.knotra.ComponentState> future) {
+            CompletableFuture<ComponentState> future) {
         synchronized (chainLock) {
             if (transition.get() != future) {
                 return;
             }
             requestedDriver.set(future);
         }
-        executor.execute(() -> runtime.driveTransition(handleId, future));
+        try {
+            executor.execute(() -> runtime.driveTransition(this, future));
+        } catch (RejectedExecutionException error) {
+            failTransition(future, new TransitionRejectedStateException(error));
+        }
     }
 
     String transitionDiagnostic() {
-        CompletableFuture<io.knotra.ComponentState> current = transition.get();
-        CompletableFuture<io.knotra.ComponentState> driver = requestedDriver.get();
+        CompletableFuture<ComponentState> current = transition.get();
+        CompletableFuture<ComponentState> driver = requestedDriver.get();
         return "slot=" + System.identityHashCode(current)
                 + "/" + (current == null ? "null" : current.isDone())
                 + " driver=" + System.identityHashCode(driver)
@@ -139,9 +145,15 @@ final class ComponentRuntime {
                 + " ownsDriver=" + (current == driver);
     }
 
-    void cancelTransition(CompletableFuture<io.knotra.ComponentState> future) {
+    boolean noLongerOwnsTransition(CompletableFuture<ComponentState> future) {
         synchronized (chainLock) {
-            transition.compareAndSet(future, null);
+            return transition.get() != future;
+        }
+    }
+
+    boolean cancelTransition(CompletableFuture<ComponentState> future) {
+        synchronized (chainLock) {
+            return transition.compareAndSet(future, null);
         }
     }
 

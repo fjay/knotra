@@ -31,6 +31,7 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
+@org.junit.jupiter.api.parallel.ResourceLock(IntegrationTestKit.INTEGRATION_COORDINATOR_LOCK)
 final class EventBusIntegrationTest {
 
     private static final Path TEST_CLASSES = Path.of("target", "test-classes");

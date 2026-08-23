@@ -22,11 +22,16 @@ import io.knotra.loader.ReconcileResult;
 import io.knotra.pf4j.ArtifactState;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@ResourceLock(IntegrationTestKit.INTEGRATION_COORDINATOR_LOCK)
 final class CrossModuleCloseIntegrationTest {
 
     private static final FactoryRef GREETING = FactoryRef.of("integration-greeting");
@@ -38,16 +43,20 @@ final class CrossModuleCloseIntegrationTest {
     private MountHandle mountBus(KnotraRuntime runtime) {
         return runtime.mount("bus", new EventBusFactory());
     }
+
     @Test
     void concurrentClosesFromAllOwnersConvergeAndStayIdempotent(
             KnotraRuntime runtime,
-            @TempDir Path pluginsRoot) throws Exception {
-        Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
+            @TempDir Path pluginsRoot) throws Throwable {
+        Pf4jArtifactAdapter adapter = null;
+        KnotraLoader loader = null;
+        Throwable testFailure = null;
         try {
+            adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             adapter.factories().resolve("integration-greeting", String.class).orElseThrow()
                     .mount(runtime.root(), "greeting", "hello");
-            KnotraLoader loader = KnotraLoader.over(
+            loader = KnotraLoader.over(
                     runtime,
                     runtime.root(),
                     Pf4jFactoryResolver.of(adapter));
@@ -57,11 +66,15 @@ final class CrossModuleCloseIntegrationTest {
             assertTrue(reconcile.converged(), () -> reconcile.diagnostics().toString());
             assertEquals(ComponentState.ACTIVE, bus.awaitSettled(Duration.ofSeconds(30)));
 
+            final Pf4jArtifactAdapter coordinatedAdapter = adapter;
+            final KnotraLoader coordinatedLoader = loader;
             try (ExecutorService executor = Executors.newFixedThreadPool(3)) {
                 CompletableFuture<Void> adapterClose = CompletableFuture.runAsync(
-                        () -> adapter.closeAsync().toCompletableFuture().join(), executor);
+                        () -> coordinatedAdapter.closeAsync().toCompletableFuture().join(),
+                        executor);
                 CompletableFuture<Void> loaderClose = CompletableFuture.runAsync(
-                        () -> loader.closeAsync().toCompletableFuture().join(), executor);
+                        () -> coordinatedLoader.closeAsync().toCompletableFuture().join(),
+                        executor);
                 CompletableFuture<Void> runtimeClose = CompletableFuture.runAsync(
                         () -> runtime.closeAsync().toCompletableFuture().join(), executor);
                 CompletableFuture.allOf(adapterClose, loaderClose, runtimeClose)
@@ -74,21 +87,29 @@ final class CrossModuleCloseIntegrationTest {
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
             assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
+        } catch (Throwable failure) {
+            testFailure = failure;
         } finally {
-            adapter.close();
+            closeRemainingResources(testFailure, adapter, loader, runtime);
+        }
+        if (testFailure != null) {
+            throw testFailure;
         }
     }
 
     @Test
     void reverseOrderClosesConvergeAndRepeatedCallsAreIdempotent(
             KnotraRuntime runtime,
-            @TempDir Path pluginsRoot) throws Exception {
-        Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
+            @TempDir Path pluginsRoot) throws Throwable {
+        Pf4jArtifactAdapter adapter = null;
+        KnotraLoader loader = null;
+        Throwable testFailure = null;
         try {
+            adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             adapter.factories().resolve("integration-greeting", String.class).orElseThrow()
                     .mount(runtime.root(), "greeting", "hello");
-            KnotraLoader loader = KnotraLoader.over(
+            loader = KnotraLoader.over(
                     runtime,
                     runtime.root(),
                     Pf4jFactoryResolver.of(adapter));
@@ -105,17 +126,24 @@ final class CrossModuleCloseIntegrationTest {
             adapter.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
+        } catch (Throwable failure) {
+            testFailure = failure;
         } finally {
-            adapter.close();
+            closeRemainingResources(testFailure, adapter, loader, runtime);
+        }
+        if (testFailure != null) {
+            throw testFailure;
         }
     }
 
     @Test
     void failedArtifactCleanupRetriesOnTheNextCloseAttempt(
             KnotraRuntime runtime, @TempDir Path pluginsRoot)
-            throws Exception {
-        Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
+            throws Throwable {
+        Pf4jArtifactAdapter adapter = null;
+        Throwable testFailure = null;
         try {
+            adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             MountHandle handle = adapter.factories()
                     .resolveNoConfig("integration-failing-cleanup").orElseThrow()
@@ -137,10 +165,46 @@ final class CrossModuleCloseIntegrationTest {
             assertEquals(ComponentState.DISPOSED, handle.state());
             assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
             runtime.close();
+        } catch (Throwable failure) {
+            testFailure = failure;
         } finally {
             IntegrationCoordinator.allowCleanup();
-            adapter.close();
-            runtime.close();
+            closeRemainingResources(testFailure, adapter, runtime);
         }
+        if (testFailure != null) {
+            throw testFailure;
+        }
+    }
+
+    private static void closeRemainingResources(
+            Throwable testFailure,
+            AutoCloseable... resources) throws Throwable {
+        Throwable cleanupFailure = null;
+        for (AutoCloseable resource : resources) {
+            if (resource == null) {
+                continue;
+            }
+            try {
+                resource.close();
+            } catch (Throwable failure) {
+                cleanupFailure = appendCleanupFailure(cleanupFailure, failure);
+            }
+        }
+        if (cleanupFailure != null) {
+            if (testFailure == null) {
+                throw cleanupFailure;
+            }
+            testFailure.addSuppressed(cleanupFailure);
+        }
+    }
+
+    private static Throwable appendCleanupFailure(
+            Throwable current,
+            Throwable additional) {
+        if (current == null) {
+            return additional;
+        }
+        current.addSuppressed(additional);
+        return current;
     }
 }

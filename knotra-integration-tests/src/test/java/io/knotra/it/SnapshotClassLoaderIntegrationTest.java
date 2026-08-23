@@ -31,6 +31,7 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
+@org.junit.jupiter.api.parallel.ResourceLock(IntegrationTestKit.INTEGRATION_COORDINATOR_LOCK)
 final class SnapshotClassLoaderIntegrationTest {
 
     private static final String PLUGIN_PACKAGE = "com.example.integration.plugin.";
@@ -67,7 +68,7 @@ final class SnapshotClassLoaderIntegrationTest {
             PublicationChange<String> updated = publication.update("two");
             SettlementReport updateReport = updated.awaitSettled(Duration.ofSeconds(10));
             PublicationChange<String> unpublished = publication.unpublish();
-            unpublished.awaitSettled(Duration.ofSeconds(10));
+            SettlementReport unpublishedReport = unpublished.awaitSettled(Duration.ofSeconds(10));
             assertEquals(PublicationState.UNPUBLISHED, publication.state());
             assertTrue(publishReport.generation() < updateReport.generation());
             assertTrue(unpublished.generation() > updateReport.generation());
@@ -110,7 +111,7 @@ final class SnapshotClassLoaderIntegrationTest {
                     List.of(publishReport, updateReport),
                     List.of(pluginFailureInfo));
             RetainedGraphScanner.allowingNonPluginClasses(PLUGIN_PACKAGE)
-                    .assertPure(unpublished);
+                    .assertPure(unpublishedReport);
             assertTrue(runtimeSnapshot.mounts().stream()
                     .anyMatch(mount -> mount.mountId().equals("plugin-failure")));
             assertEquals(IntegrationTestKit.ARTIFACT_ID, artifactSnapshot.artifactId());

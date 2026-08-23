@@ -6,7 +6,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MountFactoryTest {
 
@@ -51,16 +55,69 @@ final class MountFactoryTest {
     }
 
     @Test
-    void lifecycleCleanupRunsOnlyWhenStartRegistersIt() throws Exception {
+    void checkedStartFailuresPropagateUnwrapped() throws Exception {
+        ReflectiveOperationException startFailure =
+                new ReflectiveOperationException("checked start failure");
+        MountFactory factory = MountFactory.of(
+                "factory",
+                ComponentDescriptor.named("checked-failure"),
+                context -> {
+                    throw startFailure;
+                });
+
+        ReflectiveOperationException propagated = assertThrows(
+                ReflectiveOperationException.class,
+                () -> factory.create().start(null, NoConfig.INSTANCE));
+
+        assertSame(startFailure, propagated);
+    }
+
+    @Test
+    void factoryDoesNotImplicitlyRegisterCleanup() throws Exception {
         AtomicInteger cleanups = new AtomicInteger();
         MountFactory factory = MountFactory.of(
                 "factory",
-                ComponentDescriptor.named("clean-component"),
-                context -> context.lifecycle().onClose("cleanup", cleanups::incrementAndGet));
+                ComponentDescriptor.named("unmanaged-resource"),
+                context -> {
+                    AutoCloseable unusedResource = cleanups::incrementAndGet;
+                    assertTrue(unusedResource != null);
+                });
 
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
             MountHandle handle = runtime.mount("mount", factory);
             handle.requireActive(Duration.ofSeconds(5));
+
+            RuntimeSnapshot.LifecycleScopeSnapshot lifecycle =
+                    lifecycleScope(runtime, handle);
+            assertEquals(0, lifecycle.entries().size(), () -> lifecycle.toString());
+
+            handle.close();
+        }
+
+        assertEquals(0, cleanups.get());
+    }
+
+    @Test
+    void lifecycleCleanupRunsOnlyForExplicitlyManagedResources() throws Exception {
+        AtomicInteger cleanups = new AtomicInteger();
+        MountFactory factory = MountFactory.of(
+                "factory",
+                ComponentDescriptor.named("managed-resource"),
+                context -> {
+                    AutoCloseable resource = cleanups::incrementAndGet;
+                    context.lifecycle().manage("explicit-resource", resource);
+                });
+
+        try (KnotraRuntime runtime = KnotraRuntime.create()) {
+            MountHandle handle = runtime.mount("mount", factory);
+            handle.requireActive(Duration.ofSeconds(5));
+
+            RuntimeSnapshot.LifecycleScopeSnapshot lifecycle =
+                    lifecycleScope(runtime, handle);
+            assertEquals(1, lifecycle.entries().size(), () -> lifecycle.toString());
+            assertEquals("explicit-resource", lifecycle.entries().get(0).description());
+            assertEquals(CleanupState.PENDING, lifecycle.entries().get(0).state());
+
             handle.close();
         }
 
@@ -74,7 +131,8 @@ final class MountFactoryTest {
                 "factory",
                 ComponentDescriptor.named("broken-component"),
                 context -> {
-                    context.lifecycle().onClose("explicit-cleanup", cleanups::incrementAndGet);
+                    AutoCloseable unusedResource = cleanups::incrementAndGet;
+                    assertTrue(unusedResource != null);
                     throw new IllegalStateException("intentional start failure");
                 });
 
@@ -88,6 +146,8 @@ final class MountFactoryTest {
                                     && item.targetId().equals(handle.handleId())),
                     () -> diagnostics.toString());
         }
+
+        assertEquals(0, cleanups.get());
     }
 
     @Test
@@ -111,5 +171,21 @@ final class MountFactoryTest {
             assertEquals("artifact-source", snapshot.origin().sourceId());
             assertEquals("9.8.7", snapshot.origin().version());
         }
+    }
+
+    private static RuntimeSnapshot.LifecycleScopeSnapshot lifecycleScope(
+            KnotraRuntime runtime,
+            MountHandle handle) {
+        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
+        String activationId = snapshot.mounts().stream()
+                .filter(mount -> mount.handleId().equals(handle.handleId()))
+                .findFirst()
+                .orElseThrow()
+                .currentActivationId();
+        return snapshot.lifecycleScopes().stream()
+                .filter(scope -> scope.activationId().equals(activationId))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(
+                        "missing lifecycle scope for activation " + activationId));
     }
 }

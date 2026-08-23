@@ -11,10 +11,11 @@ import io.knotra.pf4j.Pf4jArtifactAdapter;
 
 final class IntegrationTestKit {
     static final String ARTIFACT_ID = "knotra-integration-plugin";
+    static final String INTEGRATION_COORDINATOR_LOCK =
+            "integration-coordinator";
     static final io.knotra.CapabilityKey<String> VALUE =
             io.knotra.CapabilityKey.of("integration.greeting", String.class);
     static final Set<String> SHARED_CONTRACTS = Set.of("com.example.integration.contract");
-
     private IntegrationTestKit() {
     }
 

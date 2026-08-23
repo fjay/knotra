@@ -2,14 +2,48 @@ package io.knotra.it;
 
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.fail;
 
 final class RetainedGraphScanner {
+
+    private static final Set<Class<?>> SCALAR_TYPES = Set.of(
+            String.class,
+            Boolean.class,
+            Byte.class,
+            Short.class,
+            Integer.class,
+            Long.class,
+            Float.class,
+            Double.class,
+            Character.class,
+            Void.class,
+            Duration.class,
+            Instant.class,
+            LocalDate.class,
+            LocalTime.class,
+            LocalDateTime.class,
+            OffsetDateTime.class,
+            ZonedDateTime.class,
+            UUID.class);
 
     enum ClassPolicy {
         DENY_ALL,
@@ -61,11 +95,27 @@ final class RetainedGraphScanner {
             return;
         }
 
-        if (isScalar(type, value)) {
+        if (isScalar(value, type)) {
             return;
         }
         if (value instanceof Optional<?> optional) {
             scan(optional.orElse(null), seen);
+            return;
+        }
+        if (value instanceof AtomicReference<?> atomicReference) {
+            scan(atomicReference.get(), seen);
+            return;
+        }
+        if (value instanceof AtomicBoolean atomicBoolean) {
+            scan(atomicBoolean.get(), seen);
+            return;
+        }
+        if (value instanceof AtomicInteger atomicInteger) {
+            scan(atomicInteger.get(), seen);
+            return;
+        }
+        if (value instanceof AtomicLong atomicLong) {
+            scan(atomicLong.get(), seen);
             return;
         }
         if (type.isArray()) {
@@ -89,8 +139,9 @@ final class RetainedGraphScanner {
             scan(entry.getValue(), seen);
             return;
         }
-        if (type.getName().startsWith("java.")) {
-            return;
+        if (isJdkRuntimeType(type)) {
+            fail("unsupported JDK value in retained graph: " + type.getName()
+                    + "; expose its safe semantic value explicitly");
         }
         scanFields(value, type, seen);
     }
@@ -109,27 +160,29 @@ final class RetainedGraphScanner {
         for (Class<?> current = type; current != null && current != Object.class;
                 current = current.getSuperclass()) {
             for (Field field : current.getDeclaredFields()) {
-                if (field.isSynthetic()) {
+                if (Modifier.isStatic(field.getModifiers())) {
                     continue;
                 }
-                field.setAccessible(true);
                 try {
+                    field.setAccessible(true);
                     scan(field.get(value), seen);
-                } catch (ReflectiveOperationException error) {
+                } catch (ReflectiveOperationException | RuntimeException error) {
                     throw new AssertionError(
-                            "cannot inspect retained graph field " + field, error);
+                            "cannot inspect retained graph field " + field
+                                    + " of type " + field.getType().getName(),
+                            error);
                 }
             }
         }
     }
 
-    private static boolean isScalar(Class<?> type, Object value) {
-        return type.isPrimitive()
-                || value instanceof String
-                || value instanceof Number
-                || value instanceof Boolean
-                || value instanceof Character
-                || type.isEnum()
-                || value instanceof java.time.temporal.TemporalAccessor;
+    private static boolean isScalar(Object value, Class<?> type) {
+        return SCALAR_TYPES.contains(type) || value instanceof Enum<?>;
+    }
+
+    private static boolean isJdkRuntimeType(Class<?> type) {
+        String name = type.getName();
+        return name.startsWith("java.") || name.startsWith("javax.")
+                || name.startsWith("jdk.") || name.startsWith("sun.");
     }
 }

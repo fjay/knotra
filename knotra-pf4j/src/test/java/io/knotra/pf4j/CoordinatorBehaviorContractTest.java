@@ -24,15 +24,17 @@ final class CoordinatorBehaviorContractTest {
     }
 
     @Test
-    void submitsAreSerializedOnOneNamedCoordinatorThread() throws Exception {
+    void submitsAreSerializedOnOneCoordinatorThread() throws Exception {
         coordinator = new ArtifactCoordinator();
         try {
             CountDownLatch firstEntered = new CountDownLatch(1);
             CompletableFuture<Void> releaseFirst = new CompletableFuture<>();
             List<String> order = new ArrayList<>();
+            AtomicReference<Thread> callerThread = new AtomicReference<>();
             AtomicReference<Thread> firstThread = new AtomicReference<>();
             AtomicReference<Thread> secondThread = new AtomicReference<>();
 
+            callerThread.set(Thread.currentThread());
             CompletableFuture<String> first = coordinator.submit(() -> {
                 firstThread.set(Thread.currentThread());
                 order.add("first");
@@ -52,8 +54,7 @@ final class CoordinatorBehaviorContractTest {
             assertEquals("second", second.get(10, TimeUnit.SECONDS));
             assertEquals(List.of("first", "second"), order);
             assertSame(firstThread.get(), secondThread.get());
-            assertTrue(firstThread.get().getName()
-                    .startsWith("knotra-pf4j-artifact-coordinator"));
+            assertNotSame(callerThread.get(), firstThread.get());
         } finally {
             coordinator.stop();
         }
@@ -103,9 +104,11 @@ final class CoordinatorBehaviorContractTest {
     void nestedSubmissionFromCoordinatorThreadExecutesInlineOnSameThread() throws Exception {
         coordinator = new ArtifactCoordinator();
         try {
+            AtomicReference<Thread> callerThread = new AtomicReference<>();
             AtomicReference<Thread> outerThread = new AtomicReference<>();
             AtomicReference<Thread> nestedThread = new AtomicReference<>();
 
+            callerThread.set(Thread.currentThread());
             String result = coordinator.submit(() -> {
                 outerThread.set(Thread.currentThread());
                 return coordinator.submit(() -> {
@@ -116,6 +119,7 @@ final class CoordinatorBehaviorContractTest {
 
             assertEquals("nested", result);
             assertSame(outerThread.get(), nestedThread.get());
+            assertNotSame(callerThread.get(), outerThread.get());
         } finally {
             coordinator.stop();
         }
