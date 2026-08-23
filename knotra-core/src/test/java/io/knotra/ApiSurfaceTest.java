@@ -58,7 +58,7 @@ final class ApiSurfaceTest {
         assertTrue(Arrays.stream(PublicationChange.class.getMethods())
                 .noneMatch(method -> method.getName().equals("registration")));
         assertTrue(Arrays.stream(SettlementReport.class.getMethods())
-                .anyMatch(method -> method.getName().equals("allAffectedActive")));
+                .noneMatch(method -> method.getName().equals("allAffectedActive")));
         assertTrue(Arrays.stream(SettlementReport.class.getMethods())
                 .anyMatch(method -> method.getName().equals("hasAffectedMounts")));
         assertTrue(Arrays.stream(SettlementReport.class.getMethods())

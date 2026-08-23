@@ -22,4 +22,18 @@ record BeanDisposal<T>(
     static <T> BeanDisposal<T> auto() {
         return new BeanDisposal<>(Beans.LifecycleMode.AUTO, null, null);
     }
+
+    static <T> BeanDisposal<T> unmanaged() {
+        return new BeanDisposal<>(Beans.LifecycleMode.UNMANAGED, null, null);
+    }
+
+    static <T> BeanDisposal<T> sync(Beans.Disposer<? super T> disposer) {
+        Objects.requireNonNull(disposer, "disposer");
+        return new BeanDisposal<>(Beans.LifecycleMode.CUSTOM_SYNC, disposer, null);
+    }
+
+    static <T> BeanDisposal<T> async(Beans.AsyncDisposer<? super T> disposer) {
+        Objects.requireNonNull(disposer, "disposer");
+        return new BeanDisposal<>(Beans.LifecycleMode.CUSTOM_ASYNC, null, disposer);
+    }
 }

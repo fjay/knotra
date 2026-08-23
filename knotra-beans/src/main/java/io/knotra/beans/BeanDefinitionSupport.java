@@ -9,11 +9,13 @@ import io.knotra.ComponentFactory;
 import io.knotra.LifecycleScope;
 import io.knotra.NoConfig;
 
-import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
+/** Bean 定义的唯一构造校验点和运行时实现支撑类。 */
 class BeanDefinitionSupport<C, T> implements ComponentFactory<C> {
 
     private final String componentId;
@@ -37,19 +39,22 @@ class BeanDefinitionSupport<C, T> implements ComponentFactory<C> {
             BeanDisposal<T> disposal) {
         this.componentId = Beans.requireComponentId(componentId);
         this.configType = Objects.requireNonNull(configType, "configType");
-        this.dependencies = validateDependencies(dependencies);
         this.creator = Objects.requireNonNull(creator, "creator");
-        this.outputs = validateOutputs(outputs);
+        this.disposal = Objects.requireNonNull(disposal, "disposal");
+
+        LinkedHashSet<String> dependencyNames = new LinkedHashSet<>();
+        this.dependencies = copyDependencies(componentId, dependencies, dependencyNames);
+        LinkedHashSet<String> outputNames = new LinkedHashSet<>();
+        this.outputs = copyOutputs(componentId, outputs, outputNames);
+        rejectNameOverlap(componentId, dependencyNames, outputNames);
         this.initializer = initializer;
         this.normalizer = normalizer;
-        this.disposal = Objects.requireNonNull(disposal, "disposal");
         this.descriptor = ComponentDescriptor.named(
                 this.componentId,
                 this.dependencies.stream()
                         .map(BeanDependency::requirement)
                         .toArray(CapabilityRequirement[]::new));
     }
-
 
     String componentId() {
         return componentId;
@@ -68,7 +73,7 @@ class BeanDefinitionSupport<C, T> implements ComponentFactory<C> {
     }
 
     List<CapabilityKey<?>> outputKeys() {
-        List<CapabilityKey<?>> keys = new ArrayList<>(outputs.size());
+        List<CapabilityKey<?>> keys = new java.util.ArrayList<>(outputs.size());
         for (BeanOutput<T, ?> output : outputs) {
             keys.add(output.key());
         }
@@ -181,25 +186,48 @@ class BeanDefinitionSupport<C, T> implements ComponentFactory<C> {
                 + ", dependencies=" + dependencies.size() + "]";
     }
 
-    private static List<BeanDependency<?>> validateDependencies(List<BeanDependency<?>> dependencies) {
+    private static List<BeanDependency<?>> copyDependencies(
+            String componentId,
+            List<BeanDependency<?>> dependencies,
+            Set<String> names) {
         Objects.requireNonNull(dependencies, "dependencies");
-        for (BeanDependency<?> dependency : dependencies) {
+        List<BeanDependency<?>> result = List.copyOf(dependencies);
+        for (BeanDependency<?> dependency : result) {
             Objects.requireNonNull(dependency, "dependency");
-        }
-        return List.copyOf(dependencies);
-    }
-
-    private static <T> List<BeanOutput<T, ?>> validateOutputs(List<BeanOutput<T, ?>> outputs) {
-        Objects.requireNonNull(outputs, "outputs");
-        for (int index = 0; index < outputs.size(); index++) {
-            BeanOutput<T, ?> output = Objects.requireNonNull(outputs.get(index), "output");
-            for (int previous = 0; previous < index; previous++) {
-                if (outputs.get(previous).key().name().equals(output.key().name())) {
-                    throw new IllegalArgumentException(
-                            "duplicate output name: " + output.key().name());
-                }
+            if (!names.add(dependency.name())) {
+                throw new IllegalArgumentException("duplicate dependency name '" + dependency.name()
+                        + "' for component " + componentId);
             }
         }
-        return List.copyOf(outputs);
+        return result;
+    }
+
+    private static <T> List<BeanOutput<T, ?>> copyOutputs(
+            String componentId,
+            List<BeanOutput<T, ?>> outputs,
+            Set<String> names) {
+        Objects.requireNonNull(outputs, "outputs");
+        List<BeanOutput<T, ?>> result = List.copyOf(outputs);
+        for (BeanOutput<T, ?> output : result) {
+            Objects.requireNonNull(output, "output");
+            String name = output.key().name();
+            if (!names.add(name)) {
+                throw new IllegalArgumentException("duplicate output name '" + name
+                        + "' for component " + componentId);
+            }
+        }
+        return result;
+    }
+
+    private static void rejectNameOverlap(
+            String componentId,
+            Set<String> dependencyNames,
+            Set<String> outputNames) {
+        Set<String> overlap = new LinkedHashSet<>(dependencyNames);
+        overlap.retainAll(outputNames);
+        if (!overlap.isEmpty()) {
+            throw new IllegalArgumentException("dependency and output names conflict on "
+                    + overlap + " for component " + componentId);
+        }
     }
 }

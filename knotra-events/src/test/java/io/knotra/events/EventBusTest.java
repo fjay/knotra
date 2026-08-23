@@ -16,6 +16,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -233,8 +235,9 @@ final class EventBusTest {
 
         closing.get(10, TimeUnit.SECONDS);
         assertTrue(result.get(10, TimeUnit.SECONDS).successful());
-        assertThrows(IllegalStateException.class, () ->
-                bus.dispatch(PARALLEL, new TextEvent("rejected")));
+        assertFailedDispatch(
+                bus.dispatch(PARALLEL, new TextEvent("rejected")),
+                IllegalStateException.class);
     }
 
     @Test
@@ -386,14 +389,51 @@ final class EventBusTest {
                 bus.subscribe(SYNC, event -> {}));
         assertThrows(IllegalStateException.class, () ->
                 bus.dispatch(SYNC, new TextEvent("sync")));
-        assertThrows(IllegalStateException.class, () ->
-                bus.dispatch(PARALLEL, new TextEvent("parallel")));
-        assertThrows(IllegalStateException.class, () ->
-                bus.dispatch(SERIAL, new TextEvent("serial")));
-        assertThrows(IllegalStateException.class, () ->
-                bus.dispatch(BAIL, new TextEvent("bail")));
-        assertThrows(IllegalStateException.class, () ->
-                bus.dispatch(WATERFALL, new TextEvent("waterfall")));
+        assertFailedDispatch(bus.dispatch(PARALLEL, new TextEvent("parallel")),
+                IllegalStateException.class);
+        assertFailedDispatch(bus.dispatch(SERIAL, new TextEvent("serial")),
+                IllegalStateException.class);
+        assertFailedDispatch(bus.dispatch(BAIL, new TextEvent("bail")),
+                IllegalStateException.class);
+        assertFailedDispatch(bus.dispatch(WATERFALL, new TextEvent("waterfall")),
+                IllegalStateException.class);
+    }
+
+    @Test
+    void asyncDispatchRejectsNullArgumentsSynchronously() {
+        assertThrows(NullPointerException.class, () -> bus.dispatch(PARALLEL, null));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(SERIAL, null));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(BAIL, null));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(WATERFALL, null));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(
+                (EventDefinition.Parallel<TextEvent>) null, new TextEvent("event")));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(
+                (EventDefinition.Serial<TextEvent>) null, new TextEvent("event")));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(
+                (EventDefinition.Bail<TextEvent>) null, new TextEvent("event")));
+        assertThrows(NullPointerException.class, () -> bus.dispatch(
+                (EventDefinition.Waterfall<TextEvent>) null, new TextEvent("event")));
+        assertThrows(NullPointerException.class, () ->
+                bus.dispatch(PARALLEL, (TextEvent) null));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void asyncCastFailureIsReportedByReturnedStage() {
+        EventDefinition.Parallel<Object> definition = EventDefinition.parallel(
+                (Class<Object>) (Class<?>) TextEvent.class);
+
+        assertFailedDispatch(
+                bus.dispatch(definition, new Object()), ClassCastException.class);
+    }
+
+    @Test
+    void asyncBindingConflictIsReportedByReturnedStage() {
+        bus.subscribe(SYNC, event -> {});
+        EventDefinition.Parallel<Object> other = EventDefinition.parallel(
+                "io.knotra.events.EventBusTest$TextEvent", Object.class);
+
+        assertFailedDispatch(bus.dispatch(other, new Object()), IllegalArgumentException.class);
     }
 
     @Test
@@ -495,6 +535,14 @@ final class EventBusTest {
         assertEquals(1, registrations.size());
         assertEquals(RuntimeSnapshot.RegistrationOwnerKind.ACTIVATION,
                 registrations.getFirst().owner().kind());
+    }
+
+    private static <T> void assertFailedDispatch(
+            CompletionStage<EventDispatch<T>> stage,
+            Class<? extends Throwable> expectedCause) {
+        CompletableFuture<EventDispatch<T>> future = stage.toCompletableFuture();
+        CompletionException error = assertThrows(CompletionException.class, future::join);
+        assertInstanceOf(expectedCause, error.getCause());
     }
 
     private record TextEvent(String text) {

@@ -73,8 +73,6 @@ final class SimpleApiEndToEndTest {
         SettlementReport firstReport = first.awaitSettled(Duration.ofSeconds(10));
         assertTrue(firstReport.generation() >= 0);
         assertFalse(firstReport.hasAffectedMounts());
-        assertFalse(firstReport.allAffectedActive(),
-                "an empty affected set is explicitly not an all-active health claim");
 
         MountHandle rendererHandle = Beans
                 .component("dynamic-gateway-renderer")
@@ -100,7 +98,6 @@ final class SimpleApiEndToEndTest {
         assertTrue(first.generation() < second.generation());
         assertTrue(secondReport.hasAffectedMounts());
         assertTrue(secondReport.hasFailedMounts(), () -> secondReport.toString());
-        assertFalse(secondReport.allAffectedActive());
         assertEquals(ComponentState.FAILED, fixedHandle.state());
         rendererHandle.requireActive(Duration.ofSeconds(10));
         assertEquals("gateway: two", runtime.require(RenderedGreeting.class).render());

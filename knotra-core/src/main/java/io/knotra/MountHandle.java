@@ -3,12 +3,9 @@ package io.knotra;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+
+import io.knotra.internal.AwaitSupport;
 
 /**
  * 稳定的组件挂载点句柄。
@@ -16,7 +13,7 @@ import java.util.concurrent.TimeoutException;
  * <p>代表组件在上下文树中的逻辑挂载位置；在多次激活重试、故障恢复或重新配置过程中保持身份稳定。
  * 若挂载组件具有公开配置契约，可使用子类型 {@link ConfiguredMountHandle} 进行动态重新配置。</p>
  */
-public interface MountHandle extends AutoCloseable {
+public interface MountHandle extends Awaitable<ComponentState>, AutoCloseable {
 
     /** 挂载句柄在运行时代际中的唯一实例标识。 */
     String handleId();
@@ -53,40 +50,22 @@ public interface MountHandle extends AutoCloseable {
     /** 有界同步等待组件结算并断言必须处于 ACTIVE 状态（超时抛出 MountNotActiveException）。 */
     default MountHandle requireActive(Duration timeout) {
         Objects.requireNonNull(timeout, "timeout");
-        if (timeout.isZero() || timeout.isNegative()) {
-            throw new IllegalArgumentException("timeout must be positive");
-        }
         return awaitActive(timeout);
     }
 
     private MountHandle awaitActive(Duration timeout) {
-        CompletableFuture<ComponentState> future = whenSettled().toCompletableFuture();
-        ComponentState settled = null;
-        boolean interrupted = false;
-        boolean timedOut = false;
-        Throwable settlementError = null;
-        try {
-            settled = timeout == null
-                    ? future.get()
-                    : future.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            interrupted = true;
-        } catch (TimeoutException error) {
-            timedOut = true;
-        } catch (ExecutionException | CompletionException error) {
-            settlementError = error;
-        }
-        boolean settledNormally = !interrupted && !timedOut && settlementError == null;
-        if (settledNormally && settled == ComponentState.ACTIVE) {
+        AwaitSupport.Outcome<ComponentState> outcome =
+                AwaitSupport.await(whenSettled(), timeout);
+        if (outcome.settledNormally() && outcome.result() == ComponentState.ACTIVE) {
             return this;
         }
         ComponentState observed = state();
         if (observed == ComponentState.ACTIVE) {
             return this;
         }
-        ComponentState failureState = settledNormally ? settled : observed;
-        RuntimeDiagnostic detail = failureDetail(interrupted, settlementError);
+        ComponentState failureState = outcome.settledNormally()
+                ? outcome.result()
+                : observed;
         throw new MountNotActiveException(
                 failureState,
                 handleId(),
@@ -95,40 +74,25 @@ public interface MountHandle extends AutoCloseable {
                 factoryId(),
                 contextId(),
                 timeout,
-                detail == null ? List.of() : List.of(detail));
+                failureDetail(outcome));
     }
 
-    private RuntimeDiagnostic failureDetail(boolean interrupted, Throwable settlementError) {
-        if (interrupted) {
-            return new RuntimeDiagnostic(
+    private List<RuntimeDiagnostic> failureDetail(AwaitSupport.Outcome<ComponentState> outcome) {
+        RuntimeDiagnostic detail;
+        if (outcome.interrupted()) {
+            detail = new RuntimeDiagnostic(
                     DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
                     handleId(),
                     "wait interrupted before settlement");
-        }
-        if (settlementError != null) {
-            return new RuntimeDiagnostic(
+        } else if (outcome.failure() != null) {
+            detail = new RuntimeDiagnostic(
                     DiagnosticCode.ROLLBACK_FAILED,
                     handleId(),
-                    "settlement failed: " + stableError(settlementError));
+                    "settlement failed: " + AwaitSupport.stableError(outcome.failure()));
+        } else {
+            return List.of();
         }
-        return null;
-    }
-
-    private static String stableError(Throwable error) {
-        try {
-            Throwable cause = error instanceof CompletionException || error instanceof ExecutionException
-                    ? error.getCause()
-                    : error;
-            if (cause == null) {
-                cause = error;
-            }
-            String type = cause.getClass().getName();
-            String message = cause.getMessage();
-            String text = message == null || message.isBlank() ? type : type + ": " + message;
-            return text.length() <= 160 ? text : text.substring(0, 160);
-        } catch (Throwable ignored) {
-            return "<invalid description>";
-        }
+        return List.of(detail);
     }
 
     /** 异步重试处于 FAILED 状态的挂载激活或未完成的清理操作。 */

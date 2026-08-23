@@ -9,7 +9,6 @@ import io.knotra.MountHandle;
 import io.knotra.DiagnosticCode;
 import io.knotra.KnotraRuntime;
 import io.knotra.Publication;
-import io.knotra.Registration;
 import io.knotra.TransactionRejectedException;
 
 
@@ -23,6 +22,7 @@ import org.springframework.context.annotation.Configuration;
 import java.time.Duration;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -273,17 +273,17 @@ final class SpringModuleTest {
         assertTrue(missing.wrapped().isEmpty());
 
         ExternalProvider provider = new ExternalProvider("present");
-        Registration<Provider> wrappedRegistration =
-                runtime.advanced().register(WRAPPED_PROVIDER, provider);
-        Registration<Provider> registration =
-                runtime.advanced().register(PROVIDER, provider);
+        Publication<Provider> wrappedPublication =
+                runtime.publish(WRAPPED_PROVIDER, provider).publication();
+        Publication<Provider> publication =
+                runtime.publish(PROVIDER, provider).publication();
         ServiceAssertions.assertActive(handle);
         ProviderSnapshot present = runtime.root().view().require(PROVIDER_SNAPSHOT);
         assertSame(provider, present.value());
         assertSame(provider, present.wrapped().orElseThrow());
 
-        wrappedRegistration.revoke().awaitSettled(Duration.ofSeconds(10));
-        registration.revoke().awaitSettled(Duration.ofSeconds(10));
+        wrappedPublication.unpublish().awaitSettled(Duration.ofSeconds(10));
+        publication.unpublish().awaitSettled(Duration.ofSeconds(10));
         ServiceAssertions.assertActive(handle);
         ProviderSnapshot absentAgain = runtime.root().view().require(PROVIDER_SNAPSHOT);
         assertNull(absentAgain.value());
@@ -513,6 +513,46 @@ final class SpringModuleTest {
                         .annotatedClasses(DifferentLoaderConfig.class, copied)
                         .build());
         assertTrue(rejected.getMessage().contains("multiple class loaders"));
+    }
+
+    @Test
+    void beanNameOwnershipIsCheckedRegardlessOfDeclarationOrder() {
+        IllegalArgumentException outputFirst = assertThrows(
+                IllegalArgumentException.class, () -> SpringModules.noConfig("bean-conflict")
+                        .expose(FIRST, "shared-bean")
+                        .required("shared-bean", SECOND));
+        assertTrue(outputFirst.getMessage().contains("already used by an output"));
+
+        IllegalArgumentException configFirst = assertThrows(
+                IllegalArgumentException.class, () -> SpringModules.typed(
+                                "typed-bean-conflict", ModuleConfig.class)
+                        .required("knotraConfig", SECOND));
+        assertTrue(configFirst.getMessage().contains(
+                "config bean name is already used by a dependency"));
+
+        IllegalArgumentException outputBeforeRename = assertThrows(
+                IllegalArgumentException.class, () -> SpringModules.typed(
+                                "typed-rename-conflict", ModuleConfig.class)
+                        .expose(FIRST, "renamed-config")
+                        .configBeanName("renamed-config"));
+        assertTrue(outputBeforeRename.getMessage().contains(
+                "config bean name is already used by an output"));
+    }
+
+    @Test
+    void dependenciesKeepDeclarationOrderInDefinition() {
+        ComponentFactory<ModuleConfig> factory = SpringModules.typed(
+                        "dependency-order", ModuleConfig.class)
+                .required("first-declared", FIRST)
+                .required("second-declared", SECOND)
+                .build();
+
+        SpringModuleDefinition<ModuleConfig> definition =
+                (SpringModuleDefinition<ModuleConfig>) factory;
+        assertEquals(List.of("first-declared", "second-declared"),
+                definition.dependencies().stream()
+                        .map(SpringDependency::beanName)
+                        .toList());
     }
 
     private static Class<?> copyClassInIsolatedLoader(String binaryName) throws IOException {

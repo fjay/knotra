@@ -28,8 +28,6 @@ import io.knotra.MountHandle;
 import io.knotra.MountOptions;
 import io.knotra.NoConfig;
 import io.knotra.PublicationChange;
-import io.knotra.Registration;
-import io.knotra.RegistrationHandle;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.RuntimeTransaction;
 import io.knotra.Settlement;
@@ -281,22 +279,6 @@ final class CommittedMountRecoveryTest {
             @Override
             public <T> PublicationChange<T> publication(
                     ContextHandle context, CapabilityKey<T> key, T value) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public <T> Registration<T> register(CapabilityKey<T> key, T value) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public <T> Registration<T> register(
-                    ContextHandle context, CapabilityKey<T> key, T value) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public Settlement revoke(RegistrationHandle registration) {
                 throw new UnsupportedOperationException();
             }
 

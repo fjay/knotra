@@ -4,6 +4,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -91,8 +92,11 @@ final class EventBusIntegrationTest {
         assertNotSame(oldBus, newBus);
         assertTrue(oldBus.snapshot().closed());
         assertEquals(0, oldBus.snapshot().subscriptionCount());
-        assertThrows(IllegalStateException.class, () ->
-                oldBus.dispatch(CONTRACT_EVENTS, new ContractEvent("rejected")));
+        CompletionException closedFailure = assertThrows(CompletionException.class, () ->
+                oldBus.dispatch(CONTRACT_EVENTS, new ContractEvent("rejected"))
+                        .toCompletableFuture().join());
+        assertTrue(closedFailure.getCause() instanceof IllegalStateException,
+                () -> String.valueOf(closedFailure.getCause()));
 
         assertTrue(newBus.dispatch(CONTRACT_EVENTS, new ContractEvent("new"))
                 .toCompletableFuture().get(10, TimeUnit.SECONDS).successful());
@@ -139,11 +143,15 @@ final class EventBusIntegrationTest {
                 EventDefinition.Serial<Object> shadowDefinition = EventDefinition.serial(
                         (Class<Object>) (Class<?>) shadow);
 
-                IllegalArgumentException rejected = assertThrows(
-                        IllegalArgumentException.class,
-                        () -> bus.dispatch(shadowDefinition, event));
-                assertTrue(rejected.getMessage().contains(
-                        "already bound to a different Class"), rejected::getMessage);
+                CompletionException rejected = assertThrows(
+                        CompletionException.class,
+                        () -> bus.dispatch(shadowDefinition, event)
+                                .toCompletableFuture().join());
+                Throwable cause = rejected.getCause();
+                assertTrue(cause instanceof IllegalArgumentException,
+                        () -> String.valueOf(cause));
+                assertTrue(cause.getMessage().contains(
+                        "already bound to a different Class"), cause::getMessage);
             }
             IntegrationCoordinator.releaseEvent();
             unload.get(10, TimeUnit.SECONDS);
@@ -250,11 +258,15 @@ final class EventBusIntegrationTest {
                 EventDefinition.Serial<Object> shadowDefinition = EventDefinition.serial(
                         (Class<Object>) (Class<?>) shadow);
 
-                IllegalArgumentException failure = assertThrows(
-                        IllegalArgumentException.class,
-                        () -> bus.dispatch(shadowDefinition, event));
-                assertTrue(failure.getMessage().contains("already bound to a different Class"),
-                        failure::getMessage);
+                CompletionException failure = assertThrows(
+                        CompletionException.class,
+                        () -> bus.dispatch(shadowDefinition, event)
+                                .toCompletableFuture().join());
+                Throwable failureCause = failure.getCause();
+                assertTrue(failureCause instanceof IllegalArgumentException,
+                        () -> String.valueOf(failureCause));
+                assertTrue(failureCause.getMessage().contains("already bound to a different Class"),
+                        failureCause::getMessage);
             }
         }
     }

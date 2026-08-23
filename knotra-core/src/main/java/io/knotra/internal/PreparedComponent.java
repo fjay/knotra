@@ -54,10 +54,6 @@ final class PreparedComponent<C> {
                         factoryId,
                         declared.requirements().toArray(io.knotra.CapabilityRequirement[]::new))
                 : declared;
-        for (String failure : descriptor.validate()) {
-            throw new IllegalArgumentException(failure);
-        }
-
         C config;
         try {
             C nonNullConfig = Objects.requireNonNull(

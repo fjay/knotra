@@ -83,7 +83,7 @@ PublicationChange<Greeting> change = publication.update(new BrokenGreeting());
 SettlementReport report = change.awaitSettled(Duration.ofSeconds(5));
 
 assertTrue(report.hasFailedMounts());
-assertFalse(report.allAffectedActive());
+assertTrue(report.hasAffectedMounts());
 assertEquals(
         ComponentState.FAILED,
         report.failedMounts().getFirst().state());
@@ -99,7 +99,7 @@ assertTrue(report.failedMounts().stream()
 
 - 影响集为空时，`hasAffectedMounts()` 是 false。
 - 影响集为空时，`hasFailedMounts()` 是 false。
-- 影响集为空时，`allAffectedActive()` 仍是 false。
+- 空影响集不构成任何健康断言；整体健康用 `hasAffectedMounts() && !hasFailedMounts()` 表达。
 - 动态代理消费方不重建，可能不出现在影响集。
 - 对具体挂载使用 `handle.requireActive(Duration.ofSeconds(5))`。
 
@@ -123,8 +123,10 @@ assertTrue(report.generation() >= 0);
 提交成功后，staged token 可以作为 opaque handle 撤销：
 
 ```java
-runtime.advanced().revoke(receipt.value())
-        .awaitSettled(Duration.ofSeconds(5));
+runtime.advanced().transact(tx -> {
+    tx.revoke(receipt.value());
+    return null;
+}).awaitSettled(Duration.ofSeconds(5));
 assertTrue(runtime.root().view().find(Message.class).isEmpty());
 ```
 

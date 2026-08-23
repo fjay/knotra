@@ -1,10 +1,10 @@
 package io.knotra;
 
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 /** 组件的静态依赖声明；显示 ID 可省略并由 Runtime 使用 factory ID 固化。 */
@@ -14,7 +14,7 @@ public record ComponentDescriptor(
 
     public ComponentDescriptor {
         componentId = componentId == null ? "" : componentId.trim();
-        requirements = CapabilityRequirement.freeze(requirements);
+        requirements = io.knotra.internal.Requirements.freeze(requirements);
     }
 
     /** 创建使用默认组件 ID 的声明。 */
@@ -49,15 +49,6 @@ public record ComponentDescriptor(
                 item -> item.key().name(),
                 item -> item,
                 (left, right) -> left,
-                java.util.TreeMap::new));
-    }
-
-    public List<String> validate() {
-        return requirements.stream()
-                .map(CapabilityRequirement::key)
-                .filter(key -> key.type().isPrimitive())
-                .map(key -> "primitive capability type is not supported: " + key.name())
-                .sorted(Comparator.naturalOrder())
-                .toList();
+                TreeMap::new));
     }
 }

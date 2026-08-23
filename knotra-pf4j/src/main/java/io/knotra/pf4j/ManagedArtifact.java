@@ -8,6 +8,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 import org.pf4j.PluginWrapper;
 import io.knotra.MountHandle;
@@ -38,8 +39,8 @@ final class ManagedArtifact {
     final Map<String, ManagedFactory> factoriesById = new LinkedHashMap<>();
     final Set<String> factoryIdHistory = new LinkedHashSet<>();
     int mountsInFlight;
-    java.util.concurrent.CompletableFuture<Void> mountsInFlightFuture;
-    java.util.concurrent.CompletableFuture<Void> drainFuture;
+    CompletableFuture<Void> mountsInFlightFuture;
+    CompletableFuture<Void> drainFuture;
     java.util.function.Supplier<String> pf4jStateView = () -> "UNKNOWN";
 
     ManagedArtifact(

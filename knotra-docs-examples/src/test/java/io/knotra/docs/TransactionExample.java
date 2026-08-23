@@ -47,7 +47,10 @@ public final class TransactionExample {
                             .equals("committed in one transaction"),
                     "committed value must be visible");
 
-            Settlement revoke = runtime.advanced().revoke(staged);
+            Settlement revoke = runtime.advanced().transact(tx -> {
+                tx.revoke(staged);
+                return null;
+            });
             revoke.awaitSettled(timeout);
             require(runtime.root().view().find(Message.class).isEmpty(),
                     "a committed staged token can be revoked as an opaque handle");

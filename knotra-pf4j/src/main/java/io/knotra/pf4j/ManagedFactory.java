@@ -5,7 +5,6 @@ import java.util.Objects;
 import io.knotra.ComponentFactory;
 import io.knotra.ConfigDecoder;
 import io.knotra.ContextHandle;
-import io.knotra.NoConfig;
 
 /**
  * 内部活跃工厂视图。挂载拆分为两个叶子类，确保公开类型绝不将无配置挂载表现为有配置挂载。
@@ -64,8 +63,21 @@ abstract class ManagedFactory implements ArtifactFactoryHandle {
         return configType;
     }
 
-    final <T> T requireUsable(String phase) {
-        Object current = "mount".equals(phase) ? factory : decoder;
+    /** 返回仍可提交组件事务的工厂实现。 */
+    final <T> ComponentFactory<T> requireUsableFactory() {
+        ComponentFactory<?> current = factory;
+        requireUsable("mount", current);
+        return cast(current);
+    }
+
+    /** 返回仍可执行配置解码的解码器实现。 */
+    final <T> ConfigDecoder<T> requireUsableDecoder() {
+        ConfigDecoder<?> current = decoder;
+        requireUsable("decode", current);
+        return cast(current);
+    }
+
+    private void requireUsable(String phase, Object current) {
         if (current == null
                 || !artifact.acceptingMounts
                 || artifact.state != ArtifactState.ACTIVE) {
@@ -74,7 +86,6 @@ abstract class ManagedFactory implements ArtifactFactoryHandle {
                     phase,
                     "factory handle is no longer usable: " + factoryId);
         }
-        return cast(current);
     }
 
     @SuppressWarnings("unchecked")
@@ -96,7 +107,7 @@ abstract class ManagedFactory implements ArtifactFactoryHandle {
 
         @Override
         public io.knotra.MountHandle mount(ContextHandle context, String mountId) {
-            ComponentFactory<io.knotra.NoConfig> current = requireUsable("mount");
+            ComponentFactory<io.knotra.NoConfig> current = requireUsableFactory();
             return owner.mount(this, context, mountId, current);
         }
     }
@@ -116,7 +127,7 @@ abstract class ManagedFactory implements ArtifactFactoryHandle {
 
         @Override
         public C decodeConfig(Object rawConfig) {
-            ConfigDecoder<C> current = requireUsable("decode");
+            ConfigDecoder<C> current = requireUsableDecoder();
             C decoded;
             try {
                 decoded = current.decode(rawConfig);
@@ -143,7 +154,7 @@ abstract class ManagedFactory implements ArtifactFactoryHandle {
                 ContextHandle context,
                 String mountId,
                 C config) {
-            ComponentFactory<C> current = requireUsable("mount");
+            ComponentFactory<C> current = requireUsableFactory();
             if (config == null) {
                 throw new ArtifactOperationException(
                         artifact.artifactId,

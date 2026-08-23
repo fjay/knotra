@@ -32,9 +32,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class SpringDynamicBridge<T> implements AutoCloseable {
 
-    private final ContextHandle context;
     private final MountHandle handle;
-    private final CapabilityKey<BridgeAccess> accessKey;
     private final DynamicCapability<T> capability;
     private final T proxy;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -42,14 +40,10 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
             new AtomicReference<>();
 
     private SpringDynamicBridge(
-            ContextHandle context,
             MountHandle handle,
-            CapabilityKey<BridgeAccess> accessKey,
             DynamicCapability<T> capability,
             T proxy) {
-        this.context = context;
         this.handle = handle;
-        this.accessKey = accessKey;
         this.capability = capability;
         this.proxy = proxy;
     }
@@ -100,7 +94,7 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
             BridgeAccess access = context.view().require(accessKey);
             DynamicCapability<T> capability = cast(access.dynamicCapability());
             return new SpringDynamicBridge<>(
-                    context, handle, accessKey, capability,
+                    handle, capability,
                     capability.proxy(sourceKey.type()));
         } catch (Exception error) {
             throw startupFailed(handle, error);

@@ -111,40 +111,21 @@ final class ActivationContextImpl implements ActivationContext {
             ComponentFactory<C> factory,
             C config,
             MountOptions options) {
-        ensureOpen();
-        ensureNotStale();
-        if (mountId == null || mountId.isBlank()) {
-            throw new IllegalArgumentException("mountId must not be blank");
-        }
-        for (ChildMountPlan plan : childPlans) {
-            if (plan.mountId().equals(mountId)) {
-                throw new IllegalArgumentException("mountId is already staged: " + mountId);
-            }
-        }
-        MountOptions effectiveOptions = options == null
-                ? new MountOptions(activation.owner.prepared.options().origin())
-                : options;
-        PreparedComponent<C> prepared = PreparedComponent.prepare(factory, config, effectiveOptions);
-        if (runtime.mountIdReserved(activation.owner.contextId, mountId)) {
-            throw new IllegalArgumentException("mountId is already in use: " + mountId);
-        }
-        ConfiguredMountHandleImpl<C> handle = new ConfiguredMountHandleImpl<>(
-                runtime,
-                Sequences.handle(),
-                new MountHandleImpl.Identity(
-                        mountId,
-                        prepared.descriptor().componentId(),
-                        prepared.factoryId(),
-                        activation.owner.contextId));
-        childPlans.add(new ChildMountPlan(handle, mountId, prepared));
-        return handle;
+        PreparedComponent<C> prepared = PreparedComponent.prepare(
+                factory,
+                config,
+                options == null
+                        ? new MountOptions(activation.owner.prepared.options().origin())
+                        : options);
+        return stageChild(mountId, prepared, (id, identity) ->
+                new ConfiguredMountHandleImpl<>(runtime, id, identity));
     }
 
     @Override
     public MountHandle mountChild(
             String mountId,
             ComponentFactory<NoConfig> factory) {
-        return mountPlain(mountId, factory, null);
+        return mountChild(mountId, factory, (MountOptions) null);
     }
 
     @Override
@@ -152,7 +133,14 @@ final class ActivationContextImpl implements ActivationContext {
             String mountId,
             ComponentFactory<NoConfig> factory,
             MountOptions options) {
-        return mountPlain(mountId, factory, options);
+        PreparedComponent<NoConfig> prepared = PreparedComponent.prepare(
+                factory,
+                NoConfig.INSTANCE,
+                options == null
+                        ? new MountOptions(activation.owner.prepared.options().origin())
+                        : options);
+        return stageChild(mountId, prepared, (id, identity) ->
+                new PlainMountHandleImpl(runtime, id, identity));
     }
 
     @Override
@@ -170,11 +158,10 @@ final class ActivationContextImpl implements ActivationContext {
     List<ChildMountPlan> plans() {
         return new ArrayList<>(childPlans);
     }
-
-    private MountHandleImpl mountPlain(
+    private <H extends MountHandleImpl> H stageChild(
             String mountId,
-            ComponentFactory<NoConfig> factory,
-            MountOptions options) {
+            PreparedComponent<?> prepared,
+            ChildHandleFactory<H> handleFactory) {
         ensureOpen();
         ensureNotStale();
         if (mountId == null || mountId.isBlank()) {
@@ -185,16 +172,10 @@ final class ActivationContextImpl implements ActivationContext {
                 throw new IllegalArgumentException("mountId is already staged: " + mountId);
             }
         }
-        MountOptions effectiveOptions = options == null
-                ? new MountOptions(activation.owner.prepared.options().origin())
-                : options;
-        PreparedComponent<NoConfig> prepared =
-                PreparedComponent.prepare(factory, NoConfig.INSTANCE, effectiveOptions);
         if (runtime.mountIdReserved(activation.owner.contextId, mountId)) {
             throw new IllegalArgumentException("mountId is already in use: " + mountId);
         }
-        PlainMountHandleImpl handle = new PlainMountHandleImpl(
-                runtime,
+        H handle = handleFactory.create(
                 Sequences.handle(),
                 new MountHandleImpl.Identity(
                         mountId,
@@ -203,6 +184,10 @@ final class ActivationContextImpl implements ActivationContext {
                         activation.owner.contextId));
         childPlans.add(new ChildMountPlan(handle, mountId, prepared));
         return handle;
+    }
+
+    private interface ChildHandleFactory<H extends MountHandleImpl> {
+        H create(String id, MountHandleImpl.Identity identity);
     }
 
     private void ensureOpen() {

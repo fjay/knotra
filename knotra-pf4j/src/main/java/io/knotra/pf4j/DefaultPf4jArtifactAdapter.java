@@ -3,10 +3,8 @@ package io.knotra.pf4j;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -15,8 +13,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import io.knotra.ComponentFactory;
-import io.knotra.ComponentOrigin;
-import io.knotra.ComponentState;
 import io.knotra.ConfigDecoder;
 import io.knotra.ConfiguredMountHandle;
 import io.knotra.ContextHandle;
@@ -25,20 +21,13 @@ import io.knotra.MountHandle;
 import io.knotra.MountOptions;
 import io.knotra.NoConfig;
 import io.knotra.RuntimeTransaction;
-import io.knotra.RuntimeSnapshot;
 import io.knotra.TransactionRejectedException;
 import io.knotra.pf4j.spi.ExportedComponentFactory;
 import io.knotra.pf4j.spi.RuntimeComponentProvider;
-import org.pf4j.CompoundPluginDescriptorFinder;
-import org.pf4j.DependencyResolver;
-import org.pf4j.JarPluginRepository;
-import org.pf4j.ManifestPluginDescriptorFinder;
-import org.pf4j.PluginDescriptor;
 import org.pf4j.PluginDependency;
 import org.pf4j.PluginManager;
 import org.pf4j.PluginState;
 import org.pf4j.PluginWrapper;
-import org.pf4j.PropertiesPluginDescriptorFinder;
 
 /**
  * {@link Pf4jArtifactAdapter} 的默认实现，也是 artifact 生命周期的唯一编排点。
@@ -54,68 +43,15 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     private final ArtifactCoordinator coordinator;
     private final KnotraRuntime runtime;
     private final KnotraClassLoaderPolicy classLoaderPolicy;
-    // 协调器串行化入口；drain 的异步等待会释放协调线程，因此内存状态仍需独立锁保护。
-    private final Object stateLock = new Object();
-    private final Map<String, ManagedArtifact> artifacts = new LinkedHashMap<>();
-    private final Map<String, ArtifactDiagnostic> loadFailures = new LinkedHashMap<>();
-    private final Map<String, ArtifactSnapshot> terminalSnapshots = new LinkedHashMap<>();
-    private final Map<String, ManagedFactory> catalog = new LinkedHashMap<>();
+    private final ManagedArtifactStore store = new ManagedArtifactStore();
+    private final Pf4jClosureResolver closureResolver;
+    private final ArtifactDrainService drainService;
+    private final CatalogFacade factoryCatalog =
+            new CatalogFacade(this::catalogEntries, this::activeFactory);
     private final AtomicBoolean closeStarted = new AtomicBoolean();
     private final Object closeLock = new Object();
     private CompletableFuture<Void> closeFuture;
 
-    private final ArtifactFactoryCatalog factoryCatalog = new ArtifactFactoryCatalog() {
-        @Override
-        public List<ArtifactFactoryCatalogEntry> list() {
-            return catalogEntries();
-        }
-
-        @Override
-        public Optional<ArtifactFactoryCatalogEntry> find(String factoryId) {
-            Objects.requireNonNull(factoryId, "factoryId");
-            return catalogEntries().stream()
-                    .filter(entry -> entry.factoryId().equals(factoryId))
-                    .findFirst();
-        }
-
-        @Override
-        public Optional<ArtifactFactoryHandle> resolve(String factoryId) {
-            return Optional.ofNullable(activeFactory(factoryId));
-        }
-
-        @Override
-        public Optional<ArtifactFactoryHandle.NoConfig> resolveNoConfig(String factoryId) {
-            ManagedFactory handle = activeFactory(factoryId);
-            return handle instanceof ArtifactFactoryHandle.NoConfig noConfig
-                    ? Optional.of(noConfig)
-                    : Optional.empty();
-        }
-
-        @Override
-        public <C> Optional<ArtifactFactoryHandle.Configured<C>> resolve(
-                String factoryId,
-                Class<C> configType) {
-            Objects.requireNonNull(configType, "configType");
-            ManagedFactory handle = activeFactory(factoryId);
-            if (handle == null) {
-                return Optional.empty();
-            }
-            if (!handle.configType().equals(configType)) {
-                throw new IllegalArgumentException(
-                        "factory " + factoryId + " config type is "
-                                + handle.configType().getName()
-                                + ", not " + configType.getName());
-            }
-            if (!(handle instanceof ArtifactFactoryHandle.Configured<?> configured)) {
-                throw new IllegalArgumentException(
-                        "factory " + factoryId + " does not accept configuration");
-            }
-            @SuppressWarnings("unchecked")
-            ArtifactFactoryHandle.Configured<C> typed =
-                    (ArtifactFactoryHandle.Configured<C>) configured;
-            return Optional.of(typed);
-        }
-    };
     DefaultPf4jArtifactAdapter(
             Path pluginsRoot,
             KnotraRuntime runtime,
@@ -125,6 +61,13 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         this.classLoaderPolicy = KnotraClassLoaderPolicy.forHost(sharedContractPackages);
         this.pluginManager = new SharedContractPluginManager(pluginsRoot, classLoaderPolicy);
         this.coordinator = new ArtifactCoordinator();
+        this.closureResolver = new Pf4jClosureResolver(pluginManager);
+        this.drainService = new ArtifactDrainService(
+                pluginManager,
+                coordinator,
+                runtime,
+                store,
+                closeStarted::get);
     }
 
     DefaultPf4jArtifactAdapter(
@@ -136,6 +79,13 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.classLoaderPolicy = Objects.requireNonNull(policy, "policy");
+        this.closureResolver = new Pf4jClosureResolver(pluginManager);
+        this.drainService = new ArtifactDrainService(
+                pluginManager,
+                coordinator,
+                runtime,
+                store,
+                closeStarted::get);
     }
 
     @Override
@@ -150,7 +100,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             String targetId = null;
             try {
                 // 先离线解析完整闭包与拓扑顺序，缺失/环/版本冲突在加载任何插件前失败。
-                ArtifactClosure closure = resolveClosure(target);
+                Pf4jClosureResolver.ArtifactClosure closure = closureResolver.resolve(target);
                 targetId = closure.targetId();
                 loadMissing(closure, journal);
                 // 依赖先启动，目标插件最后一个启动，保证扩展发现看到的是可用闭包。
@@ -180,38 +130,21 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
     @Override
     public CompletableFuture<Void> unloadArtifactAsync(String artifactId) {
-        return drain(Objects.requireNonNull(artifactId, "artifactId"), "unload");
+        return drainService.drain(Objects.requireNonNull(artifactId, "artifactId"), "unload");
     }
 
     @Override
     public CompletableFuture<Void> retryDrainAsync(String artifactId) {
-        return drain(Objects.requireNonNull(artifactId, "artifactId"), "retry-drain");
+        return drainService.drain(Objects.requireNonNull(artifactId, "artifactId"), "retry-drain");
     }
 
     private List<ArtifactFactoryCatalogEntry> catalogEntries() {
-        return coordinator.submit(() -> {
-            synchronized (stateLock) {
-                List<ArtifactFactoryCatalogEntry> entries = new ArrayList<>();
-                for (ManagedFactory factory : catalog.values()) {
-                    entries.add(new ArtifactFactoryCatalogView(
-                            factory.artifactId(),
-                            factory.artifactVersion(),
-                            factory.artifactPath(),
-                            factory.factoryId(),
-                            factory.configTypeName()));
-                }
-                return List.copyOf(entries);
-            }
-        }).join();
+        return coordinator.submit(store::catalogEntries).join();
     }
 
     private ManagedFactory activeFactory(String factoryId) {
         Objects.requireNonNull(factoryId, "factoryId");
-        return coordinator.submit(() -> {
-            synchronized (stateLock) {
-                return catalog.get(factoryId);
-            }
-        }).join();
+        return coordinator.submit(() -> store.activeFactory(factoryId)).join();
     }
 
     @Override
@@ -226,10 +159,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     @Override
     public List<ArtifactSnapshot> artifacts() {
         return coordinator.submit(() -> {
-            List<String> ids;
-            synchronized (stateLock) {
-                ids = List.copyOf(artifacts.keySet());
-            }
+            List<String> ids = store.artifactIds();
             return ids.stream().map(this::snapshotCoordinated).toList();
         }).join();
     }
@@ -244,17 +174,13 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     public Optional<ArtifactSnapshot> artifact(String artifactId) {
         Objects.requireNonNull(artifactId, "artifactId");
         if (coordinator.isStopped()) {
-            synchronized (stateLock) {
-                return Optional.ofNullable(terminalSnapshots.get(artifactId));
-            }
+            return store.terminalSnapshot(artifactId);
         }
         return coordinator.submit(() -> {
-            synchronized (stateLock) {
-                if (!artifacts.containsKey(artifactId)) {
-                    return Optional.<ArtifactSnapshot>empty();
-                }
+            if (!store.containsArtifact(artifactId)) {
+                return Optional.<ArtifactSnapshot>empty();
             }
-            return Optional.of(snapshotCoordinated(artifactId));
+            return Optional.ofNullable(snapshotCoordinated(artifactId));
         }).join();
     }
 
@@ -262,22 +188,11 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     public Optional<ArtifactDiagnostic> diagnostic(String artifactId) {
         Objects.requireNonNull(artifactId, "artifactId");
         if (coordinator.isStopped()) {
-            synchronized (stateLock) {
-                ManagedArtifact artifact = artifacts.get(artifactId);
-                return Optional.ofNullable(artifact == null
-                        ? loadFailures.get(artifactId)
-                        : artifact.diagnostic(List.of()));
-            }
+            return store.stoppedDiagnostic(artifactId);
         }
         return coordinator.submit(() -> {
             List<ArtifactOwnership> ownership = ownershipCoordinated(artifactId);
-            synchronized (stateLock) {
-                ManagedArtifact artifact = artifacts.get(artifactId);
-                if (artifact != null) {
-                    return Optional.of(artifact.diagnostic(ownership));
-                }
-                return Optional.ofNullable(loadFailures.get(artifactId));
-            }
+            return store.diagnostic(artifactId, ownership);
         }).join();
     }
 
@@ -304,14 +219,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
         List<String> ids;
         try {
-            ids = coordinator.submit(() -> {
-                synchronized (stateLock) {
-                    return artifacts.values().stream()
-                            .filter(artifact -> artifact.state != ArtifactState.UNLOADED)
-                            .map(artifact -> artifact.artifactId)
-                            .toList();
-                }
-            }).join();
+            ids = coordinator.submit(store::activeArtifactIds).join();
         } catch (Throwable failure) {
             clearFailedCloseAttempt(attempt);
             attempt.completeExceptionally(failure);
@@ -324,7 +232,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             return attempt;
         }
         List<CompletableFuture<Void>> drains = ids.stream()
-                .map(id -> drain(id, "close-drain"))
+                .map(id -> drainService.drain(id, "close-drain"))
                 .toList();
         CompletableFuture.allOf(drains.toArray(CompletableFuture[]::new)).whenComplete((ignored, failure) -> {
             if (failure != null) {
@@ -394,9 +302,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         boolean lostRace = false;
         H component = null;
         try {
-            synchronized (stateLock) {
-                requireMountableLocked(handle);
-            }
+            requireMountable(handle);
             // 核心事务在不持有适配器内存锁的情况下提交；核心内核控制启动。
             try {
                 component = runtime.advanced().transact(commit::apply).value();
@@ -407,25 +313,24 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         "Knotra rejected mount: " + failure.diagnostics(),
                         failure.diagnostics());
             }
-            synchronized (stateLock) {
-                // 在判断并发排空是否胜出前，先记录已提交的核心句柄。
-                handle.artifact.directHandles.put(component.handleId(), component);
-                if (handle.artifact.acceptingMounts
-                        && handle.artifact.state == ArtifactState.ACTIVE) {
-                    return component;
-                }
+            if (!store.recordDirectHandle(
+                    handle.artifact,
+                    component.handleId(),
+                    component)) {
                 lostRace = true;
+            } else {
+                return component;
             }
         } finally {
             if (!lostRace) {
-                endMount(handle.artifact);
+                store.endMount(handle.artifact);
             }
         }
 
         // 在排空期间提交的挂载在补偿完成前保持所有权。
         H rejected = component;
         rejected.disposeAsync().whenComplete((ignored, disposalFailure) ->
-                endMount(handle.artifact));
+                store.endMount(handle.artifact));
         throw new ArtifactOperationException(
                 handle.artifact.artifactId,
                 "mount",
@@ -433,20 +338,15 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     private void beginMount(ManagedFactory handle) {
-        synchronized (stateLock) {
-            if (closeStarted.get()) {
-                throw new ArtifactOperationException(
-                        handle.artifact.artifactId, "mount", "adapter is closed");
-            }
-            requireMountableLocked(handle);
-            handle.artifact.mountsInFlight++;
+        if (closeStarted.get()) {
+            throw new ArtifactOperationException(
+                    handle.artifact.artifactId, "mount", "adapter is closed");
         }
+        store.beginMount(handle);
     }
 
-    private void requireMountableLocked(ManagedFactory handle) {
-        if (handle.factory == null
-                || !handle.artifact.acceptingMounts
-                || handle.artifact.state != ArtifactState.ACTIVE) {
+    private void requireMountable(ManagedFactory handle) {
+        if (!store.isMountable(handle)) {
             throw new ArtifactOperationException(
                     handle.artifact.artifactId,
                     "mount",
@@ -454,185 +354,15 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         }
     }
 
-    private void endMount(ManagedArtifact artifact) {
-        synchronized (stateLock) {
-            artifact.mountsInFlight = Math.max(0, artifact.mountsInFlight - 1);
-            if (artifact.mountsInFlight == 0) {
-                CompletableFuture<Void> future = artifact.mountsInFlightFuture;
-                artifact.mountsInFlightFuture = null;
-                if (future != null) {
-                    future.complete(null);
-                }
-            }
-        }
-    }
-
-    private ArtifactClosure resolveClosure(Path targetPath) {
-        CompoundPluginDescriptorFinder descriptorFinder = new CompoundPluginDescriptorFinder()
-                .add(new PropertiesPluginDescriptorFinder())
-                .add(new ManifestPluginDescriptorFinder());
-        Map<String, CatalogEntry> repository = new LinkedHashMap<>();
-        Map<Path, CatalogEntry> byPath = new LinkedHashMap<>();
-        LinkedHashSet<Path> roots = new LinkedHashSet<>();
-        // 同时扫描配置 roots、目标所在目录和已加载 wrapper，才能复用依赖并识别同 ID 冲突。
-        for (Path root : safePluginRoots()) {
-            roots.add(root.toAbsolutePath().normalize());
-        }
-        roots.add(targetPath.getParent().toAbsolutePath().normalize());
-        for (Path root : roots) {
-            for (Path path : new JarPluginRepository(root).getPluginPaths()) {
-                putRepositoryEntry(
-                        repository,
-                        byPath,
-                        readDescriptor(descriptorFinder, path.toAbsolutePath().normalize()));
-            }
-        }
-        for (PluginWrapper wrapper : pluginManager.getPlugins()) {
-            putRepositoryEntry(repository, byPath, new CatalogEntry(
-                    wrapper.getPluginPath().toAbsolutePath().normalize(),
-                    wrapper.getDescriptor()));
-        }
-
-        CatalogEntry targetEntry = readDescriptor(descriptorFinder, targetPath);
-        putRepositoryEntry(repository, byPath, targetEntry);
-        String targetId = targetEntry.descriptor().getPluginId();
-
-        Map<String, CatalogEntry> selected = new LinkedHashMap<>();
-        Set<String> missing = new LinkedHashSet<>();
-        collectClosure(targetId, repository, selected, new LinkedHashSet<>(), missing);
-        if (!missing.isEmpty()) {
-            throw new IllegalStateException(
-                    "missing required PF4J dependencies: " + String.join(", ", missing));
-        }
-        DependencyResolver.Result resolved = new DependencyResolver(pluginManager.getVersionManager())
-                .resolve(selected.values().stream().map(CatalogEntry::descriptor).toList());
-        if (resolved.hasCyclicDependency()) {
-            throw new IllegalStateException("PF4J dependency cycle contains artifact " + targetId);
-        }
-        if (resolved.hasNotFoundDependencies()) {
-            throw new IllegalStateException(
-                    "missing required PF4J dependencies: " + resolved.getNotFoundDependencies());
-        }
-        if (resolved.hasWrongVersionDependencies()) {
-            throw new IllegalStateException(
-                    "incompatible PF4J dependencies: " + resolved.getWrongVersionDependencies());
-        }
-        Set<String> selectedIds = selected.keySet();
-        List<String> order = resolved.getSortedPlugins().stream()
-                .filter(selectedIds::contains)
-                .toList();
-        if (order.isEmpty() || !order.getLast().equals(targetId)) {
-            throw new IllegalStateException("PF4J dependency order does not end at " + targetId);
-        }
-        return new ArtifactClosure(targetId, order, selected);
-    }
-
-    private CatalogEntry readDescriptor(
-            CompoundPluginDescriptorFinder finder,
-            Path path) {
-        try {
-            PluginDescriptor descriptor = finder.find(path);
-            if (descriptor != null
-                    && descriptor.getPluginId() != null
-                    && !descriptor.getPluginId().isBlank()
-                    && descriptor.getVersion() != null) {
-                return new CatalogEntry(path, descriptor);
-            }
-        } catch (RuntimeException ignored) {
-            // 统一落到下方稳定失败，避免把 finder 的各种运行时异常泄漏给宿主。
-        }
-        throw new IllegalStateException("cannot read a valid PF4J descriptor from " + path);
-    }
-
-    private void putRepositoryEntry(
-            Map<String, CatalogEntry> repository,
-            Map<Path, CatalogEntry> byPath,
-            CatalogEntry entry) {
-        CatalogEntry byId = repository.putIfAbsent(entry.descriptor().getPluginId(), entry);
-        if (byId != null && !sameEntry(byId, entry)) {
-            throw ambiguousTarget(entry.descriptor().getPluginId(), """
-                    ambiguous PF4J repository entry: id=%s, firstPath=%s, firstVersion=%s, \
-                    actualPath=%s, actualVersion=%s\
-                    """.formatted(
-                    entry.descriptor().getPluginId(),
-                    byId.path(),
-                    byId.descriptor().getVersion(),
-                    entry.path(),
-                    entry.descriptor().getVersion()));
-        }
-        CatalogEntry pathEntry = byPath.putIfAbsent(entry.path(), entry);
-        if (pathEntry != null && !sameEntry(pathEntry, entry)) {
-            throw ambiguousTarget(entry.descriptor().getPluginId(), """
-                    ambiguous PF4J path entry: path=%s, firstId=%s, firstVersion=%s, \
-                    actualId=%s, actualVersion=%s\
-                    """.formatted(
-                    entry.path(),
-                    pathEntry.descriptor().getPluginId(),
-                    pathEntry.descriptor().getVersion(),
-                    entry.descriptor().getPluginId(),
-                    entry.descriptor().getVersion()));
-        }
-    }
-
-    private boolean sameEntry(CatalogEntry left, CatalogEntry right) {
-        return left.path().equals(right.path())
-                && left.descriptor().getPluginId().equals(right.descriptor().getPluginId())
-                && left.descriptor().getVersion().equals(right.descriptor().getVersion());
-    }
-
-    private IllegalStateException ambiguousTarget(String id, String message) {
-        return new IllegalStateException(message + ", artifactId=" + id);
-    }
-
-    private void collectClosure(
-            String id,
-            Map<String, CatalogEntry> repository,
-            Map<String, CatalogEntry> selected,
-            Set<String> visiting,
-            Set<String> missing) {
-        if (!visiting.add(id)) {
-            throw new IllegalStateException("PF4J dependency cycle contains artifact " + id);
-        }
-        CatalogEntry entry = repository.get(id);
-        if (entry == null) {
-            missing.add(id);
-            visiting.remove(id);
-            return;
-        }
-        selected.put(id, entry);
-        // optional 依赖只要在仓库中就参与解析；完全缺失时才允许被跳过。
-        for (PluginDependency dependency : entry.descriptor().getDependencies()) {
-            if (repository.containsKey(dependency.getPluginId()) || !dependency.isOptional()) {
-                collectClosure(
-                        dependency.getPluginId(),
-                        repository,
-                        selected,
-                        visiting,
-                        missing);
-            }
-        }
-        visiting.remove(id);
-    }
-
-    private List<Path> safePluginRoots() {
-        try {
-            List<Path> roots = pluginManager.getPluginsRoots();
-            if (roots == null) {
-                return List.of();
-            }
-            return roots.stream().filter(Objects::nonNull).toList();
-        } catch (RuntimeException ignored) {
-            return List.of();
-        }
-    }
-
-    private void loadMissing(ArtifactClosure closure, LoadJournal journal) {
+    private void loadMissing(
+            Pf4jClosureResolver.ArtifactClosure closure,
+            LoadJournal journal) {
         for (String id : closure.loadOrder()) {
             // 只加载 PF4J 尚未持有的插件，并验证实际 ID，防止描述符与 jar 内容漂移。
             if (pluginManager.getPlugin(id) != null) {
                 continue;
             }
-            CatalogEntry entry = closure.entry(id);
+            Pf4jClosureResolver.CatalogEntry entry = closure.entry(id);
             String loadedId = pluginManager.loadPlugin(entry.path());
             if (loadedId == null || loadedId.isBlank()) {
                 throw new IllegalStateException("PF4J loadPlugin returned no id for " + entry.path());
@@ -651,38 +381,21 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         String version = wrapper.getDescriptor().getVersion();
 
         // 扩展发现会执行插件代码，因此候选对象在锁外构建，发布时再复查当前受管状态。
-        synchronized (stateLock) {
-            ManagedArtifact existing = artifacts.get(artifactId);
-            if (existing != null && existing.state != ArtifactState.UNLOADED) {
-                requireSameManagedArtifact(existing, wrapper, path, version);
-                return;
-            }
-        }
-
-        ManagedArtifact candidate = new ManagedArtifact(
+        store.publishCandidate(
                 artifactId,
-                version,
-                path,
-                dependencies(wrapper),
-                wrapper);
-        candidate.pf4jStateView = () -> pf4jState(artifactId);
-        List<ManagedFactory> discovered = discoverFactories(candidate, requireProvider);
-        // 锁外发现期间同 ID 可能已被并发协调发布；只有最终检查通过才提交目录。
-        synchronized (stateLock) {
-            ManagedArtifact existing = artifacts.get(artifactId);
-            if (existing != null && existing.state != ArtifactState.UNLOADED) {
-                requireSameManagedArtifact(existing, wrapper, path, version);
-                return;
-            }
-            artifacts.put(artifactId, candidate);
-            loadFailures.remove(artifactId);
-            for (ManagedFactory factory : discovered) {
-                candidate.factories.add(factory);
-                candidate.factoriesById.put(factory.factoryId, factory);
-                candidate.factoryIdHistory.add(factory.factoryId);
-                catalog.put(factory.factoryId, factory);
-            }
-        }
+                existing -> requireSameManagedArtifact(existing, wrapper, path, version),
+                () -> {
+                    ManagedArtifact candidate = new ManagedArtifact(
+                            artifactId,
+                            version,
+                            path,
+                            dependencies(wrapper),
+                            wrapper);
+                    candidate.pf4jStateView = () -> pf4jState(artifactId);
+                    return new ManagedArtifactStore.Candidate(
+                            candidate,
+                            discoverFactories(candidate, requireProvider));
+                });
     }
 
     private void requireSameManagedArtifact(
@@ -706,6 +419,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         + ", actualPath=" + path
                         + ", actualVersion=" + version);
     }
+
     private Set<String> dependencies(PluginWrapper wrapper) {
         return wrapper.getDescriptor().getDependencies().stream()
                 .map(PluginDependency::getPluginId)
@@ -780,12 +494,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             throw new IllegalStateException(
                     "duplicate factory id inside artifact: " + factoryId);
         }
-        synchronized (stateLock) {
-            if (catalog.containsKey(factoryId)) {
-                throw new IllegalStateException(
-                        "factory id is already cataloged: " + factoryId);
-            }
-        }
+        store.requireFactoryIdAbsent(factoryId);
         result.add(ManagedFactory.create(
                 this,
                 artifact,
@@ -801,58 +510,42 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         boolean residual = false;
         List<String> loaded = journal.loaded();
         for (int index = loaded.size() - 1; index >= 0; index--) {
-            String id = loaded.get(index);
-            PluginWrapper wrapper = pluginManager.getPlugin(id);
-            if (wrapper == null) {
-                continue;
-            }
-            try {
-                if (wrapper.getPluginState() == PluginState.STARTED
-                        && pluginManager.stopPlugin(id) != PluginState.STOPPED) {
-                    rollbackFailures.add("PF4J stop returned non-STOPPED for " + id);
-                }
-            } catch (Throwable stopFailure) {
-                rollbackFailures.add(FailureText.describe(stopFailure));
-            }
-            try {
-                if (!pluginManager.unloadPlugin(id) && pluginManager.getPlugin(id) != null) {
-                    rollbackFailures.add("PF4J unload returned false for " + id);
-                }
-            } catch (Throwable unloadFailure) {
-                rollbackFailures.add(FailureText.describe(unloadFailure));
-            }
-            if (pluginManager.getPlugin(id) == null) {
-                synchronized (stateLock) {
-                    ManagedArtifact artifact = artifacts.get(id);
-                    if (artifact != null) {
-                        artifact.unloadView();
-                    }
-                }
-            } else {
-                residual = true;
-                registerResidual(id, rollbackFailures);
-            }
+            residual |= rollbackOne(loaded.get(index), rollbackFailures);
         }
         String message = rollbackFailures.isEmpty()
                 ? FailureText.describe(failure)
                 : FailureText.describe(failure) + "; rollback: " + String.join("; ", rollbackFailures);
         if (targetId != null) {
-            synchronized (stateLock) {
-                ManagedArtifact existing = artifacts.get(targetId);
-                if (existing != null && existing.state != ArtifactState.UNLOADED) {
-                    existing.lastError = message;
-                    return;
-                }
-                loadFailures.put(targetId, new ArtifactDiagnostic(
-                        targetId,
-                        ArtifactState.FAILED,
-                        residual ? "load-rollback-residual" : "load-rollback",
-                        List.of(),
-                        List.of(),
-                        Optional.of(message),
-                        List.of()));
-            }
+            store.recordLoadFailure(targetId, message, residual);
         }
+    }
+
+    private boolean rollbackOne(String id, List<String> rollbackFailures) {
+        PluginWrapper wrapper = pluginManager.getPlugin(id);
+        if (wrapper == null) {
+            return false;
+        }
+        try {
+            if (wrapper.getPluginState() == PluginState.STARTED
+                    && pluginManager.stopPlugin(id) != PluginState.STOPPED) {
+                rollbackFailures.add("PF4J stop returned non-STOPPED for " + id);
+            }
+        } catch (Throwable stopFailure) {
+            rollbackFailures.add(FailureText.describe(stopFailure));
+        }
+        try {
+            if (!pluginManager.unloadPlugin(id) && pluginManager.getPlugin(id) != null) {
+                rollbackFailures.add("PF4J unload returned false for " + id);
+            }
+        } catch (Throwable unloadFailure) {
+            rollbackFailures.add(FailureText.describe(unloadFailure));
+        }
+        if (pluginManager.getPlugin(id) == null) {
+            store.discardUnloadedView(id);
+            return false;
+        }
+        registerResidual(id, rollbackFailures);
+        return true;
     }
 
     private void registerResidual(String artifactId, List<String> rollbackFailures) {
@@ -860,374 +553,31 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         if (wrapper == null) {
             return;
         }
-        synchronized (stateLock) {
-            ManagedArtifact artifact = artifacts.get(artifactId);
-            if (artifact == null) {
-                artifact = new ManagedArtifact(
-                        artifactId,
-                        wrapper.getDescriptor().getVersion(),
-                        wrapper.getPluginPath(),
-                        dependencies(wrapper),
-                        wrapper);
-                artifact.pf4jStateView = () -> pf4jState(artifactId);
-                artifacts.put(artifactId, artifact);
-            }
-            artifact.fail(
-                    "load-rollback-residual",
-                    String.join("; ", rollbackFailures));
-            loadFailures.put(artifactId, artifact.diagnostic(List.of()));
-        }
-    }
-
-    private CompletableFuture<Void> drain(String artifactId, String phase) {
-        if (closeStarted.get() && phase.equals("unload")) {
-            return CompletableFuture.failedFuture(new IllegalStateException("adapter is closing"));
-        }
-        if (coordinator.isStopped()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("adapter is closed"));
-        }
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        // 先在协调器上完成状态切换；后续等待和 dispose 异步执行，不占用唯一协调线程。
-        CompletableFuture<Void> scheduled = coordinator.execute(() -> {
-            DrainRequest request;
-            synchronized (stateLock) {
-                ManagedArtifact target = artifacts.get(artifactId);
-                if (target == null) {
-                    result.completeExceptionally(new ArtifactOperationException(
-                            artifactId, phase, "artifact is not managed"));
-                    return;
-                }
-                // 复用同一个 drain future，使并发 unload/retry 观察到同一结果。
-                if (target.state == ArtifactState.DRAINING && target.drainFuture != null) {
-                    target.drainFuture.whenComplete((ignored, error) -> {
-                        if (error == null) {
-                            result.complete(null);
-                        } else {
-                            result.completeExceptionally(error);
-                        }
-                    });
-                    return;
-                }
-                if (target.state == ArtifactState.UNLOADED) {
-                    result.complete(null);
-                    return;
-                }
-                try {
-                    request = beginDrainLocked(target, result, phase);
-                } catch (RuntimeException failure) {
-                    result.completeExceptionally(failure);
-                    return;
-                }
-            }
-            waitAndDispose(request);
-        });
-        scheduled.whenComplete((ignored, error) -> {
-            if (error != null) {
-                result.completeExceptionally(error);
-            }
-        });
-        return result;
-    }
-
-    private DrainRequest beginDrainLocked(
-            ManagedArtifact target,
-            CompletableFuture<Void> result,
-            String phase) {
-        // 卸载依赖会先 drain 全部未卸载下游 artifact，避免下游仍引用已释放插件类。
-        List<ManagedArtifact> closure = dependentClosure(target);
-        for (ManagedArtifact artifact : closure) {
-            artifact.state = ArtifactState.DRAINING;
-            artifact.transition = phase;
-            artifact.acceptingMounts = false;
-            artifact.drainFuture = result;
-            for (ManagedFactory factory : artifact.factories) {
-                catalog.remove(factory.factoryId);
-            }
-            artifact.invalidateFactories();
-        }
-        return new DrainRequest(closure, result, phase);
-    }
-
-    private List<ManagedArtifact> dependentClosure(ManagedArtifact target) {
-        List<ManagedArtifact> order = new ArrayList<>();
-        collectDependents(target.artifactId, new LinkedHashSet<>(), order, new LinkedHashSet<>());
-        return order;
-    }
-
-    private void collectDependents(
-            String artifactId,
-            Set<String> visited,
-            List<ManagedArtifact> order,
-            Set<String> visiting) {
-        if (!visiting.add(artifactId)) {
-            throw new IllegalStateException("PF4J dependent cycle contains artifact " + artifactId);
-        }
-        for (ManagedArtifact candidate : artifacts.values()) {
-            if (candidate.state != ArtifactState.UNLOADED
-                    && candidate.dependencies.contains(artifactId)) {
-                collectDependents(candidate.artifactId, visited, order, visiting);
-            }
-        }
-        visiting.remove(artifactId);
-        if (visited.add(artifactId)) {
-            ManagedArtifact self = artifacts.get(artifactId);
-            if (self != null && self.state != ArtifactState.UNLOADED) {
-                order.add(self);
-            }
-        }
-    }
-
-    private void waitAndDispose(DrainRequest request) {
-        // drain 的顺序是等待 in-flight 挂载，再刷新归属并异步 dispose owned root。
-        List<CompletableFuture<Void>> waits = request.artifacts().stream()
-                .map(this::waitForMounts)
-                .toList();
-        CompletableFuture.allOf(waits.toArray(CompletableFuture[]::new))
-                .whenComplete((ignored, waitFailure) -> {
-                    if (waitFailure != null) {
-                        completeDrainFailure(request, waitFailure);
-                        return;
-                    }
-                    disposeOwnedHandles(request);
-                });
-    }
-
-    private CompletableFuture<Void> waitForMounts(ManagedArtifact artifact) {
-        synchronized (stateLock) {
-            if (artifact.mountsInFlight == 0) {
-                return CompletableFuture.completedFuture(null);
-            }
-            if (artifact.mountsInFlightFuture == null) {
-                artifact.mountsInFlightFuture = new CompletableFuture<>();
-            }
-            return artifact.mountsInFlightFuture;
-        }
-    }
-
-    private void disposeOwnedHandles(DrainRequest request) {
-        for (ManagedArtifact artifact : request.artifacts()) {
-            refreshOwnership(artifact.artifactId);
-        }
-        // 只 dispose 适配器直接提交的根；来源标记像 artifact 的宿主根不能被悄悄夺走。
-        ArtifactOperationException missingRoots = verifyKnownArtifactRoots(request);
-        if (missingRoots != null) {
-            completeDrainFailure(request, missingRoots);
-            return;
-        }
-        List<CompletableFuture<ComponentState>> disposals = new ArrayList<>();
-        for (ManagedArtifact artifact : request.artifacts()) {
-            for (MountHandle handle : artifact.rootHandles()) {
-                if (handle.state() == ComponentState.DISPOSED) {
-                    continue;
-                }
-                disposals.add(disposeRootHandle(handle));
-            }
-        }
-        if (disposals.isEmpty()) {
-            finishDrain(request);
-            return;
-        }
-        CompletableFuture.allOf(disposals.toArray(CompletableFuture[]::new))
-                .whenComplete((ignored, disposalFailure) -> {
-                    for (ManagedArtifact artifact : request.artifacts()) {
-                        refreshOwnership(artifact.artifactId);
-                    }
-                    boolean unsettled = request.artifacts().stream()
-                            .flatMap(artifact -> artifact.rootHandles().stream())
-                            .anyMatch(handle -> handle.state() != ComponentState.DISPOSED);
-                    if (disposalFailure != null || unsettled) {
-                        completeDrainFailure(
-                                request,
-                                disposalFailure == null
-                                        ? new ArtifactOperationException(
-                                                request.targetId(),
-                                                "drain",
-                                                "one or more artifact components failed teardown")
-                                        : disposalFailure);
-                        return;
-                    }
-                    finishDrain(request);
-                });
-    }
-
-    private CompletableFuture<ComponentState> disposeRootHandle(MountHandle handle) {
-        boolean failedDisposedGoal = handle.state() == ComponentState.FAILED
-                && handle.goal() == io.knotra.ComponentGoal.DISPOSED;
-        // FAILED 且目标是 DISPOSED 时，只剩可重试的清理，不应重新启动组件。
-        CompletableFuture<ComponentState> attempt = failedDisposedGoal
-                ? handle.retryAsync().toCompletableFuture()
-                : handle.disposeAsync().toCompletableFuture();
-        return attempt.exceptionallyCompose(error -> {
-            if (!isRuntimeClosing()) {
-                return CompletableFuture.failedFuture(error);
-            }
-            // runtime.close 已拥有该清理；适配器等待其收敛，避免重复 dispose 争抢。
-            return handle.whenSettled().toCompletableFuture();
-        });
-    }
-
-    private boolean isRuntimeClosing() {
-        String rootId = runtime.root().contextId();
-        return runtime.advanced().snapshot().contexts().stream()
-                .filter(context -> context.contextId().equals(rootId))
-                .findFirst()
-                .map(context -> context.state() == io.knotra.ContextState.DISPOSING
-                        || context.state() == io.knotra.ContextState.DISPOSED)
-                .orElse(false);
-    }
-
-    private ArtifactOperationException verifyKnownArtifactRoots(DrainRequest request) {
-        Set<String> artifactIds = request.artifacts().stream()
-                .map(artifact -> artifact.artifactId)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
-        List<String> missing = new ArrayList<>();
-        synchronized (stateLock) {
-            for (RuntimeSnapshot.MountSnapshot component : snapshot.mounts()) {
-                ComponentOrigin origin = component.origin();
-                if (origin.kind() != ComponentOrigin.Kind.ARTIFACT
-                        || !artifactIds.contains(origin.sourceId())
-                        || component.parentHandleId() != null) {
-                    continue;
-                }
-                ManagedArtifact artifact = artifacts.get(origin.sourceId());
-                if (artifact == null || !artifact.directHandles.containsKey(component.handleId())) {
-                    missing.add(component.handleId());
-                }
-            }
-        }
-        if (missing.isEmpty()) {
-            return null;
-        }
-        return new ArtifactOperationException(
-                request.targetId(),
-                "drain",
-                "artifact snapshot contains roots without adapter ownership: "
-                        + missing.stream().sorted().toList());
-    }
-
-    private void completeDrainFailure(DrainRequest request, Throwable failure) {
-        synchronized (stateLock) {
-            for (ManagedArtifact artifact : request.artifacts()) {
-                artifact.state = ArtifactState.DRAIN_FAILED;
-                artifact.transition = "drain-failed";
-                artifact.acceptingMounts = false;
-                artifact.lastError = FailureText.describe(failure);
-                artifact.drainFuture = null;
-            }
-        }
-        request.result().completeExceptionally(failure);
-    }
-
-    private void finishDrain(DrainRequest request) {
-        // 所有 dispose settled 后重新进入协调器；最终 stop/unload 不能与读或其他 drain 交错。
-        CompletableFuture<Void> scheduled = coordinator.execute(() -> {
-            try {
-                stopAndUnload(request);
-                synchronized (stateLock) {
-                    for (ManagedArtifact artifact : request.artifacts()) {
-                        artifact.state = ArtifactState.UNLOADED;
-                        artifact.transition = "unloaded";
-                        terminalSnapshots.put(artifact.artifactId, artifact.snapshot(List.of()));
-                        artifact.unloadView();
-                    }
-                }
-                request.result().complete(null);
-            } catch (Throwable failure) {
-                synchronized (stateLock) {
-                    for (ManagedArtifact artifact : request.artifacts()) {
-                        if (artifact.state == ArtifactState.UNLOADED) {
-                            continue;
-                        }
-                        artifact.state = ArtifactState.DRAIN_FAILED;
-                        artifact.transition = "pf4j-unload-failed";
-                        artifact.acceptingMounts = false;
-                        artifact.lastError = FailureText.describe(failure);
-                        artifact.drainFuture = null;
-                    }
-                }
-                request.result().completeExceptionally(failure);
-            }
-        });
-        scheduled.whenComplete((ignored, error) -> {
-            if (error != null) {
-                request.result().completeExceptionally(error);
-            }
-        });
-    }
-
-    private void stopAndUnload(DrainRequest request) {
-        for (ManagedArtifact artifact : request.artifacts()) {
-            PluginWrapper wrapper = pluginManager.getPlugin(artifact.artifactId);
-            PluginState current = wrapper == null || wrapper.getPluginState() == null
-                    ? PluginState.UNLOADED
-                    : wrapper.getPluginState();
-            if (current == PluginState.STARTED) {
-                PluginState stopped = pluginManager.stopPlugin(artifact.artifactId);
-                if (stopped != PluginState.STOPPED) {
-                    throw new IllegalStateException(
-                            "PF4J stop returned " + stopped + " for " + artifact.artifactId);
-                }
-            }
-            if (!pluginManager.unloadPlugin(artifact.artifactId)
-                    && pluginManager.getPlugin(artifact.artifactId) != null) {
-                throw new IllegalStateException(
-                        "PF4J unload returned false for " + artifact.artifactId);
-            }
-        }
+        store.registerResidual(
+                artifactId,
+                wrapper,
+                candidateWrapper -> {
+                    ManagedArtifact residual = new ManagedArtifact(
+                            artifactId,
+                            candidateWrapper.getDescriptor().getVersion(),
+                            candidateWrapper.getPluginPath(),
+                            dependencies(candidateWrapper),
+                            candidateWrapper);
+                    residual.pf4jStateView = () -> pf4jState(artifactId);
+                    return residual;
+                },
+                String.join("; ", rollbackFailures));
     }
 
     private ArtifactSnapshot snapshotCoordinated(String artifactId) {
         List<ArtifactOwnership> ownership = ownershipCoordinated(artifactId);
-        synchronized (stateLock) {
-            ManagedArtifact artifact = artifacts.get(artifactId);
-            return artifact == null ? null : artifact.snapshot(ownership);
-        }
+        return store.snapshot(artifactId, ownership);
     }
 
     private List<ArtifactOwnership> ownershipCoordinated(String artifactId) {
-        ManagedArtifact artifact;
-        synchronized (stateLock) {
-            artifact = artifacts.get(artifactId);
-        }
-        if (artifact == null || artifact.state == ArtifactState.UNLOADED) {
-            return List.of();
-        }
-        RuntimeSnapshot snapshot = runtime.advanced().snapshot();
-        Map<String, RuntimeSnapshot.MountSnapshot> byId = snapshot.mounts().stream()
-                .collect(Collectors.toMap(
-                        RuntimeSnapshot.MountSnapshot::handleId,
-                        item -> item,
-                        (left, right) -> right,
-                        LinkedHashMap::new));
-        synchronized (stateLock) {
-            // 运行时快照具有权威性；已释放挂载的过期本地记录会被移除。
-            artifact.directHandles.keySet().removeIf(handleId ->
-                    artifact.directHandles.get(handleId) != null
-                            && artifact.directHandles.get(handleId).state() == ComponentState.DISPOSED
-                            && !byId.containsKey(handleId));
-            List<ArtifactOwnership> result = new ArrayList<>();
-            for (RuntimeSnapshot.MountSnapshot component : snapshot.mounts()) {
-                ComponentOrigin origin = component.origin();
-                if (origin.kind() != ComponentOrigin.Kind.ARTIFACT
-                        || !origin.sourceId().equals(artifactId)) {
-                    continue;
-                }
-                String factoryId = component.factoryId();
-                result.add(new ArtifactOwnership(
-                        artifactId,
-                        factoryId,
-                        component.handleId(),
-                        component.mountId(),
-                        component.parentHandleId(),
-                        component.state()));
-            }
-            return result;
-        }
-    }
-
-    private void refreshOwnership(String artifactId) {
-        ownershipCoordinated(artifactId);
+        return store.ownershipCoordinated(
+                artifactId,
+                () -> runtime.advanced().snapshot());
     }
 
     private String pf4jState(String artifactId) {
@@ -1244,23 +594,6 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                 : failure;
     }
 
-    private record CatalogEntry(Path path, PluginDescriptor descriptor) {
-    }
-
-    private record ArtifactClosure(
-            String targetId,
-            List<String> loadOrder,
-            Map<String, CatalogEntry> entries) {
-
-        CatalogEntry entry(String artifactId) {
-            CatalogEntry entry = entries.get(artifactId);
-            if (entry == null) {
-                throw new IllegalStateException("artifact is not in closure: " + artifactId);
-            }
-            return entry;
-        }
-    }
-
     private static final class LoadJournal {
         private final List<String> loadedIds = new ArrayList<>();
 
@@ -1272,16 +605,6 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
         List<String> loaded() {
             return List.copyOf(loadedIds);
-        }
-    }
-
-    private record DrainRequest(
-            List<ManagedArtifact> artifacts,
-            CompletableFuture<Void> result,
-            String phase) {
-
-        String targetId() {
-            return artifacts.getLast().artifactId;
         }
     }
 }

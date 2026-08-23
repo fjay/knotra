@@ -3,6 +3,7 @@ package io.knotra;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
@@ -130,11 +131,17 @@ final class DynamicCapabilityTest {
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
         assertEquals("v1", dynamic.get().call(Api::value));
 
-        runtime.advanced().revoke(first);
+        runtime.advanced().transact(transaction -> {
+            transaction.revoke(first);
+            return null;
+        }).awaitSettled(Duration.ofSeconds(10));
         assertEquals(ComponentState.ACTIVE,
                 handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS));
         assertFalse(dynamic.get().available());
-        assertThrows(CapabilityUnavailableException.class, () -> dynamic.get().call(Api::value));
+        CapabilityUnavailableException unavailable = assertThrows(
+                CapabilityUnavailableException.class,
+                () -> dynamic.get().call(Api::value));
+        assertEquals(API, unavailable.key());
 
         provide(new ApiValue("v2"));
         assertEquals(ComponentState.ACTIVE,
@@ -162,12 +169,17 @@ final class DynamicCapabilityTest {
                 CapabilityRequirement.dynamicRequired(API));
 
         assertTrue(entered.await(10, TimeUnit.SECONDS));
-        runtime.advanced().revoke(registration);
+        runtime.advanced().transact(transaction -> {
+            transaction.revoke(registration);
+            return null;
+        });
         release.complete(null);
 
         assertEquals(ComponentState.WAITING, TestKit.settle(handle).call());
-        assertThrows(DynamicCapabilityClosedException.class,
+        DynamicCapabilityClosedException closed = assertThrows(
+                DynamicCapabilityClosedException.class,
                 () -> dynamic.get().call(Api::value));
+        assertEquals(API.name(), closed.capabilityName());
         assertTrue(runtime.advanced().snapshot().diagnostics().stream().noneMatch(diagnostic ->
                 diagnostic.code() == DiagnosticCode.ACTIVATION_FAILED
                         && diagnostic.targetId().equals(handle.handleId())));
@@ -360,7 +372,10 @@ final class DynamicCapabilityTest {
         var shadow = runtime.advanced().transact(transaction ->
                 transaction.provide(child, API, new ApiValue("child"))).value();
         assertEquals("child", dynamic.get().call(Api::value));
-        runtime.advanced().revoke(shadow);
+        runtime.advanced().transact(transaction -> {
+            transaction.revoke(shadow);
+            return null;
+        }).awaitSettled(Duration.ofSeconds(10));
         assertEquals("parent", dynamic.get().call(Api::value));
         assertEquals(1, starts.get());
     }

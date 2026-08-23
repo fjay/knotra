@@ -1,20 +1,7 @@
 package io.knotra;
 
-import java.util.Optional;
 /** 传递给组件启动回调的一次性激活上下文（ActivationContext）。 */
-public interface ActivationContext {
-    <T> T require(CapabilityKey<T> key);
-
-    default <T> T require(Class<T> type) {
-        return require(CapabilityKey.of(type));
-    }
-
-    <T> Optional<T> find(CapabilityKey<T> key);
-
-    default <T> Optional<T> find(Class<T> type) {
-        return find(CapabilityKey.of(type));
-    }
-
+public interface ActivationContext extends CapabilityLookup {
     <T> DynamicCapability<T> subscribe(CapabilityKey<T> key);
 
     default <T> DynamicCapability<T> subscribe(Class<T> type) {

@@ -32,23 +32,18 @@ final class RegistrationPublicationTest {
     @Test
     void typedRegistrationReplacesInItsOriginalContextAndWaitsForRevokeDrain() throws Exception {
         ContextHandle child = runtime.advanced().childContext(runtime.root(), "child");
-        Registration<String> first = runtime.advanced().register(child, TEXT, "one");
-        assertEquals(child, first.context());
-        assertEquals(TEXT, first.key());
+        PublicationChange<String> first = runtime.publish(child, TEXT, "one");
+        Publication<String> publication = first.publication();
         first.awaitSettled(Duration.ofSeconds(10));
         assertEquals("one", child.view().require(TEXT));
 
-        Registration<String> second = first.replace("two");
-        assertNotEquals(first.registrationId(), second.registrationId());
-        assertEquals(child, second.context());
+        PublicationChange<String> second = publication.update("two");
         assertEquals("two", child.view().require(TEXT));
-        assertThrows(TransactionRejectedException.class, () -> first.replace("three"));
-        assertThrows(TransactionRejectedException.class, first::revoke);
-
         second.awaitSettled(Duration.ofSeconds(10));
-        Settlement revoked = second.revoke();
-        assertNotNull(revoked.awaitSettled(Duration.ofSeconds(10)));
-        assertThrows(TransactionRejectedException.class, second::revoke);
+
+        PublicationChange<String> removed = publication.unpublish();
+        assertNotNull(removed.awaitSettled(Duration.ofSeconds(10)));
+        assertSame(removed, publication.unpublish());
         assertTrue(child.view().find(TEXT).isEmpty());
     }
 
@@ -77,7 +72,7 @@ final class RegistrationPublicationTest {
 
     @Test
     void publicationKeepsChildContextAndShadowsParentUntilUnpublished() throws Exception {
-        Registration<String> parent = runtime.advanced().register(TEXT, "parent");
+        PublicationChange<String> parent = runtime.publish(TEXT, "parent");
         parent.awaitSettled(Duration.ofSeconds(10));
         ContextHandle child = runtime.advanced().childContext(runtime.root(), "child");
         PublicationChange<String> childChange = runtime.publish(child, TEXT, "child-value");
@@ -94,7 +89,10 @@ final class RegistrationPublicationTest {
         String regId = runtime.advanced().snapshot().registrations().stream()
                 .filter(r -> r.capability().name().equals(TEXT.name()))
                 .findFirst().orElseThrow().registrationId();
-        runtime.advanced().revoke(() -> regId).awaitSettled(Duration.ofSeconds(10));
+        runtime.advanced().transact(transaction -> {
+            transaction.revoke(() -> regId);
+            return null;
+        }).awaitSettled(Duration.ofSeconds(10));
         assertEquals(PublicationState.DISPLACED, publication.state());
         assertThrows(TransactionRejectedException.class, () -> publication.update("two"));
     }
@@ -118,8 +116,7 @@ final class RegistrationPublicationTest {
         PublicationChange<String> second = first.publication().update("two");
         SettlementReport report = second.awaitSettled(Duration.ofSeconds(10));
         assertTrue(second.whenSettled().toCompletableFuture().isDone());
-        assertTrue(report.hasFailedMounts());
-        assertFalse(report.allAffectedActive());
+        assertTrue(report.hasFailedMounts() && !report.affectedMounts().isEmpty());
         assertEquals(ComponentState.FAILED, consumer.state());
         assertTrue(report.failedMounts().stream()
                 .anyMatch(outcome -> outcome.handleId().equals(consumer.handleId())));
@@ -138,40 +135,52 @@ final class RegistrationPublicationTest {
         assertFalse(staged instanceof Registration);
         receipt.awaitSettled(Duration.ofSeconds(10));
         assertEquals("expert", runtime.root().view().require(TEXT));
-        runtime.advanced().revoke(staged).awaitSettled(Duration.ofSeconds(10));
+        runtime.advanced().transact(transaction -> {
+            transaction.revoke(staged);
+            return null;
+        }).awaitSettled(Duration.ofSeconds(10));
         assertTrue(runtime.root().view().find(TEXT).isEmpty());
     }
 
     @Test
     void rejectedReplacementKeepsCurrentRegistrationFresh() throws Exception {
-        Registration<String> current = runtime.advanced().register(TEXT, "one");
+        PublicationChange<String> current = runtime.publish(TEXT, "one");
+        Publication<String> publication = current.publication();
         long generation = runtime.advanced().snapshot().generation();
+        String registrationId = currentRegistrationId();
         TestKit.assertRejected(() -> runtime.advanced().transact(transaction -> {
-            transaction.revoke(current);
+            transaction.revoke(() -> registrationId);
             return transaction.provide(runtime.root(), TEXT_AS_INTEGER, 2);
         }), DiagnosticCode.CAPABILITY_TYPE_CONFLICT);
 
         assertEquals("one", runtime.root().view().require(TEXT));
         assertEquals(generation, runtime.advanced().snapshot().generation());
-        Registration<String> replacement = current.replace("two");
+        PublicationChange<String> replacement = publication.update("two");
         assertEquals("two", runtime.root().view().require(TEXT));
-        assertThrows(TransactionRejectedException.class, current::revoke);
-        replacement.revoke().awaitSettled(Duration.ofSeconds(10));
+        replacement.awaitSettled(Duration.ofSeconds(10));
+        publication.unpublish().awaitSettled(Duration.ofSeconds(10));
+    }
+
+    private String currentRegistrationId() {
+        return runtime.advanced().snapshot().registrations().stream()
+                .filter(registration -> registration.capability().name().equals(TEXT.name()))
+                .findFirst().orElseThrow().registrationId();
     }
 
     @Test
     void typedHandleCannotBeRevokedThroughAForeignRuntime() throws Exception {
         KnotraRuntime other = KnotraRuntime.create();
         try {
-            Registration<String> local = runtime.advanced().register(TEXT, "one");
-            assertThrows(IllegalArgumentException.class,
-                    () -> other.advanced().revoke(local));
-            TestKit.assertRejected(() -> other.advanced().transact(transaction -> {
-                transaction.revoke(local);
-                return null;
-            }), DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
-            assertEquals("one", runtime.root().view().require(TEXT));
-            local.revoke().awaitSettled(Duration.ofSeconds(10));
+        Publication<String> publication = runtime.publish(TEXT, "one").publication();
+        String registrationId = runtime.advanced().snapshot().registrations().stream()
+                .filter(registration -> registration.capability().name().equals(TEXT.name()))
+                .findFirst().orElseThrow().registrationId();
+        TestKit.assertRejected(() -> other.advanced().transact(transaction -> {
+            transaction.revoke(() -> registrationId);
+            return null;
+        }), DiagnosticCode.INVALID_LIFECYCLE_OPERATION);
+        assertEquals("one", runtime.root().view().require(TEXT));
+            publication.unpublish().awaitSettled(Duration.ofSeconds(10));
             assertTrue(runtime.root().view().find(TEXT).isEmpty());
         } finally {
             other.close();
@@ -179,7 +188,7 @@ final class RegistrationPublicationTest {
     }
 
     @Test
-    void concurrentRegistrationOperationsHaveExactlyOneWinner() throws Exception {
+    void concurrentPublicationReplacementAndUnpublishAreLinearized() throws Exception {
         int lanes = 4;
         int rounds = 40;
         ExecutorService executor = Executors.newFixedThreadPool(lanes);
@@ -187,24 +196,21 @@ final class RegistrationPublicationTest {
             for (int round = 0; round < rounds; round++) {
                 CapabilityKey<String> key =
                         CapabilityKey.of("replace-race-" + round, String.class);
-                Registration<String> first = runtime.advanced().register(key, "first");
-                first.awaitSettled(Duration.ofSeconds(10));
+                Publication<String> publication = runtime.publish(key, "first").publication();
 
                 CyclicBarrier barrier = new CyclicBarrier(lanes);
-                AtomicReference<String> winner = new AtomicReference<>("revoked");
-                AtomicReference<Registration<String>> winnerHandle = new AtomicReference<>();
                 List<Future<Object>> outcomes = new ArrayList<>();
                 for (int lane = 0; lane < lanes; lane++) {
                     int laneId = lane;
                     outcomes.add(executor.submit(() -> {
                         barrier.await(10, TimeUnit.SECONDS);
                         if (laneId == 0) {
-                            first.revoke().awaitSettled(Duration.ofSeconds(10));
+                            publication.unpublish().awaitSettled(Duration.ofSeconds(10));
                             return null;
                         }
-                        Registration<String> replacement = first.replace("lane-" + laneId);
-                        winner.compareAndSet("revoked", "lane-" + laneId);
-                        winnerHandle.compareAndSet(null, replacement);
+                        PublicationChange<String> replacement =
+                                publication.update("lane-" + laneId);
+                        replacement.awaitSettled(Duration.ofSeconds(10));
                         return replacement;
                     }));
                 }
@@ -220,20 +226,13 @@ final class RegistrationPublicationTest {
                         rejections++;
                     }
                 }
-                assertEquals(1, successes, "round " + round);
-                assertEquals(lanes - 1, rejections, "round " + round);
-
-                if ("revoked".equals(winner.get())) {
-                    assertTrue(runtime.root().view().find(key).isEmpty());
+                assertTrue(successes >= 1, "round " + round);
+                assertEquals(lanes, successes + rejections, "round " + round);
+                var current = runtime.root().view().find(key);
+                if (current.isPresent()) {
+                    assertEquals(PublicationState.PUBLISHED, publication.state());
                 } else {
-                    assertEquals(winner.get(), runtime.root().view().require(key));
-                    assertEquals(winnerHandle.get().registrationId(),
-                            runtime.advanced().snapshot().registrations().stream()
-                                    .filter(registration ->
-                                            registration.capability().name().equals(key.name()))
-                                    .findFirst()
-                                    .orElseThrow()
-                                    .registrationId());
+                    assertEquals(PublicationState.UNPUBLISHED, publication.state());
                 }
             }
         } finally {
@@ -301,7 +300,10 @@ final class RegistrationPublicationTest {
         assertEquals(PublicationState.DISPLACED, publication.state());
         assertThrows(TransactionRejectedException.class, () -> publication.update("three"));
         assertThrows(TransactionRejectedException.class, publication::unpublish);
-        runtime.advanced().revoke(replacement.value()).awaitSettled(Duration.ofSeconds(10));
+        runtime.advanced().transact(transaction -> {
+            transaction.revoke(replacement.value());
+            return null;
+        }).awaitSettled(Duration.ofSeconds(10));
     }
 
 

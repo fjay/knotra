@@ -33,6 +33,24 @@ public record KnotraConfig(
                 FailureDetailPolicy.defaults());
     }
 
+    /** 返回替换运行时标识后的配置副本。 */
+    public KnotraConfig withRuntimeId(String nextRuntimeId) {
+        return new KnotraConfig(nextRuntimeId, maxReconcileIterations, failureDetailPolicy);
+    }
+
+    /** 返回替换协调迭代上限后的配置副本。 */
+    public KnotraConfig withMaxReconcileIterations(int nextMaxReconcileIterations) {
+        return new KnotraConfig(runtimeId, nextMaxReconcileIterations, failureDetailPolicy);
+    }
+
+    /** 返回替换失败详情策略后的配置副本。 */
+    public KnotraConfig withFailureDetailPolicy(FailureDetailPolicy nextPolicy) {
+        return new KnotraConfig(
+                runtimeId,
+                maxReconcileIterations,
+                Objects.requireNonNull(nextPolicy, "failureDetailPolicy"));
+    }
+
     /** 运行时诊断所保留失败详情的有界策略。 */
     public record FailureDetailPolicy(
             int maxCauses,
@@ -52,6 +70,18 @@ public record KnotraConfig(
 
         public FailureDetailPolicy withStackTraces(boolean include) {
             return new FailureDetailPolicy(maxCauses, maxFrames, maxTextLength, include);
+        }
+
+        public FailureDetailPolicy withMaxCauses(int nextMaxCauses) {
+            return new FailureDetailPolicy(nextMaxCauses, maxFrames, maxTextLength, includeStackTraces);
+        }
+
+        public FailureDetailPolicy withMaxFrames(int nextMaxFrames) {
+            return new FailureDetailPolicy(maxCauses, nextMaxFrames, maxTextLength, includeStackTraces);
+        }
+
+        public FailureDetailPolicy withMaxTextLength(int nextMaxTextLength) {
+            return new FailureDetailPolicy(maxCauses, maxFrames, nextMaxTextLength, includeStackTraces);
         }
     }
 }

@@ -14,6 +14,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -285,8 +287,9 @@ final class EventBusQuiescenceTest {
             subscription.unsubscribe();
             assertThrows(IllegalArgumentException.class, () -> bus.subscribe(second, event ->
                     CompletableFuture.completedFuture(true)));
-            assertThrows(IllegalArgumentException.class, () ->
-                    bus.dispatch(second, secondType.cast(newInstance(secondType))));
+            assertFailedDispatch(
+                    bus.dispatch(second, secondType.cast(newInstance(secondType))),
+                    IllegalArgumentException.class);
 
             CompletableFuture<Void> idle = bus.whenIdle().toCompletableFuture();
             assertFalse(idle.isDone());
@@ -687,6 +690,14 @@ final class EventBusQuiescenceTest {
             bytes[offset + 1] = (byte) value;
             return offset + 2;
         }
+    }
+
+    private static <T> void assertFailedDispatch(
+            CompletionStage<EventDispatch<T>> stage,
+            Class<? extends Throwable> expectedCause) {
+        CompletableFuture<EventDispatch<T>> future = stage.toCompletableFuture();
+        CompletionException error = assertThrows(CompletionException.class, future::join);
+        assertInstanceOf(expectedCause, error.getCause());
     }
 
     private record TextEvent(String text) {

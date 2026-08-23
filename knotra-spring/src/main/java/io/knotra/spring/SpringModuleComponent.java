@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -44,9 +45,7 @@ final class SpringModuleComponent<C> implements Component<C> {
         // 在清理可逆前，不允许运行任何 Bean、自定义器或刷新操作。
         registerCleanup(context, spring, loader);
         spring.setClassLoader(loader);
-        ClassLoader previousLoader = Thread.currentThread().getContextClassLoader();
-        Thread.currentThread().setContextClassLoader(loader);
-        try {
+        withThreadContextClassLoader(loader, () -> {
             if (!definition.annotatedClasses().isEmpty()) {
                 spring.register(definition.annotatedClasses().toArray(Class<?>[]::new));
             }
@@ -70,9 +69,8 @@ final class SpringModuleComponent<C> implements Component<C> {
             for (StagedOutput<?> output : staged) {
                 provide(context, output);
             }
-        } finally {
-            Thread.currentThread().setContextClassLoader(previousLoader);
-        }
+            return null;
+        });
     }
 
     private ClassLoader effectiveClassLoader() {
@@ -107,7 +105,7 @@ final class SpringModuleComponent<C> implements Component<C> {
             case OPTIONAL_OPTIONAL -> registerOptionalWrapper(context, spring, cast(dependency));
             case DYNAMIC_CAPABILITY_REQUIRED, DYNAMIC_CAPABILITY_OPTIONAL ->
                     registerDynamicCapability(context, spring, cast(dependency));
-            case DYNAMIC_REQUIRED, DYNAMIC_OPTIONAL ->
+            case DYNAMIC_PROXY_REQUIRED, DYNAMIC_PROXY_OPTIONAL ->
                     registerDynamicProxy(context, spring, cast(dependency));
         }
     }
@@ -191,47 +189,63 @@ final class SpringModuleComponent<C> implements Component<C> {
             AnnotationConfigApplicationContext spring,
             SpringContextCloser hook,
             ClassLoader loader) {
-        ClassLoader previousLoader = Thread.currentThread().getContextClassLoader();
-        Thread.currentThread().setContextClassLoader(loader);
         try {
-            if (hook == null) {
-                return closePhysically(spring, loader);
-            }
-            CompletionStage<Void> stage;
-            try {
-                stage = hook.close(spring);
-            } catch (Throwable error) {
-                return failedCleanup(error);
-            }
-            if (stage == null) {
-                return closePhysically(spring, loader);
-            }
-            return stage.handle((ignored, error) -> {
-                if (error != null) {
-                    throw new CompletionException(error);
-                }
-                return closePhysically(spring, loader);
-            }).thenCompose(stageValue -> stageValue);
-        } finally {
-            Thread.currentThread().setContextClassLoader(previousLoader);
+            return afterHook(runHook(spring, hook, loader), spring, loader);
+        } catch (Throwable error) {
+            return failedCleanup(error);
         }
+    }
+
+    private static CompletionStage<Void> runHook(
+            AnnotationConfigApplicationContext spring,
+            SpringContextCloser hook,
+            ClassLoader loader) throws Exception {
+        if (hook == null) {
+            return null;
+        }
+        return withThreadContextClassLoader(loader, () -> hook.close(spring));
+    }
+
+    private static CompletionStage<Void> afterHook(
+            CompletionStage<Void> hookStage,
+            AnnotationConfigApplicationContext spring,
+            ClassLoader loader) {
+        if (hookStage == null) {
+            return closePhysically(spring, loader);
+        }
+        return hookStage.handle((ignored, error) -> {
+            if (error != null) {
+                throw new CompletionException(error);
+            }
+            return closePhysically(spring, loader);
+        }).thenCompose(stage -> stage);
     }
 
     private static CompletionStage<Void> closePhysically(
             AnnotationConfigApplicationContext spring,
             ClassLoader loader) {
-        ClassLoader previousLoader = Thread.currentThread().getContextClassLoader();
-        Thread.currentThread().setContextClassLoader(loader);
         try {
-            if (spring.isActive()) {
-                spring.close();
-            } else {
-                // refresh() 未完成；Spring 创建的早期单例仍需要清理。
-                ((DefaultListableBeanFactory) spring.getBeanFactory()).destroySingletons();
-            }
+            withThreadContextClassLoader(loader, () -> {
+                if (spring.isActive()) {
+                    spring.close();
+                } else {
+                    // refresh() 未完成；Spring 创建的早期单例仍需要清理。
+                    ((DefaultListableBeanFactory) spring.getBeanFactory()).destroySingletons();
+                }
+                return null;
+            });
             return CompletableFuture.completedFuture(null);
         } catch (Throwable error) {
             return failedCleanup(error);
+        }
+    }
+
+    private static <T> T withThreadContextClassLoader(
+            ClassLoader loader, Callable<T> action) throws Exception {
+        ClassLoader previousLoader = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(loader);
+        try {
+            return action.call();
         } finally {
             Thread.currentThread().setContextClassLoader(previousLoader);
         }

@@ -17,6 +17,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import javax.annotation.processing.Processor;
+import javax.lang.model.SourceVersion;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -48,6 +49,11 @@ final class KnotraBeanProcessorTest {
         if (runtime != null) {
             runtime.close();
         }
+    }
+
+    @Test
+    void processorUsesLatestSupportedSourceVersion() {
+        assertEquals(SourceVersion.latestSupported(), new KnotraBeanProcessor().getSupportedSourceVersion());
     }
 
     @Test
@@ -544,7 +550,10 @@ final class KnotraBeanProcessorTest {
         assertFalse(source.contains("java.lang.reflect"), "generated source must not use reflection");
         assertFalse(source.contains("System.currentTimeMillis"), "generated source must not embed a timestamp");
         assertFalse(source.contains("Instant.now"), "generated source must not embed a timestamp");
-        assertTrue(source.contains("contractClass("), "generated source must use compile-time class literals");
+        assertFalse(source.contains("contractClass("), "generated source must not use an unchecked bridge");
+        assertFalse(source.contains("@SuppressWarnings(\"unchecked\")"),
+                "generated source must not suppress unchecked warnings");
+        assertTrue(source.contains(".class)"), "generated source must use compile-time class literals");
     }
     private static int countOccurrences(String value, String token) {
         int count = 0;
@@ -566,7 +575,7 @@ final class KnotraBeanProcessorTest {
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     private void provide(String name, Class<?> type, Object value) {
-        runtime.advanced().register(new CapabilityKey(name, type), value);
+        runtime.publish(new CapabilityKey(name, type), value);
     }
 
     private static Constructor<?> accessibleConstructor(Class<?> type, Class<?>... parameters)

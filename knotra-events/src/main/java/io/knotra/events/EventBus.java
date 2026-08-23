@@ -43,30 +43,53 @@ public interface EventBus extends AsyncCloseable {
     /**
      * 在当前线程同步分发事件。监听失败不会中断后续监听，所有失败会出现在返回结果中。
      *
+     * @throws NullPointerException definition 或 event 为 {@code null}
      * @throws ClassCastException 事件值不符合定义的事件类型
      * @throws IllegalStateException 总线已关闭
+     * @throws IllegalArgumentException 事件名已绑定到不同的规范 JVM Class
      */
     <T> EventDispatch<T> dispatch(EventDefinition.Sync<T> definition, T event);
 
     /**
-     * 并行分发事件。返回的 stage 只报告接受分发或组装分发时的失败；监听失败聚合在
-     * {@link EventDispatch} 中，不会让返回的 stage 异常完成。
+     * 并行分发事件。监听失败聚合在 {@link EventDispatch} 中，不会让返回的 stage 异常完成；
+     * 总线已关闭、事件类型转换失败、事件名绑定冲突或组装分发失败会以 failed stage 返回。
+     * {@code definition} 或 {@code event} 为 {@code null} 时仍按 JDK 惯例同步抛出。
+     *
+     * @throws NullPointerException definition 或 event 为 {@code null}
      */
     <T> CompletionStage<EventDispatch<T>> dispatch(
             EventDefinition.Parallel<T> definition,
             T event);
 
-    /** 按串行语义分发事件。监听返回 {@code false} 或失败都会体现在分发结果中。 */
+    /**
+     * 按串行语义分发事件。监听返回 {@code false} 或失败都会体现在分发结果中；接受分发或
+     * 组装分发失败会以 failed stage 返回，而监听失败不会异常完成返回的 stage。
+     * {@code definition} 或 {@code event} 为 {@code null} 时仍按 JDK 惯例同步抛出。
+     *
+     * @throws NullPointerException definition 或 event 为 {@code null}
+     */
     <T> CompletionStage<EventDispatch<T>> dispatch(
             EventDefinition.Serial<T> definition,
             T event);
 
-    /** 按应急语义分发事件。第一个认领结果的监听会停止后续监听。 */
+    /**
+     * 按应急语义分发事件。第一个认领结果的监听会停止后续监听；接受分发或组装分发失败会以
+     * failed stage 返回，而监听失败不会异常完成返回的 stage。{@code definition} 或
+     * {@code event} 为 {@code null} 时仍按 JDK 惯例同步抛出。
+     *
+     * @throws NullPointerException definition 或 event 为 {@code null}
+     */
     <T> CompletionStage<EventDispatch<T>> dispatch(
             EventDefinition.Bail<T> definition,
             T event);
 
-    /** 按瀑布语义分发事件。最终结果保留初始事件与最终事件。 */
+    /**
+     * 按瀑布语义分发事件。最终结果保留初始事件与最终事件；接受分发或组装分发失败会以
+     * failed stage 返回，而监听失败不会异常完成返回的 stage。{@code definition} 或
+     * {@code event} 为 {@code null} 时仍按 JDK 惯例同步抛出。
+     *
+     * @throws NullPointerException definition 或 event 为 {@code null}
+     */
     <T> CompletionStage<EventDispatch<T>> dispatch(
             EventDefinition.Waterfall<T> definition,
             T event);

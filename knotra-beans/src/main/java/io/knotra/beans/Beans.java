@@ -9,7 +9,6 @@ import io.knotra.MountHandle;
 import io.knotra.MountOptions;
 import io.knotra.NoConfig;
 
-
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -138,38 +137,8 @@ public final class Beans {
             this.componentId = componentId;
         }
 
-        public <D1> Builder1<D1> with(BeanDependency<D1> first) {
-            return new Builder1<>(componentId, first);
-        }
-
-        public <D1, D2> Builder2<D1, D2> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second) {
-            return new Builder2<>(componentId, first, second);
-        }
-
-        public <D1, D2, D3> Builder3<D1, D2, D3> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third) {
-            return new Builder3<>(componentId, first, second, third);
-        }
-
-        public <D1, D2, D3, D4> Builder4<D1, D2, D3, D4> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            return new Builder4<>(componentId, first, second, third, fourth);
-        }
-
-        public <D1, D2, D3, D4, D5> Builder5<D1, D2, D3, D4, D5> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new Builder5<>(componentId, first, second, third, fourth, fifth);
+        public <D1> Builder1<D1> with(BeanDependency<D1> dependency) {
+            return new Builder1<>(componentId, dependency);
         }
 
         public <T> OutputStage<T> create(Creator0<T> creator) {
@@ -193,27 +162,6 @@ public final class Beans {
 
         public <D2> Builder2<D1, D2> with(BeanDependency<D2> second) {
             return new Builder2<>(componentId, first, second);
-        }
-
-        public <D2, D3> Builder3<D1, D2, D3> with(
-                BeanDependency<D2> second,
-                BeanDependency<D3> third) {
-            return new Builder3<>(componentId, first, second, third);
-        }
-
-        public <D2, D3, D4> Builder4<D1, D2, D3, D4> with(
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            return new Builder4<>(componentId, first, second, third, fourth);
-        }
-
-        public <D2, D3, D4, D5> Builder5<D1, D2, D3, D4, D5> with(
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new Builder5<>(componentId, first, second, third, fourth, fifth);
         }
 
         public <T> OutputStage<T> create(Creator1<D1, T> creator) {
@@ -242,19 +190,6 @@ public final class Beans {
 
         public <D3> Builder3<D1, D2, D3> with(BeanDependency<D3> third) {
             return new Builder3<>(componentId, first, second, third);
-        }
-
-        public <D3, D4> Builder4<D1, D2, D3, D4> with(
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            return new Builder4<>(componentId, first, second, third, fourth);
-        }
-
-        public <D3, D4, D5> Builder5<D1, D2, D3, D4, D5> with(
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new Builder5<>(componentId, first, second, third, fourth, fifth);
         }
 
         public <T> OutputStage<T> create(Creator2<D1, D2, T> creator) {
@@ -288,12 +223,6 @@ public final class Beans {
 
         public <D4> Builder4<D1, D2, D3, D4> with(BeanDependency<D4> fourth) {
             return new Builder4<>(componentId, first, second, third, fourth);
-        }
-
-        public <D4, D5> Builder5<D1, D2, D3, D4, D5> with(
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new Builder5<>(componentId, first, second, third, fourth, fifth);
         }
 
         public <T> OutputStage<T> create(Creator3<D1, D2, D3, T> creator) {
@@ -394,39 +323,8 @@ public final class Beans {
             this.configType = Objects.requireNonNull(configType, "configType");
         }
 
-        public <D1> ConfigBuilder1<C, D1> with(BeanDependency<D1> first) {
-            return new ConfigBuilder1<>(componentId, configType, first);
-        }
-
-        public <D1, D2> ConfigBuilder2<C, D1, D2> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second) {
-            return new ConfigBuilder2<>(componentId, configType, first, second);
-        }
-
-        public <D1, D2, D3> ConfigBuilder3<C, D1, D2, D3> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third) {
-            return new ConfigBuilder3<>(componentId, configType, first, second, third);
-        }
-
-        public <D1, D2, D3, D4> ConfigBuilder4<C, D1, D2, D3, D4> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            return new ConfigBuilder4<>(componentId, configType, first, second, third, fourth);
-        }
-
-        public <D1, D2, D3, D4, D5> ConfigBuilder5<C, D1, D2, D3, D4, D5> with(
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new ConfigBuilder5<>(
-                    componentId, configType, first, second, third, fourth, fifth);
+        public <D1> ConfigBuilder1<C, D1> with(BeanDependency<D1> dependency) {
+            return new ConfigBuilder1<>(componentId, configType, dependency);
         }
 
         public <T> ConfigOutputStage<C, T> create(ConfigCreator0<C, T> creator) {
@@ -455,28 +353,6 @@ public final class Beans {
 
         public <D2> ConfigBuilder2<C, D1, D2> with(BeanDependency<D2> second) {
             return new ConfigBuilder2<>(componentId, configType, first, second);
-        }
-
-        public <D2, D3> ConfigBuilder3<C, D1, D2, D3> with(
-                BeanDependency<D2> second,
-                BeanDependency<D3> third) {
-            return new ConfigBuilder3<>(componentId, configType, first, second, third);
-        }
-
-        public <D2, D3, D4> ConfigBuilder4<C, D1, D2, D3, D4> with(
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            return new ConfigBuilder4<>(componentId, configType, first, second, third, fourth);
-        }
-
-        public <D2, D3, D4, D5> ConfigBuilder5<C, D1, D2, D3, D4, D5> with(
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new ConfigBuilder5<>(
-                    componentId, configType, first, second, third, fourth, fifth);
         }
 
         public <T> ConfigOutputStage<C, T> create(ConfigCreator1<C, D1, T> creator) {
@@ -508,20 +384,6 @@ public final class Beans {
 
         public <D3> ConfigBuilder3<C, D1, D2, D3> with(BeanDependency<D3> third) {
             return new ConfigBuilder3<>(componentId, configType, first, second, third);
-        }
-
-        public <D3, D4> ConfigBuilder4<C, D1, D2, D3, D4> with(
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            return new ConfigBuilder4<>(componentId, configType, first, second, third, fourth);
-        }
-
-        public <D3, D4, D5> ConfigBuilder5<C, D1, D2, D3, D4, D5> with(
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new ConfigBuilder5<>(
-                    componentId, configType, first, second, third, fourth, fifth);
         }
 
         public <T> ConfigOutputStage<C, T> create(ConfigCreator2<C, D1, D2, T> creator) {
@@ -559,13 +421,6 @@ public final class Beans {
 
         public <D4> ConfigBuilder4<C, D1, D2, D3, D4> with(BeanDependency<D4> fourth) {
             return new ConfigBuilder4<>(componentId, configType, first, second, third, fourth);
-        }
-
-        public <D4, D5> ConfigBuilder5<C, D1, D2, D3, D4, D5> with(
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            return new ConfigBuilder5<>(
-                    componentId, configType, first, second, third, fourth, fifth);
         }
 
         public <T> ConfigOutputStage<C, T> create(ConfigCreator3<C, D1, D2, D3, T> creator) {
@@ -606,8 +461,7 @@ public final class Beans {
         }
 
         public <D5> ConfigBuilder5<C, D1, D2, D3, D4, D5> with(BeanDependency<D5> fifth) {
-            return new ConfigBuilder5<>(
-                    componentId, configType, first, second, third, fourth, fifth);
+            return new ConfigBuilder5<>(componentId, configType, first, second, third, fourth, fifth);
         }
 
         public <T> ConfigOutputStage<C, T> create(ConfigCreator4<C, D1, D2, D3, D4, T> creator) {
@@ -669,61 +523,58 @@ public final class Beans {
     }
 
     public static final class OutputStage<T> {
-        private final BeanStage<NoConfig, T> stage;
+        private final OutputStageSupport<NoConfig, T> outputs;
 
         OutputStage(BeanStage<NoConfig, T> stage) {
-            this.stage = stage;
+            this.outputs = new OutputStageSupport<>(stage);
         }
 
         public OutputStage<T> provide(CapabilityKey<T> key) {
-            return new OutputStage<>(stage.withOutput(new BeanOutput<>(key, null)));
+            return new OutputStage<>(outputs.provide(key).stage());
         }
 
         public OutputStage<T> provide(Class<T> type) {
-            return provide(CapabilityKey.of(type));
+            return new OutputStage<>(outputs.provide(type).stage());
         }
 
         public <P> OutputStage<T> provideAs(Class<P> type) {
-            return provideAs(type, type::cast);
+            return new OutputStage<>(outputs.provideAs(type).stage());
         }
 
         public <P> OutputStage<T> provideAs(CapabilityKey<P> key) {
-            return provideAs(key, key.type()::cast);
+            return new OutputStage<>(outputs.provideAs(key).stage());
         }
 
         public <P> OutputStage<T> provideAs(
                 CapabilityKey<P> key,
                 OutputMapper<? super T, ? extends P> mapper) {
-            return new OutputStage<>(stage.withOutput(new BeanOutput<>(key, mapper)));
+            return new OutputStage<>(outputs.provideAs(key, mapper).stage());
         }
 
         public <P> OutputStage<T> provideAs(
                 Class<P> type,
                 OutputMapper<? super T, ? extends P> mapper) {
-            return provideAs(CapabilityKey.of(type), mapper);
+            return new OutputStage<>(outputs.provideAs(type, mapper).stage());
         }
 
         public OutputStage<T> initializer(Initializer<? super T> initializer) {
-            return new OutputStage<>(stage.withInitializer(initializer));
+            return new OutputStage<>(outputs.initializer(initializer).stage());
         }
 
         public OutputStage<T> unmanaged() {
-            return new OutputStage<>(stage.withDisposal(
-                    new BeanDisposal<>(LifecycleMode.UNMANAGED, null, null)));
+            return new OutputStage<>(outputs.unmanaged().stage());
         }
 
         public OutputStage<T> destroyWith(Disposer<? super T> disposer) {
-            return new OutputStage<>(stage.withDisposal(
-                    new BeanDisposal<>(LifecycleMode.CUSTOM_SYNC, disposer, null)));
+            return new OutputStage<>(outputs.destroyWith(disposer).stage());
         }
 
         public OutputStage<T> destroyAsyncWith(AsyncDisposer<? super T> disposer) {
-            return new OutputStage<>(stage.withDisposal(
-                    new BeanDisposal<>(LifecycleMode.CUSTOM_ASYNC, null, disposer)));
+            return new OutputStage<>(outputs.destroyAsyncWith(disposer).stage());
         }
 
         public BeanDefinition<T> build() {
-            return new BeanDefinition<>(BeanStage.mountFactory(stage));
+            return new BeanDefinition<>(BeanStage.mountFactory(outputs.stage()));
         }
 
         public MountHandle mount(KnotraRuntime runtime) {
@@ -744,65 +595,62 @@ public final class Beans {
     }
 
     public static final class ConfigOutputStage<C, T> {
-        private final BeanStage<C, T> stage;
+        private final OutputStageSupport<C, T> outputs;
 
         ConfigOutputStage(BeanStage<C, T> stage) {
-            this.stage = stage;
+            this.outputs = new OutputStageSupport<>(stage);
         }
 
         public ConfigOutputStage<C, T> provide(CapabilityKey<T> key) {
-            return new ConfigOutputStage<>(stage.withOutput(new BeanOutput<>(key, null)));
+            return new ConfigOutputStage<>(outputs.provide(key).stage());
         }
 
         public ConfigOutputStage<C, T> provide(Class<T> type) {
-            return provide(CapabilityKey.of(type));
+            return new ConfigOutputStage<>(outputs.provide(type).stage());
         }
 
         public <P> ConfigOutputStage<C, T> provideAs(Class<P> type) {
-            return provideAs(type, type::cast);
+            return new ConfigOutputStage<>(outputs.provideAs(type).stage());
         }
 
         public <P> ConfigOutputStage<C, T> provideAs(CapabilityKey<P> key) {
-            return provideAs(key, key.type()::cast);
+            return new ConfigOutputStage<>(outputs.provideAs(key).stage());
         }
 
         public <P> ConfigOutputStage<C, T> provideAs(
                 CapabilityKey<P> key,
                 OutputMapper<? super T, ? extends P> mapper) {
-            return new ConfigOutputStage<>(stage.withOutput(new BeanOutput<>(key, mapper)));
+            return new ConfigOutputStage<>(outputs.provideAs(key, mapper).stage());
         }
 
         public <P> ConfigOutputStage<C, T> provideAs(
                 Class<P> type,
                 OutputMapper<? super T, ? extends P> mapper) {
-            return provideAs(CapabilityKey.of(type), mapper);
+            return new ConfigOutputStage<>(outputs.provideAs(type, mapper).stage());
         }
 
         public ConfigOutputStage<C, T> initializer(Initializer<? super T> initializer) {
-            return new ConfigOutputStage<>(stage.withInitializer(initializer));
+            return new ConfigOutputStage<>(outputs.initializer(initializer).stage());
         }
 
         public ConfigOutputStage<C, T> normalizeConfig(Normalizer<C> normalizer) {
-            return new ConfigOutputStage<>(stage.withNormalizer(normalizer));
+            return new ConfigOutputStage<>(outputs.normalizeConfig(normalizer).stage());
         }
 
         public ConfigOutputStage<C, T> unmanaged() {
-            return new ConfigOutputStage<>(stage.withDisposal(
-                    new BeanDisposal<>(LifecycleMode.UNMANAGED, null, null)));
+            return new ConfigOutputStage<>(outputs.unmanaged().stage());
         }
 
         public ConfigOutputStage<C, T> destroyWith(Disposer<? super T> disposer) {
-            return new ConfigOutputStage<>(stage.withDisposal(
-                    new BeanDisposal<>(LifecycleMode.CUSTOM_SYNC, disposer, null)));
+            return new ConfigOutputStage<>(outputs.destroyWith(disposer).stage());
         }
 
         public ConfigOutputStage<C, T> destroyAsyncWith(AsyncDisposer<? super T> disposer) {
-            return new ConfigOutputStage<>(stage.withDisposal(
-                    new BeanDisposal<>(LifecycleMode.CUSTOM_ASYNC, null, disposer)));
+            return new ConfigOutputStage<>(outputs.destroyAsyncWith(disposer).stage());
         }
 
         public ConfiguredBeanDefinition<C, T> build() {
-            return new ConfiguredBeanDefinition<>(stage.build());
+            return new ConfiguredBeanDefinition<>(outputs.stage().build());
         }
 
         public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, C config) {
@@ -817,7 +665,11 @@ public final class Beans {
             return build().mount(runtime, config, options);
         }
 
-        public ConfiguredMountHandle<C> mount(KnotraRuntime runtime, String mountId, C config, MountOptions options) {
+        public ConfiguredMountHandle<C> mount(
+                KnotraRuntime runtime,
+                String mountId,
+                C config,
+                MountOptions options) {
             return build().mount(runtime, mountId, config, options);
         }
     }
@@ -846,7 +698,6 @@ public final class Beans {
 
     /**
      * 声明必需的动态接口代理依赖项。
-
      *
      * <p>仅在组件首次启动激活时校验提供方是否存在；一旦处于 ACTIVE 状态，提供方缺失或热替换不会重启该 Bean，
      * 每次方法调用会自动获取提供方租约并透明路由。</p>
@@ -1014,7 +865,6 @@ public final class Beans {
         Objects.requireNonNull(mountId, "mountId");
         return runtime.mount(mountId, definition.asFactory(), config, options);
     }
-
 
     static String requireComponentId(String componentId) {
         Objects.requireNonNull(componentId, "componentId");

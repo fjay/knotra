@@ -1,53 +1,32 @@
 package io.knotra.spring;
 
-import io.knotra.ComponentFactory;
-
-import org.springframework.context.annotation.AnnotationConfigApplicationContext;
-
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 
+import io.knotra.ComponentFactory;
+
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
 /** 具有稳定组件与工厂身份标识的冻结 Spring 模块定义。 */
 public final class SpringModuleDefinition<C> implements ComponentFactory<C> {
 
     private final String componentId;
-    private final Class<C> configType;
-    private final boolean configured;
-    private final List<Class<?>> annotatedClasses;
-    private final List<Consumer<? super AnnotationConfigApplicationContext>> customizers;
-    private final ClassLoader classLoader;
-    private final String configBeanName;
-    private final UnaryOperator<C> configNormalizer;
-    private final SpringContextCloser closer;
-    private final List<SpringDependency<?>> dependencies;
-    private final List<SpringOutput<?>> outputs;
+    private final ConfigContract<C> contract;
+    private final ContextOptions options;
+    private final BeanNameRegistry beanNames;
 
     SpringModuleDefinition(
             String componentId,
-            Class<C> configType,
-            boolean configured,
-            List<Class<?>> annotatedClasses,
-            List<Consumer<? super AnnotationConfigApplicationContext>> customizers,
-            ClassLoader classLoader,
-            String configBeanName,
-            UnaryOperator<C> configNormalizer,
-            SpringContextCloser closer,
-            List<SpringDependency<?>> dependencies,
-            List<SpringOutput<?>> outputs) {
+            ConfigContract<C> contract,
+            ContextOptions options,
+            BeanNameRegistry beanNames) {
         this.componentId = Objects.requireNonNull(componentId, "componentId");
-        this.configType = Objects.requireNonNull(configType, "configType");
-        this.configured = configured;
-        this.annotatedClasses = List.copyOf(annotatedClasses);
-        this.customizers = List.copyOf(customizers);
-        this.classLoader = classLoader;
-        this.configBeanName = configBeanName;
-        this.configNormalizer = configNormalizer;
-        this.closer = closer;
-        this.dependencies = List.copyOf(dependencies);
-        this.outputs = List.copyOf(outputs);
+        this.contract = Objects.requireNonNull(contract, "contract");
+        this.options = Objects.requireNonNull(options, "options");
+        this.beanNames = Objects.requireNonNull(beanNames, "beanNames");
     }
 
     public String componentId() {
@@ -67,16 +46,23 @@ public final class SpringModuleDefinition<C> implements ComponentFactory<C> {
     @Override
     public C normalizeConfig(C config) throws Exception {
         C input = Objects.requireNonNull(config, "config");
-        if (!configType.isInstance(input)) {
+        if (!contract.configType().isInstance(input)) {
             throw new IllegalArgumentException(
-                    "config must be instance of " + configType.getName()
+                    "config must be instance of " + contract.configType().getName()
                             + ": " + input.getClass().getName());
         }
-        C typed = configType.cast(input);
-        if (!configured || configNormalizer == null) {
-            return typed;
-        }
-        C normalized = configNormalizer.apply(typed);
+        C typed = contract.configType().cast(input);
+        return applyNormalizer(typed);
+    }
+
+    private C applyNormalizer(C typed) {
+        return contract.configNormalizer()
+                .map(normalizer -> normalizeWith(normalizer, typed))
+                .orElse(typed);
+    }
+
+    private C normalizeWith(UnaryOperator<C> normalizer, C typed) {
+        C normalized = normalizer.apply(typed);
         if (normalized == null) {
             throw new IllegalStateException(
                     "config normalizer returned null for " + componentId);
@@ -85,38 +71,38 @@ public final class SpringModuleDefinition<C> implements ComponentFactory<C> {
     }
 
     public Class<C> configType() {
-        return configType;
+        return contract.configType();
     }
 
     boolean configured() {
-        return configured;
+        return contract.configured();
     }
 
     List<Class<?>> annotatedClasses() {
-        return annotatedClasses;
+        return options.annotatedClasses();
     }
 
     List<Consumer<? super AnnotationConfigApplicationContext>> customizers() {
-        return customizers;
+        return options.customizers();
     }
 
     Optional<ClassLoader> classLoader() {
-        return Optional.ofNullable(classLoader);
+        return options.classLoader();
     }
 
     Optional<String> configBeanName() {
-        return Optional.ofNullable(configBeanName);
+        return contract.configBeanName();
     }
 
     Optional<SpringContextCloser> closer() {
-        return Optional.ofNullable(closer);
+        return options.closer();
     }
 
     List<SpringDependency<?>> dependencies() {
-        return dependencies;
+        return beanNames.dependencies();
     }
 
     List<SpringOutput<?>> outputs() {
-        return outputs;
+        return beanNames.outputs();
     }
 }

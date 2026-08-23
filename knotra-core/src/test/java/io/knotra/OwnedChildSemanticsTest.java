@@ -269,7 +269,7 @@ final class OwnedChildSemanticsTest {
                 .map(SettlementReport.MountOutcome::state).orElseThrow(), report::toString);
         assertEquals(ComponentState.ACTIVE, report.outcome(child.get().handleId())
                 .map(SettlementReport.MountOutcome::state).orElseThrow(), report::toString);
-        assertTrue(report.allAffectedActive());
+        assertTrue(!report.hasFailedMounts() && !report.affectedMounts().isEmpty());
     }
 
     @Test
@@ -298,7 +298,7 @@ final class OwnedChildSemanticsTest {
         SettlementReport report = receipt.settlement().whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertTrue(report.hasFailedMounts(), report::toString);
-        assertFalse(report.allAffectedActive());
+
         assertEquals(ComponentState.ACTIVE, report.outcome(receipt.value().handleId())
                 .map(SettlementReport.MountOutcome::state).orElseThrow());
         assertEquals(ComponentState.FAILED, report.outcome(child.get().handleId())
@@ -354,7 +354,7 @@ final class OwnedChildSemanticsTest {
         assertEquals(ComponentState.ACTIVE,
                 report.outcome(secondChild.get().handleId())
                         .map(SettlementReport.MountOutcome::state).orElseThrow());
-        assertFalse(report.allAffectedActive(), report::toString);
+
     }
 
 

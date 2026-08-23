@@ -1,9 +1,9 @@
 package io.knotra;
 
 /**
- * 某一已提交运行时代际中类型化的能力注册凭据。
+ * 某一已提交运行时代际中类型化的能力注册只读凭据。
  *
- * <p>每次替换注册都会生成一个全新的 {@code Registration} 实例，保持历史不可变。</p>
+ * <p>注册变更统一通过所属 {@link Publication} 的 update/unpublish 完成。</p>
  *
  * @param <T> 能力接口类型
  */
@@ -15,9 +15,4 @@ public interface Registration<T> extends RegistrationHandle, Settlement {
     /** 注册所在的上下文节点。 */
     ContextHandle context();
 
-    /** 替换当前注册并返回新一代注册凭据。 */
-    Registration<T> replace(T value);
-
-    /** 撤销当前注册并返回结算等待句柄。 */
-    Settlement revoke();
 }

@@ -1,12 +1,6 @@
 package io.knotra;
 
-import java.util.Collection;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
-
 /**
  * 组件对单个 Capability 的依赖需求声明，由 {@link CapabilityKey}、启动模式和绑定语义组成。
  *
@@ -47,19 +41,6 @@ public final record CapabilityRequirement(
 
     public static CapabilityRequirement dynamicOptional(CapabilityKey<?> key) {
         return new CapabilityRequirement(key, Mode.OPTIONAL, CapabilityBinding.DYNAMIC);
-    }
-
-    static Set<CapabilityRequirement> freeze(Collection<CapabilityRequirement> requirements) {
-        Objects.requireNonNull(requirements, "requirements");
-        Map<String, CapabilityRequirement> byName = new LinkedHashMap<>();
-        for (CapabilityRequirement requirement : requirements) {
-            Objects.requireNonNull(requirement, "requirement");
-            CapabilityRequirement previous = byName.putIfAbsent(requirement.key().name(), requirement);
-            if (previous != null) {
-                throw new IllegalArgumentException("duplicate requirement key: " + requirement.key().name());
-            }
-        }
-        return Set.copyOf(new LinkedHashSet<>(byName.values()));
     }
 
     /** 先按 Capability 名称、类型名、模式和绑定语义排序，保证稳定顺序。 */

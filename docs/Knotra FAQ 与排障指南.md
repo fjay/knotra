@@ -51,9 +51,9 @@ if (report.hasFailedMounts()) {
 }
 ```
 
-### hasFailedMounts 为 false，为什么 allAffectedActive 也是 false？
+### hasFailedMounts 为 false，怎么判断影响集为空？
 
-`allAffectedActive()` 要求受影响挂载集非空且全部处于 ACTIVE 状态。若本次变更没有受影响的挂载（例如更新了仅被动态代理依赖的能力，消费方无需重建），则 `hasAffectedMounts()` 为 false，`allAffectedActive()` 也是 false。
+`hasAffectedMounts()` 为 false 表示本次变更没有受影响的挂载（例如更新了仅被动态代理依赖的能力，消费方无需重建）。空影响集没有失败挂载，因此 `hasFailedMounts()` 也是 false；此时报告不代表任何挂载的健康状态。要判断整体健康，先检查影响集非空，再组合 `affectedMounts()` 与 `failedMounts()`。
 
 ### report 正常，怎么确认我的挂载可用？
 

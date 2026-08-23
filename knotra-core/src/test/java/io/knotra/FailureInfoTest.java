@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import io.knotra.internal.FailureCapture;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 final class FailureInfoTest {
@@ -11,7 +13,7 @@ final class FailureInfoTest {
     void failureDetailPolicyBoundsCausesFramesAndText() {
         Throwable deep = chained(8);
         var policy = new KnotraConfig.FailureDetailPolicy(2, 2, 64, true);
-        FailureInfo detail = FailureInfo.capture(
+        FailureInfo detail = FailureCapture.capture(
                 deep,
                 FailurePhase.ACTIVATION,
                 policy,
@@ -25,7 +27,7 @@ final class FailureInfoTest {
     @Test
     void stackTracesAreDisabledByDefaultButExceptionTypeAndMessageAreRetained() {
         IllegalStateException error = new IllegalStateException("cannot start");
-        FailureInfo detail = FailureInfo.capture(
+        FailureInfo detail = FailureCapture.capture(
                 error,
                 FailurePhase.ACTIVATION,
                 KnotraConfig.defaults().failureDetailPolicy(),
@@ -101,7 +103,7 @@ final class FailureInfoTest {
         MaliciousThrowable cause = new MaliciousThrowable(root);
         root.initCause(cause);
 
-        FailureInfo detail = FailureInfo.capture(
+        FailureInfo detail = FailureCapture.capture(
                 root,
                 FailurePhase.ACTIVATION,
                 new KnotraConfig.FailureDetailPolicy(5, 5, 500, true),

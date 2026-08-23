@@ -12,7 +12,8 @@ import io.knotra.DynamicCapability;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountFactory;
 import io.knotra.MountHandle;
-import io.knotra.Registration;
+import io.knotra.Publication;
+import io.knotra.PublicationChange;
 import io.knotra.TransactionRejectedException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -62,7 +63,7 @@ final class BeansTest {
     void providerRebindCreatesFreshBeanAndClosesOldBean() throws Exception {
         CapabilityKey<String> dep = CapabilityKey.of("rebind-dep", String.class);
         CapabilityKey<Service> out = CapabilityKey.of("rebind-service", Service.class);
-        Registration<String> first = runtime.advanced().register(dep, "one");
+        Publication<String> first = runtime.publish(dep, "one").publication();
         List<Service> beans = new CopyOnWriteArrayList<>();
 
         BeanDefinition<Service> definition = Beans.component("rebind-consumer")
@@ -77,9 +78,9 @@ final class BeansTest {
         MountHandle handle = definition.mount(runtime);
 
         assertEquals(ComponentState.ACTIVE, settle(handle));
-        first.revoke().awaitSettled(WAIT);
+        first.unpublish().awaitSettled(WAIT);
         assertEquals(ComponentState.WAITING, settle(handle));
-        runtime.advanced().register(dep, "two").awaitSettled(WAIT);
+        runtime.publish(dep, "two").awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
 
         assertEquals(2, beans.size());
@@ -104,13 +105,12 @@ final class BeansTest {
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("empty"), observed);
 
-        Registration<String> registration =
-                runtime.advanced().register(OPT, "x");
+        PublicationChange<String> registration = runtime.publish(OPT, "x");
         registration.awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("empty", "present:x"), observed);
 
-        registration.revoke().awaitSettled(WAIT);
+        registration.publication().unpublish().awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("empty", "present:x", "empty"), observed);
     }
@@ -309,17 +309,91 @@ final class BeansTest {
     }
 
     @Test
-    void duplicateOutputNameIsRejected() {
+    void duplicateDependencyOutputAndCrossNamesAreRejectedAtBuild() {
         CapabilityKey<String> first = CapabilityKey.of("dup-out", String.class);
         CapabilityKey<Integer> second = CapabilityKey.of("dup-out", Integer.class);
-        Beans.OutputStage<String> stage = Beans.component("dup-component")
+        Beans.OutputStage<String> outputStage = Beans.component("dup-component")
                 .create(() -> "x")
                 .provide(first);
 
-        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
-                () -> stage.provideAs(second, value -> 1));
-        assertTrue(error.getMessage().contains("duplicate output name: dup-out"));
-        assertThrows(IllegalArgumentException.class, () -> stage.provide(first));
+        IllegalArgumentException outputError = assertThrows(IllegalArgumentException.class,
+                () -> outputStage.provideAs(second, value -> 1).build());
+        assertTrue(outputError.getMessage().contains("duplicate output name 'dup-out'"));
+        assertTrue(outputError.getMessage().contains("component dup-component"));
+
+        IllegalArgumentException dependencyError = assertThrows(IllegalArgumentException.class,
+                () -> Beans.component("dup-dependency")
+                        .with(Beans.fixed(D0))
+                        .with(Beans.fixedOptional(D0))
+                        .create((String value, java.util.Optional<String> ignored) -> value)
+                        .build());
+        assertTrue(dependencyError.getMessage().contains("duplicate dependency name 'beans-d0'"));
+        assertTrue(dependencyError.getMessage().contains("component dup-dependency"));
+
+        CapabilityKey<Object> sameAsDependency = CapabilityKey.of("beans-d0", Object.class);
+        IllegalArgumentException crossError = assertThrows(IllegalArgumentException.class,
+                () -> Beans.component("cross-name")
+                        .with(Beans.fixed(D0))
+                        .create((String value) -> value)
+                        .provideAs(sameAsDependency, value -> value)
+                        .build());
+        assertTrue(crossError.getMessage().contains("dependency and output names conflict"));
+        assertTrue(crossError.getMessage().contains("beans-d0"));
+        assertTrue(crossError.getMessage().contains("component cross-name"));
+
+        IllegalArgumentException expertDependencies = assertThrows(
+                IllegalArgumentException.class,
+                () -> Beans.expert(
+                        "expert-duplicates",
+                        List.of(Beans.fixed(D0), Beans.fixedOptional(D0)),
+                        context -> "x")
+                        .build());
+        assertTrue(expertDependencies.getMessage().contains("duplicate dependency name"));
+        assertTrue(expertDependencies.getMessage().contains("component expert-duplicates"));
+
+        IllegalArgumentException expertCross = assertThrows(
+                IllegalArgumentException.class,
+                () -> Beans.expert(
+                        "expert-cross",
+                        List.of(Beans.fixed(D0)),
+                        context -> "x")
+                        .provideAs(sameAsDependency, value -> value)
+                        .build());
+        assertTrue(expertCross.getMessage().contains("dependency and output names conflict"));
+        assertTrue(expertCross.getMessage().contains("component expert-cross"));
+
+        IllegalArgumentException configuredExpertCross = assertThrows(
+                IllegalArgumentException.class,
+                () -> Beans.expert(
+                        "expert-config-cross",
+                        Prefix.class,
+                        List.of(Beans.fixed(D0)),
+                        (context, config) -> "x")
+                        .provideAs(sameAsDependency, value -> value)
+                        .build());
+        assertTrue(configuredExpertCross.getMessage().contains("component expert-config-cross"));
+    }
+
+    @Test
+    void singleConfigurationMethodsRejectSilentOverwrite() {
+        Beans.OutputStage<String> initialized = Beans.component("overwrite-init")
+                .create(() -> "x")
+                .initializer(value -> { });
+        assertThrows(IllegalStateException.class,
+                () -> initialized.initializer(value -> { }));
+
+        Beans.ConfigOutputStage<Prefix, String> normalized =
+                Beans.component("overwrite-normalizer", Prefix.class)
+                        .create(config -> config.value())
+                        .normalizeConfig(config -> config);
+        assertThrows(IllegalStateException.class,
+                () -> normalized.normalizeConfig(config -> config));
+
+        Beans.OutputStage<String> destroyed = Beans.component("overwrite-disposal")
+                .create(() -> "x")
+                .destroyWith(value -> { });
+        assertThrows(IllegalStateException.class, destroyed::unmanaged);
+        assertThrows(IllegalStateException.class, () -> destroyed.destroyAsyncWith(value -> null));
     }
 
     @Test
@@ -394,7 +468,8 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-2")
-                .with(Beans.fixed(D0), Beans.fixed(D1))
+                .with(Beans.fixed(D0))
+                .with(Beans.fixed(D1))
                 .create((v1, v2) -> {
                     String value = v1 + v2;
                     joined.add(value);
@@ -404,7 +479,8 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-3")
                 .with(Beans.fixed(D0))
-                .with(Beans.fixed(D1), Beans.fixed(D2))
+                .with(Beans.fixed(D1))
+                .with(Beans.fixed(D2))
                 .create((v1, v2, v3) -> {
                     String value = v1 + v2 + v3;
                     joined.add(value);
@@ -413,8 +489,10 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-4")
-                .with(Beans.fixed(D0), Beans.fixed(D1))
-                .with(Beans.fixed(D2), Beans.fixed(D3))
+                .with(Beans.fixed(D0))
+                .with(Beans.fixed(D1))
+                .with(Beans.fixed(D2))
+                .with(Beans.fixed(D3))
                 .create((v1, v2, v3, v4) -> {
                     String value = v1 + v2 + v3 + v4;
                     joined.add(value);
@@ -423,8 +501,11 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-5")
-                .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
-                .with(Beans.fixed(D3), Beans.fixed(D4))
+                .with(Beans.fixed(D0))
+                .with(Beans.fixed(D1))
+                .with(Beans.fixed(D2))
+                .with(Beans.fixed(D3))
+                .with(Beans.fixed(D4))
                 .create((v1, v2, v3, v4, v5) -> {
                     String value = v1 + v2 + v3 + v4 + v5;
                     joined.add(value);
@@ -464,7 +545,8 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-2", Prefix.class)
-                        .with(Beans.fixed(D0), Beans.fixed(D1))
+                        .with(Beans.fixed(D0))
+                        .with(Beans.fixed(D1))
                         .create((config, v1, v2) -> {
                             String value = config.value() + v1 + v2;
                             joined.add(value);
@@ -474,7 +556,9 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-3", Prefix.class)
-                        .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
+                        .with(Beans.fixed(D0))
+                        .with(Beans.fixed(D1))
+                        .with(Beans.fixed(D2))
                         .create((config, v1, v2, v3) -> {
                             String value = config.value() + v1 + v2 + v3;
                             joined.add(value);
@@ -484,7 +568,9 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-4", Prefix.class)
-                        .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
+                        .with(Beans.fixed(D0))
+                        .with(Beans.fixed(D1))
+                        .with(Beans.fixed(D2))
                         .with(Beans.fixed(D3))
                         .create((config, v1, v2, v3, v4) -> {
                             String value = config.value() + v1 + v2 + v3 + v4;
@@ -495,8 +581,11 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-5", Prefix.class)
-                        .with(Beans.fixed(D0), Beans.fixed(D1), Beans.fixed(D2))
-                        .with(Beans.fixed(D3), Beans.fixed(D4))
+                        .with(Beans.fixed(D0))
+                        .with(Beans.fixed(D1))
+                        .with(Beans.fixed(D2))
+                        .with(Beans.fixed(D3))
+                        .with(Beans.fixed(D4))
                         .create((config, v1, v2, v3, v4, v5) -> {
                             String value = config.value() + v1 + v2 + v3 + v4 + v5;
                             joined.add(value);
@@ -535,7 +624,7 @@ final class BeansTest {
 
         MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.ACTIVE, settle(handle));
-        runtime.advanced().register(OPT, "x").awaitSettled(WAIT);
+        runtime.publish(OPT, "x").awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(List.of("0", "0+x"), observed);
     }
@@ -647,13 +736,13 @@ final class BeansTest {
 
         MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.WAITING, settle(handle));
-        Registration<Api> first = runtime.advanced().register(api, new ApiValue("v1"));
+        PublicationChange<Api> first = runtime.publish(api, new ApiValue("v1"));
         first.awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals("v1", runtime.root().view().require(output).get());
 
-        first.revoke().awaitSettled(WAIT);
-        runtime.advanced().register(api, new ApiValue("v2")).awaitSettled(WAIT);
+        first.publication().unpublish().awaitSettled(WAIT);
+        runtime.publish(api, new ApiValue("v2")).awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertEquals(1, starts.get(), "dynamic provider replacement must not recreate the bean");
         assertEquals("v2", runtime.root().view().require(output).get());
@@ -711,7 +800,7 @@ final class BeansTest {
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertFalse(dynamic.get().available());
 
-        runtime.advanced().register(api, new ApiValue("v1")).awaitSettled(WAIT);
+        runtime.publish(api, new ApiValue("v1")).awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
         assertTrue(dynamic.get().available());
         assertEquals("v1", dynamic.get().call(Api::value));
@@ -759,7 +848,7 @@ final class BeansTest {
 
         MountHandle handle = definition.mount(runtime);
         assertEquals(ComponentState.ACTIVE, settle(handle));
-        runtime.advanced().register(Api.class, new ApiValue("x")).awaitSettled(WAIT);
+        runtime.publish(Api.class, new ApiValue("x")).awaitSettled(WAIT);
         assertEquals(ComponentState.ACTIVE, settle(handle));
     }
 
@@ -805,6 +894,31 @@ final class BeansTest {
     }
 
     @Test
+    void everyBuilderExposesExactlyOneSingleDependencyWithMethod() {
+        for (Class<?> builderType : List.of(
+                Beans.Builder0.class,
+                Beans.Builder1.class,
+                Beans.Builder2.class,
+                Beans.Builder3.class,
+                Beans.Builder4.class,
+                Beans.Builder5.class,
+                Beans.ConfigBuilder0.class,
+                Beans.ConfigBuilder1.class,
+                Beans.ConfigBuilder2.class,
+                Beans.ConfigBuilder3.class,
+                Beans.ConfigBuilder4.class,
+                Beans.ConfigBuilder5.class)) {
+            var withMethods = Stream.of(builderType.getDeclaredMethods())
+                    .filter(method -> method.getName().equals("with"))
+                    .toList();
+            boolean canIncreaseArity = !builderType.getSimpleName().endsWith("5");
+            assertEquals(canIncreaseArity ? 1 : 0, withMethods.size(), builderType::toString);
+            if (canIncreaseArity) {
+                assertEquals(1, withMethods.getFirst().getParameterCount(), builderType::toString);
+            }
+        }
+    }
+    @Test
     void happyPathDslAllowsDirectMountAndProvideAsClassAndRuntimeRequire() throws Exception {
         interface Greeting {
             String message();
@@ -834,13 +948,13 @@ final class BeansTest {
         renderer.requireActive(WAIT);
 
         assertEquals("Hello Knotra",
-                runtime.require(RenderedGreeting.class).render("Knotra"));
+                runtime.root().view().require(RenderedGreeting.class).render("Knotra"));
 
         greeting.update(new ConstantGreeting("Hi"))
                 .awaitSettled(WAIT);
 
         assertEquals("Hi Knotra",
-                runtime.require(RenderedGreeting.class).render("Knotra"));
+                runtime.root().view().require(RenderedGreeting.class).render("Knotra"));
     }
 
 
@@ -859,7 +973,7 @@ final class BeansTest {
     }
 
     private void register(CapabilityKey<String> key, String value) {
-        runtime.advanced().register(key, value).awaitSettled(WAIT);
+        runtime.publish(key, value).awaitSettled(WAIT);
     }
 
     record Prefix(String value) {

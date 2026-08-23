@@ -147,7 +147,7 @@ renderer instances: 1
 - `Beans.component(...).mount(runtime)` 直接完成构建与挂载，返回 `MountHandle`。
 - `runtime.require(Class<T>)` / `runtime.find(Class<T>)` 提供根上下文能力的直接便捷访问。
 - `greeting.update(...)` 原地更新发布槽位，返回 `PublicationChange<T>`，可调用 `awaitSettled(timeout)` 观察受影响挂载的结算。
-- `report.hasFailedMounts()` 与 `report.allAffectedActive()` 精确报告本次结构变更影响的挂载状态。
+- `report.hasAffectedMounts()` 与 `report.hasFailedMounts()` 精确报告本次结构变更影响的挂载状态。
 - `renderer.requireActive(Duration.ofSeconds(10))` 显式等待挂载点进入 ACTIVE 活跃状态，非活跃时抛出含诊断的 `MountNotActiveException`。
 - 示例使用 try-with-resources 保持精简；它调用的 `close()` 会无界等待停机收敛。生产环境应调用 `runtime.closeAsync()` 并使用有界 `get(timeout)` 等待停机，详见 [线程模型与生产实践](<docs/Knotra 线程模型与生产实践.md>)。
 

@@ -66,7 +66,7 @@ public interface KnotraRuntime extends AutoCloseable {
     default MountHandle mount(
             String mountId,
             MountFactory factory) {
-        return advanced().transact(tx -> tx.mount(root(), mountId, factory)).value();
+        return transactForHandle(tx -> tx.mount(root(), mountId, factory));
     }
 
     /** 在根上下文中带挂载选项挂载无配置组件。 */
@@ -74,7 +74,7 @@ public interface KnotraRuntime extends AutoCloseable {
             String mountId,
             MountFactory factory,
             MountOptions options) {
-        return advanced().transact(tx -> tx.mount(root(), mountId, factory, options)).value();
+        return transactForHandle(tx -> tx.mount(root(), mountId, factory, options));
     }
 
     /** 在根上下文中挂载带配置的类型化组件。 */
@@ -82,7 +82,7 @@ public interface KnotraRuntime extends AutoCloseable {
             String mountId,
             ComponentFactory<C> factory,
             C config) {
-        return mount(mountId, factory, config, null);
+        return mount(mountId, factory, config, MountOptions.DEFAULT);
     }
 
     /** 在根上下文中带挂载选项挂载带配置的类型化组件。 */

@@ -62,19 +62,18 @@ Publication 状态：
 - `UNPUBLISHED`：主动撤销，终态；再次 unpublish 幂等，不会自动重新发布。
 - `DISPLACED`：外部替换、Context 释放或 Runtime 关闭移除了当前发布，槽位不再接受 update。
 
-需要精确控制与撤销具体某一代时才使用 Advanced API 的 `Registration<T>`：
+提交后需要精确引用“当前这一代”时，`PublicationChange.registration()` 返回对应的 `Registration<T>` 只读凭据；它只承载身份与拓扑信息，不提供变更操作。所有替换与撤销统一通过 `Publication` 进行，多操作原子变更走 Advanced 事务：
 
 ```java
-Registration<Greeting> registration =
-        runtime.advanced().register(Greeting.class, new StandardGreeting());
-registration.awaitSettled(Duration.ofSeconds(10));
+Registration<Greeting> current = change.registration();
+current.awaitSettled(Duration.ofSeconds(10));
 
-Registration<Greeting> replacement = registration.replace(new FastGreeting());
-replacement.awaitSettled(Duration.ofSeconds(10));
-replacement.revoke().awaitSettled(Duration.ofSeconds(10));
+// 热替换与撤销始终通过稳定槽位进行
+publication.update(new FastGreeting()).awaitSettled(Duration.ofSeconds(10));
+publication.unpublish().awaitSettled(Duration.ofSeconds(10));
 ```
 
-旧 `Registration` 被替换或撤销后失效；再次 replace 或 revoke 会抛出 `TransactionRejectedException`。
+旧 `Registration` 被替换或撤销后失效；对其发起不兼容操作会抛出 `TransactionRejectedException`。
 
 ### Settlement 语义
 
@@ -96,11 +95,11 @@ SettlementReport report = change.awaitSettled(Duration.ofSeconds(10));
 - `hasAffectedMounts()`：本次操作是否存在受影响的挂载点。
 - `hasFailedMounts()`：影响集中是否存在 FAILED 状态挂载。
 - `failedMounts()`：列出失败挂载和诊断。
-- `allAffectedActive()`：影响集非空且全部处于 ACTIVE 状态才为 true。
+- `affectedMounts()`：列出本次操作影响的挂载结果，可直接组合判断整体健康状态。
 - `outcome(handleId)`：查询某个受影响挂载。
 - `diagnostics()`：只包含本次相关诊断，不混入全局无关诊断。
 
-空影响集没有受影响挂载，因此 `hasAffectedMounts()` 为 false，`hasFailedMounts()` 为 false，`allAffectedActive()` 为 false。动态代理消费方无需重建时，提供方替换的影响集可以为空。
+空影响集没有受影响挂载，因此 `hasAffectedMounts()` 为 false，`hasFailedMounts()` 也为 false。动态代理消费方无需重建时，提供方替换的影响集可以为空；此时报告不代表任何挂载失败。
 
 
 要等待某个具体挂载 ACTIVE，使用：
@@ -179,7 +178,10 @@ TransactionReceipt<StagedRegistration<Message>> receipt =
 StagedRegistration<Message> staged = receipt.value();
 SettlementReport report = receipt.awaitSettled(Duration.ofSeconds(10));
 
-runtime.advanced().revoke(staged).awaitSettled(Duration.ofSeconds(10));
+runtime.advanced().transact(tx -> {
+    tx.revoke(staged);
+    return null;
+}).awaitSettled(Duration.ofSeconds(10));
 ```
 
 完整可执行版本见 [TransactionExample.java](../knotra-docs-examples/src/test/java/io/knotra/docs/TransactionExample.java)。
@@ -188,8 +190,8 @@ runtime.advanced().revoke(staged).awaitSettled(Duration.ofSeconds(10));
 
 - 事务记录期间提供 `key()` 与 `context()` 的静态类型信息。
 - 提交失败时随事务失效。
-- 提交成功后仍可作为 opaque registration handle 传给 `advanced().revoke(...)`。
-- 它不会升级成 `Registration<T>`，也没有 replace 或 settlement 方法。
+- 提交成功后仍可作为 opaque registration handle 传给后续事务的 `tx.revoke(...)`。
+- 它不会升级成 `Registration<T>`，也没有变更操作或 settlement 方法。
 
 同一事务可以一次提交多个意图：
 

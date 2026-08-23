@@ -32,7 +32,7 @@ public interface RuntimeTransaction {
             ContextHandle context,
             String mountId,
             ComponentFactory<NoConfig> factory) {
-        return mount(context, mountId, factory, NoConfig.INSTANCE, null);
+        return mount(context, mountId, factory, NoConfig.INSTANCE, MountOptions.DEFAULT);
     }
 
     default MountHandle mount(

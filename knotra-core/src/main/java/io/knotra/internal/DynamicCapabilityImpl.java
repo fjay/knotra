@@ -31,14 +31,14 @@ final class DynamicCapabilityImpl<T> implements DynamicCapability<T> {
 
     @Override
     public boolean available() {
-        return runtime.isDynamicAvailable(activation, key);
+        return runtime.dynamicBroker().isDynamicAvailable(activation, key);
     }
 
     @Override
     public <R> R call(DynamicOperation<? super T, ? extends R> operation) {
         Objects.requireNonNull(operation, "operation");
-        try (DefaultKnotraRuntime.DynamicLease<T> lease =
-                runtime.acquireDynamic(activation, key)) {
+        try (DynamicLease<T> lease =
+                runtime.dynamicBroker().acquireDynamic(activation, key)) {
             return operation.execute(lease.provider());
         } catch (InvocationTargetException error) {
             throw runtime.uncheckedInvocation(error);
@@ -51,9 +51,9 @@ final class DynamicCapabilityImpl<T> implements DynamicCapability<T> {
     public <R> CompletionStage<R> callAsync(
             AsyncDynamicOperation<? super T, ? extends R> operation) {
         Objects.requireNonNull(operation, "operation");
-        DefaultKnotraRuntime.DynamicLease<T> lease;
+        DynamicLease<T> lease;
         try {
-            lease = runtime.acquireDynamic(activation, key);
+            lease = runtime.dynamicBroker().acquireDynamic(activation, key);
         } catch (RuntimeException error) {
             return CompletableFuture.failedFuture(error);
         }
@@ -107,8 +107,8 @@ final class DynamicCapabilityImpl<T> implements DynamicCapability<T> {
             };
         }
 
-        DefaultKnotraRuntime.DynamicLease<T> lease =
-                runtime.acquireDynamic(activation, key);
+        DynamicLease<T> lease =
+                runtime.dynamicBroker().acquireDynamic(activation, key);
         Object result;
         try {
             method.setAccessible(true);
@@ -135,7 +135,7 @@ final class DynamicCapabilityImpl<T> implements DynamicCapability<T> {
 
     private <R> CompletionStage<R> attachAsyncLease(
             CompletionStage<? extends R> stage,
-            DefaultKnotraRuntime.DynamicLease<T> lease) {
+            DynamicLease<T> lease) {
         CompletableFuture<R> result = new CompletableFuture<>();
         AtomicBoolean released = new AtomicBoolean();
         try {

@@ -7,8 +7,7 @@ final class SettlementReportTest {
         SettlementReport empty = new SettlementReport(0, java.util.List.of(), java.util.List.of());
         org.junit.jupiter.api.Assertions.assertFalse(empty.hasAffectedMounts());
         org.junit.jupiter.api.Assertions.assertFalse(empty.hasFailedMounts());
-        org.junit.jupiter.api.Assertions.assertFalse(empty.allAffectedActive());
-
+        org.junit.jupiter.api.Assertions.assertTrue(empty.affectedMounts().isEmpty());
         RuntimeDiagnostic diagnostic = new RuntimeDiagnostic(
                 DiagnosticCode.MISSING_CAPABILITY, "mount", "waiting");
         SettlementReport waiting = new SettlementReport(
@@ -18,8 +17,6 @@ final class SettlementReportTest {
                 java.util.List.of());
         org.junit.jupiter.api.Assertions.assertTrue(waiting.hasAffectedMounts());
         org.junit.jupiter.api.Assertions.assertFalse(waiting.hasFailedMounts());
-        org.junit.jupiter.api.Assertions.assertFalse(waiting.allAffectedActive());
-
         SettlementReport disposed = new SettlementReport(
                 2,
                 java.util.List.of(new SettlementReport.MountOutcome(
@@ -27,7 +24,6 @@ final class SettlementReportTest {
                 java.util.List.of());
         org.junit.jupiter.api.Assertions.assertTrue(disposed.hasAffectedMounts());
         org.junit.jupiter.api.Assertions.assertFalse(disposed.hasFailedMounts());
-        org.junit.jupiter.api.Assertions.assertFalse(disposed.allAffectedActive());
     }
 
     @org.junit.jupiter.api.Test
@@ -67,7 +63,7 @@ final class SettlementReportTest {
 
             org.junit.jupiter.api.Assertions.assertTrue(report.hasAffectedMounts());
             org.junit.jupiter.api.Assertions.assertTrue(report.hasFailedMounts());
-            org.junit.jupiter.api.Assertions.assertFalse(report.allAffectedActive());
+            org.junit.jupiter.api.Assertions.assertFalse(report.affectedMounts().isEmpty());
             org.junit.jupiter.api.Assertions.assertEquals(
                     java.util.List.of(consumer.handleId()),
                     report.mountOutcomes().stream().map(SettlementReport.MountOutcome::handleId).toList());

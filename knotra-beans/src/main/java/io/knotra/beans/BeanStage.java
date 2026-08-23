@@ -6,6 +6,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
+/**
+ * Bean 构建过程中的不可变中间状态。
+ *
+ * <p>本类只承载状态与单项配置冲突检查；名称不变量和不可变列表的所有权统一归
+ * {@link BeanDefinitionSupport}。</p>
+ */
 final class BeanStage<C, T> {
 
     private final String componentId;
@@ -42,11 +48,11 @@ final class BeanStage<C, T> {
             Beans.Initializer<? super T> initializer,
             Beans.Normalizer<C> normalizer,
             BeanDisposal<T> disposal) {
-        this.componentId = Beans.requireComponentId(componentId);
-        this.configType = Objects.requireNonNull(configType, "configType");
-        this.dependencies = List.copyOf(dependencies);
-        this.creator = Objects.requireNonNull(creator, "creator");
-        this.outputs = List.copyOf(outputs);
+        this.componentId = componentId;
+        this.configType = configType;
+        this.dependencies = dependencies;
+        this.creator = creator;
+        this.outputs = outputs;
         this.initializer = initializer;
         this.normalizer = normalizer;
         this.disposal = disposal;
@@ -54,33 +60,36 @@ final class BeanStage<C, T> {
 
     BeanStage<C, T> withOutput(BeanOutput<T, ?> output) {
         Objects.requireNonNull(output, "output");
-        String name = output.key().name();
-        for (BeanOutput<T, ?> existing : outputs) {
-            if (existing.key().name().equals(name)) {
-                throw new IllegalArgumentException("duplicate output name: " + name);
-            }
-        }
         List<BeanOutput<T, ?>> next = new ArrayList<>(outputs);
         next.add(output);
         return new BeanStage<>(
-                componentId, configType, dependencies, creator, List.copyOf(next),
+                componentId, configType, dependencies, creator, next,
                 initializer, normalizer, disposal);
     }
 
     BeanStage<C, T> withInitializer(Beans.Initializer<? super T> next) {
+        Objects.requireNonNull(next, "initializer");
+        rejectExisting(initializer, "initializer");
         return new BeanStage<>(componentId, configType, dependencies, creator, outputs,
-                Objects.requireNonNull(next, "initializer"), normalizer, disposal);
+                next, normalizer, disposal);
     }
 
     BeanStage<C, T> withNormalizer(Beans.Normalizer<C> next) {
+        Objects.requireNonNull(next, "normalizer");
+        rejectExisting(normalizer, "config normalizer");
         return new BeanStage<>(componentId, configType, dependencies, creator, outputs,
-                initializer, Objects.requireNonNull(next, "normalizer"), disposal);
+                initializer, next, disposal);
     }
 
     BeanStage<C, T> withDisposal(BeanDisposal<T> next) {
+        Objects.requireNonNull(next, "disposal");
+        rejectExisting(disposal.mode() == Beans.LifecycleMode.AUTO
+                ? null
+                : disposal, "disposal");
         return new BeanStage<>(componentId, configType, dependencies, creator, outputs,
-                initializer, normalizer, Objects.requireNonNull(next, "disposal"));
+                initializer, normalizer, next);
     }
+
     BeanDefinitionSupport<C, T> build() {
         return new BeanDefinitionSupport<>(
                 componentId, configType, dependencies, creator, outputs,
@@ -95,5 +104,11 @@ final class BeanStage<C, T> {
                 stage.outputs,
                 stage.initializer,
                 stage.disposal);
+    }
+
+    private static void rejectExisting(Object existing, String configurationName) {
+        if (existing != null) {
+            throw new IllegalStateException(configurationName + " has already been configured");
+        }
     }
 }

@@ -71,16 +71,6 @@ final class RegistrationImpl<T> implements Registration<T> {
         return settlement.whenSettled();
     }
 
-    @Override
-    public Registration<T> replace(T value) {
-        return runtime().replace(this, value);
-    }
-
-    @Override
-    public Settlement revoke() {
-        return runtime().revoke(this);
-    }
-
     void requireFresh(String operation) {
         if (!stale && registration.runtime.hasLiveRegistration(registration.registrationId())) {
             return;

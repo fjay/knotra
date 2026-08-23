@@ -13,8 +13,8 @@ record SpringDependency<T>(CapabilityKey<T> key, String beanName, Binding bindin
         OPTIONAL_OPTIONAL,
         DYNAMIC_CAPABILITY_REQUIRED,
         DYNAMIC_CAPABILITY_OPTIONAL,
-        DYNAMIC_REQUIRED,
-        DYNAMIC_OPTIONAL
+        DYNAMIC_PROXY_REQUIRED,
+        DYNAMIC_PROXY_OPTIONAL
     }
 
     SpringDependency {
@@ -28,9 +28,9 @@ record SpringDependency<T>(CapabilityKey<T> key, String beanName, Binding bindin
             case REQUIRED -> CapabilityRequirement.required(key);
             case OPTIONAL_VALUE, OPTIONAL_OPTIONAL ->
                     CapabilityRequirement.optional(key);
-            case DYNAMIC_CAPABILITY_REQUIRED, DYNAMIC_REQUIRED ->
+            case DYNAMIC_CAPABILITY_REQUIRED, DYNAMIC_PROXY_REQUIRED ->
                     CapabilityRequirement.dynamicRequired(key);
-            case DYNAMIC_CAPABILITY_OPTIONAL, DYNAMIC_OPTIONAL ->
+            case DYNAMIC_CAPABILITY_OPTIONAL, DYNAMIC_PROXY_OPTIONAL ->
                     CapabilityRequirement.dynamicOptional(key);
         };
     }

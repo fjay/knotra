@@ -19,8 +19,8 @@ public final class QuickStartExample {
             String firstValue,
             String secondValue,
             Publication<Greeting> publication,
-            boolean firstReportAllAffectedActive,
-            boolean secondReportAllAffectedActive,
+            boolean firstReportAffectedMounts,
+            boolean secondReportAffectedMounts,
             int rendererInstances) {
     }
 
@@ -69,8 +69,7 @@ public final class QuickStartExample {
 
             SettlementReport firstReport = firstChange.awaitSettled(timeout);
             check(!firstReport.hasFailedMounts(), "first publication must not fail a mount");
-            check(!firstReport.allAffectedActive(),
-                    "an empty affected set is not an all-active health claim");
+            check(!firstReport.hasAffectedMounts(), "no mounts exist yet when the first value publishes");
 
             MountHandle renderer = Beans
                     .component("greeting-renderer")
@@ -88,7 +87,7 @@ public final class QuickStartExample {
             SettlementReport secondReport = secondChange.awaitSettled(timeout);
 
             check(!secondReport.hasFailedMounts(), "renderer settlement must not fail");
-            check(!secondReport.allAffectedActive(), "a dynamic proxy is not activation-affected by replacement");
+            check(!secondReport.hasAffectedMounts(), "a dynamic proxy consumer is not activation-affected by replacement");
             check(secondChange.publication() == publication,
                     "Publication must stay stable across updates");
             check(secondChange.generation() > firstChange.generation(),
@@ -102,8 +101,8 @@ public final class QuickStartExample {
                     firstValue,
                     secondValue,
                     publication,
-                    firstReport.allAffectedActive(),
-                    secondReport.allAffectedActive(),
+                    firstReport.hasAffectedMounts(),
+                    secondReport.hasAffectedMounts(),
                     rendererInstances.get());
         }
     }

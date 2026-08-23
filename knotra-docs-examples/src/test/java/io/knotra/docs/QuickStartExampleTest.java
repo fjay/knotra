@@ -17,8 +17,8 @@ final class QuickStartExampleTest {
         assertEquals("v1: Hello, Knotra", result.firstValue());
         assertEquals("v2: Hello, Knotra", result.secondValue());
         assertNotNull(result.publication());
-        assertFalse(result.firstReportAllAffectedActive());
-        assertFalse(result.secondReportAllAffectedActive(),
+        assertFalse(result.firstReportAffectedMounts());
+        assertFalse(result.secondReportAffectedMounts(),
                 "a dynamic proxy consumer is not rebuilt for this change");
         assertEquals(1, result.rendererInstances(),
                 "the dynamic proxy must follow the new provider without rebuilding the bean");

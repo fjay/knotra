@@ -35,6 +35,8 @@ public final class EventBusComponent implements Component<NoConfig> {
      */
     @Override
     public void start(ActivationContext context, NoConfig config) {
+        // 默认构造路径由组件宿主决定：Activation 独立使用自带 cached pool；宿主若注入执行器，
+        // 线程策略和生命周期治理也应由宿主统一决定。
         EventBus bus = new DefaultEventBus();
         context.lifecycle().manageAsync("event-bus", bus);
         context.provide(EventCapabilities.EVENT_BUS, bus);
