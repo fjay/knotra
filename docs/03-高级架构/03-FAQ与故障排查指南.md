@@ -101,6 +101,35 @@ handle.requireActive(Duration.ofSeconds(10));
 
 ---
 
+### Q6: `closeAsync()` 有界等待超时了，怎么判断卡在哪里？
+
+**解答**：
+
+`closeAsync()` 的语义是无界排空收敛，不会因为诊断而注入隐藏超时或跳过资源释放。超时后应分别采样四个 owner 的挂起操作快照：
+
+```java
+System.err.println(runtime.advanced().pendingOperations().render());
+System.err.println(bus.pendingOperations().render());      // knotra-events
+System.err.println(adapter.pendingOperations().render());  // knotra-pf4j
+System.err.println(loader.pendingOperations().render());   // knotra-loader
+```
+
+四份快照相互独立、各自 point-in-time，没有全局聚合视图；某份快照为空只说明采样瞬间没有已知挂起操作，不代表对应 close 已完成，更不能据此推断整体关闭完成。完成与否只以 close future 的收敛为准，诊断只负责回答“还在等什么”。
+
+典型三层关联（插件监听器卡住导致卸载阻塞）：
+
+```text
+adapter:   ARTIFACT_DRAIN|pricing-plugin|...|phase=dispose-roots, rootIds=[m-42], closureIds=[pricing-plugin]
+runtime:   COMPONENT_TRANSITION|m-42|...|component dispose
+           LIFECYCLE_CLEANUP|entry-17|...|async pricing-listener
+bus:       EVENT_DISPATCH|event-dispatch-bus-3-12|...|listeners=1
+           EVENT_SUBSCRIPTION_DRAIN|event-subscription-bus-3-8|...|ids=[event-dispatch-bus-3-12]
+```
+
+adapter 的 `rootIds` 与 core `COMPONENT_TRANSITION` 的 targetId 指向同一挂载句柄；`LIFECYCLE_CLEANUP` 给出该句柄正在清理的生命周期条目；被卡住的 `EVENT_DISPATCH` targetId 出现在 `EVENT_SUBSCRIPTION_DRAIN` 的 `ids=[...]` 中。沿稳定 ID 关联即可定位到具体回调，再决定释放外部依赖、修复代码还是告警。
+
+---
+
 ## 诊断码（DiagnosticCode）速查手册
 
 | 诊断码 | 含义 | 处置建议 |

@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class SnapshotClassLoaderFixture {
 
     static final FactoryRef GREETING = FactoryRef.of("integration-greeting");
+    static final FactoryRef IN_FLIGHT = FactoryRef.of("integration-in-flight");
 
     private SnapshotClassLoaderFixture() {
     }

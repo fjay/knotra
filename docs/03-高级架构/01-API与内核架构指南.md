@@ -206,3 +206,10 @@ final class ToolBoxFactory implements MountFactory {
 3. 关闭宿主挂载点与动态桥。
 4. 调用 `runtime.closeAsync()` 并使用有界超时（如 `.get(30, TimeUnit.SECONDS)`）等待完全收敛。
 5. 遇清理失败保留诊断并重试，不盲目吞掉异常。
+
+### 3. 挂起操作快照（pendingOperations）
+
+每个 owner 各自暴露无副作用的中止诊断入口：`runtime.advanced().pendingOperations()`、`bus.pendingOperations()`、`adapter.pendingOperations()` 与 `loader.pendingOperations()`。返回的 `PendingOperationsSnapshot` 只包含枚举、稳定文本与非负时长：每条操作由 `kind`（类别）、`targetId`（目标标识）、`waitsFor`（收敛边界）、`age` 与 `detail` 组成，`render()` 输出确定性多行文本，可直接写入日志。
+
+快照顶层由 `closeRequested`（该 owner 是否已请求关闭）与 `omitted`（因超限被截断的操作数）组成。构造器对操作做确定性排序，最多保留 128 条，超出部分丢弃并计入 `omitted`；每个操作的 `targetId` 截断到 128 个 code point、`detail` 截断到 512 个 code point，均按 code point 边界截断，不会拆分代理对。`render()` 首行输出 `closeRequested=<boolean>`，随后每行一条操作，末行输出 `omitted=<n>`。
+该快照与 `RuntimeSnapshot` 遵循同样的内存安全约束：不持有组件实例、工厂、`Throwable`、`Class` 或 `ClassLoader`，阻塞期间采样后长期持有也不会阻碍插件回收。各 owner 的快照是独立采样、各自 point-in-time，不提供全局聚合视图；空列表只说明该采样瞬间没有已知挂起操作。读取快照不改变任何状态，也不改变 `closeAsync()` 的排空语义，完成与否仍只以对应 future 的收敛为准。

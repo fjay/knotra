@@ -2,12 +2,14 @@ package io.knotra.it;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 
 import com.example.integration.contract.ContractEvent;
 import com.example.integration.contract.IntegrationCoordinator;
@@ -16,6 +18,7 @@ import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountFactory;
 import io.knotra.MountHandle;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.events.EventBus;
 import io.knotra.events.EventCapabilities;
 import io.knotra.events.EventDefinition;
@@ -111,31 +114,120 @@ final class EventBusIntegrationTest {
             CompletableFuture<EventDispatch<ContractEvent>> held =
                     bus.dispatch(CONTRACT_EVENTS, new ContractEvent("held")).toCompletableFuture();
             IntegrationCoordinator.eventEntered().get(10, TimeUnit.SECONDS);
+            Throwable heldPhaseFailure = null;
+            CompletableFuture<Void> unload = null;
+            try {
+                unload = adapter
+                        .unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID)
+                        .toCompletableFuture();
+                await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                        assertEquals(ArtifactState.DRAINING, adapter.artifact(
+                                IntegrationTestKit.ARTIFACT_ID).orElseThrow().state()));
+                assertFalse(unload.isDone(), "drain must wait for the accepted plugin callback");
+                assertEquals(0, bus.snapshot().subscriptionCount());
 
-            CompletableFuture<Void> unload = adapter
-                    .unloadArtifactAsync(IntegrationTestKit.ARTIFACT_ID)
-                    .toCompletableFuture();
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                    assertEquals(ArtifactState.DRAINING, adapter.artifact(
-                            IntegrationTestKit.ARTIFACT_ID).orElseThrow().state()));
-            assertFalse(unload.isDone(), "drain must wait for the accepted plugin callback");
-            assertEquals(0, bus.snapshot().subscriptionCount());
+                // 事件门未释放：三层数据就绪后快速采样，查询本身不推进任何状态。
+                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                    requireOperation(adapter.pendingOperations(), item ->
+                            item.kind() == PendingOperationsSnapshot.Kind.ARTIFACT_DRAIN
+                                    && item.targetId().equals(IntegrationTestKit.ARTIFACT_ID)
+                                    && item.detail().contains(consumer.handleId()));
+                    requireOperation(runtime.advanced().pendingOperations(), item ->
+                            item.kind() == PendingOperationsSnapshot.Kind.COMPONENT_TRANSITION
+                                    && item.targetId().equals(consumer.handleId()));
+                    requireOperation(runtime.advanced().pendingOperations(), item ->
+                            item.kind() == PendingOperationsSnapshot.Kind.LIFECYCLE_CLEANUP
+                                    && item.detail().contains("integration-shared-listener"));
+                    requireOperation(bus.pendingOperations(), item ->
+                            item.kind() == PendingOperationsSnapshot.Kind.EVENT_SUBSCRIPTION_DRAIN);
+                });
+                PendingOperationsSnapshot eventsWhileHeld = assertTimeout(
+                        Duration.ofSeconds(1), bus::pendingOperations);
+                PendingOperationsSnapshot coreWhileHeld = assertTimeout(
+                        Duration.ofSeconds(1), () -> runtime.advanced().pendingOperations());
+                PendingOperationsSnapshot artifactWhileHeld = assertTimeout(
+                        Duration.ofSeconds(1), adapter::pendingOperations);
 
-            ShadowEvents.ShadowEvent<?> shadowWhileHeld = ShadowEvents.load(
-                    TEST_CLASSES,
-                    ContractEvent.class.getName(),
-                    "shadow-while-held");
-            Throwable rejected = ShadowEvents.failedStageCause(
-                    dispatchShadow(bus, shadowWhileHeld));
-            assertTrue(rejected instanceof IllegalArgumentException,
-                    () -> String.valueOf(rejected));
-            assertTrue(rejected.getMessage().contains("already bound to a different Class"),
-                    rejected::getMessage);
+                PendingOperationsSnapshot.Operation dispatch = requireOperation(
+                        eventsWhileHeld,
+                        item -> item.kind() == PendingOperationsSnapshot.Kind.EVENT_DISPATCH);
+                assertEquals(PendingOperationsSnapshot.WaitType.LISTENER, dispatch.waitsFor());
+                PendingOperationsSnapshot.Operation subscriptionDrain = requireOperation(
+                        eventsWhileHeld,
+                        item -> item.kind() == PendingOperationsSnapshot.Kind.EVENT_SUBSCRIPTION_DRAIN);
+                assertEquals(PendingOperationsSnapshot.WaitType.DISPATCH,
+                        subscriptionDrain.waitsFor());
+                assertTrue(subscriptionDrain.detail().contains(dispatch.targetId()),
+                        eventsWhileHeld::render);
 
-            IntegrationCoordinator.releaseEvent();
-            unload.get(10, TimeUnit.SECONDS);
+                PendingOperationsSnapshot.Operation transition = requireOperation(
+                        coreWhileHeld,
+                        item -> item.kind() == PendingOperationsSnapshot.Kind.COMPONENT_TRANSITION
+                                    && item.targetId().equals(consumer.handleId()));
+                assertEquals(PendingOperationsSnapshot.WaitType.COMPONENT, transition.waitsFor());
+                PendingOperationsSnapshot.Operation cleanup = requireOperation(
+                        coreWhileHeld,
+                        item -> item.kind() == PendingOperationsSnapshot.Kind.LIFECYCLE_CLEANUP
+                                    && item.detail().contains("integration-shared-listener"));
+                assertEquals(PendingOperationsSnapshot.WaitType.LIFECYCLE_ENTRY,
+                        cleanup.waitsFor());
+
+                PendingOperationsSnapshot.Operation artifactDrain = requireOperation(
+                        artifactWhileHeld,
+                        item -> item.kind() == PendingOperationsSnapshot.Kind.ARTIFACT_DRAIN
+                                    && item.targetId().equals(IntegrationTestKit.ARTIFACT_ID));
+                assertTrue(artifactDrain.detail().contains("rootIds="),
+                        artifactWhileHeld::render);
+                assertTrue(artifactDrain.detail().contains(consumer.handleId()),
+                        artifactWhileHeld::render);
+                ShadowEvents.ShadowEvent<?> shadowWhileHeld = ShadowEvents.load(
+                        TEST_CLASSES,
+                        ContractEvent.class.getName(),
+                        "shadow-while-held");
+                Throwable rejected = ShadowEvents.failedStageCause(
+                        dispatchShadow(bus, shadowWhileHeld));
+                assertTrue(rejected instanceof IllegalArgumentException,
+                        () -> String.valueOf(rejected));
+                assertTrue(rejected.getMessage().contains("already bound to a different Class"),
+                        rejected::getMessage);
+
+                IntegrationCoordinator.releaseEvent();
+                unload.get(10, TimeUnit.SECONDS);
+            } catch (Throwable failure) {
+                heldPhaseFailure = failure;
+            } finally {
+                // 任何 pending/Shadow 断言失败都必须先释放事件门并有界排空，
+                // 否则 adapter 的 try-with-resources close 会把失败变成挂死。
+                try {
+                    IntegrationCoordinator.releaseEvent();
+                    if (unload != null) {
+                        unload.get(10, TimeUnit.SECONDS);
+                    }
+                    held.get(10, TimeUnit.SECONDS);
+                } catch (Throwable cleanupFailure) {
+                    if (heldPhaseFailure == null) {
+                        heldPhaseFailure = cleanupFailure;
+                    } else {
+                        heldPhaseFailure.addSuppressed(cleanupFailure);
+                    }
+                }
+            }
+            if (heldPhaseFailure != null) {
+                if (heldPhaseFailure instanceof Exception failure) {
+                    throw failure;
+                }
+                throw new AssertionError(heldPhaseFailure);
+            }
             assertTrue(held.get(10, TimeUnit.SECONDS).successful());
             assertEquals(1, IntegrationCoordinator.eventDeliveries());
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                assertEquals(List.of(), bus.pendingOperations().operations(),
+                        () -> bus.pendingOperations().render());
+                assertEquals(List.of(), runtime.advanced().pendingOperations().operations(),
+                        () -> runtime.advanced().pendingOperations().render());
+                assertEquals(List.of(), adapter.pendingOperations().operations(),
+                        () -> adapter.pendingOperations().render());
+            });
             assertEquals(ArtifactState.UNLOADED, adapter.artifact(
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
             assertTrue(runtime.advanced().snapshot().mounts().stream()
@@ -238,6 +330,15 @@ final class EventBusIntegrationTest {
             assertTrue(failureCause.getMessage().contains("already bound to a different Class"),
                     failureCause::getMessage);
         }
+    }
+
+    private static PendingOperationsSnapshot.Operation requireOperation(
+            PendingOperationsSnapshot snapshot,
+            Predicate<PendingOperationsSnapshot.Operation> filter) {
+        return snapshot.operations().stream()
+                .filter(filter)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(snapshot.render()));
     }
 
     private static <T> CompletionStage<EventDispatch<T>> dispatchShadow(

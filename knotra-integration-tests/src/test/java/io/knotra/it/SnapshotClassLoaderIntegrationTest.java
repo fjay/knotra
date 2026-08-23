@@ -1,14 +1,20 @@
 package io.knotra.it;
 
+import java.lang.ref.Reference;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 import com.example.integration.contract.IntegrationCoordinator;
+import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentState;
 import io.knotra.ConfiguredMountHandle;
 import io.knotra.KnotraRuntime;
+import io.knotra.MountFactory;
 import io.knotra.MountHandle;
 import io.knotra.Publication;
 import io.knotra.PublicationChange;
@@ -17,13 +23,17 @@ import io.knotra.SettlementReport;
 import io.knotra.events.EventBus;
 import io.knotra.events.EventBusFactory;
 import io.knotra.events.EventBusSnapshot;
+import io.knotra.loader.ComponentEntry;
+import io.knotra.loader.ComponentTree;
 import io.knotra.loader.KnotraLoader;
+import io.knotra.loader.ReconcileResult;
 import io.knotra.loader.LoaderSnapshot;
 import io.knotra.pf4j.ArtifactSnapshot;
 import io.knotra.pf4j.ArtifactState;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.FailureInfo;
+import io.knotra.PendingOperationsSnapshot;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
@@ -74,6 +84,54 @@ final class SnapshotClassLoaderIntegrationTest {
             assertTrue(unpublished.generation() > updateReport.generation());
             assertTrue(runtime.root().view().find(String.class).isEmpty());
 
+            // 阻塞期间采集四份 pending DTO：释放、卸载与 close 之后继续持有它们。
+            // 插件工厂在 create() 阻塞覆盖 loader/adapter；宿主工厂在 start() 阻塞覆盖 core。
+            CompletableFuture<ReconcileResult> gatedReconcile = loader.reconcileAsync(
+                            ComponentTree.of(ComponentEntry.of(
+                                    "gated", SnapshotClassLoaderFixture.IN_FLIGHT)))
+                    .toCompletableFuture();
+            IntegrationCoordinator.mountEntered().get(10, TimeUnit.SECONDS);
+            CountDownLatch startEntered = new CountDownLatch(1);
+            CompletableFuture<Void> startGate = new CompletableFuture<>();
+            MountHandle pendingCapture = runtime.mount("pending-capture", MountFactory.of(
+                    "pending-capture",
+                    ComponentDescriptor.named("pending-capture"),
+                    context -> {
+                        startEntered.countDown();
+                        startGate.join();
+                    }));
+            assertTrue(startEntered.await(10, TimeUnit.SECONDS));
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                requireOperation(loader.pendingOperations(), item ->
+                        item.kind() == PendingOperationsSnapshot.Kind.LOADER_OPERATION
+                                && item.targetId().equals("gated"));
+                requireOperation(adapter.pendingOperations(), item ->
+                        item.kind() == PendingOperationsSnapshot.Kind.ARTIFACT_MOUNT
+                                && item.targetId().equals(IntegrationTestKit.ARTIFACT_ID));
+                requireOperation(runtime.advanced().pendingOperations(), item ->
+                        item.kind() == PendingOperationsSnapshot.Kind.COMPONENT_TRANSITION
+                                && item.targetId().equals(pendingCapture.handleId()));
+            });
+            PendingOperationsSnapshot[] retainedPending = {
+                    assertTimeout(
+                            Duration.ofSeconds(1), () -> runtime.advanced().pendingOperations()),
+                    assertTimeout(
+                            Duration.ofSeconds(1), loader::pendingOperations),
+                    assertTimeout(
+                            Duration.ofSeconds(1), adapter::pendingOperations),
+                    assertTimeout(
+                            Duration.ofSeconds(1), bus::pendingOperations)
+            };
+
+            startGate.complete(null);
+            assertEquals(ComponentState.ACTIVE,
+                    pendingCapture.awaitSettled(Duration.ofSeconds(30)));
+            assertEquals(ComponentState.DISPOSED, pendingCapture.disposeAsync()
+                    .toCompletableFuture().get(10, TimeUnit.SECONDS));
+            IntegrationCoordinator.releaseMount();
+            ReconcileResult gatedResult = gatedReconcile.get(30, TimeUnit.SECONDS);
+            assertTrue(gatedResult.converged(), () -> gatedResult.diagnostics().toString());
+
             RuntimeSnapshot runtimeSnapshot = runtime.advanced().snapshot();
             LoaderSnapshot loaderSnapshot = loader.snapshot();
             EventBusSnapshot busSnapshot = bus.snapshot();
@@ -102,12 +160,17 @@ final class SnapshotClassLoaderIntegrationTest {
 
             RetainedGraphScanner denyingClasses =
                     RetainedGraphScanner.denyingClasses(PLUGIN_PACKAGE);
+            // Scanner 先扫，GC 断言之后仍要读取同一批 DTO，消除 JIT 局部死亡假阳性。
             denyingClasses.assertPure(
                     runtimeSnapshot,
                     artifactSnapshot,
                     loaderSnapshot,
                     busSnapshot,
                     closedBusSnapshot,
+                    retainedPending[0],
+                    retainedPending[1],
+                    retainedPending[2],
+                    retainedPending[3],
                     List.of(publishReport, updateReport),
                     List.of(pluginFailureInfo));
             RetainedGraphScanner.allowingNonPluginClasses(PLUGIN_PACKAGE)
@@ -129,9 +192,24 @@ final class SnapshotClassLoaderIntegrationTest {
                         System.gc();
                         assertEquals(0, IntegrationCoordinator.liveLoaders(),
                                 "retained stable DTOs must not retain the plugin class loader");
+                        Reference.reachabilityFence(retainedPending);
                     });
+            for (PendingOperationsSnapshot snapshot : retainedPending) {
+                assertFalse(snapshot.render().isBlank(), snapshot::render);
+                assertNotNull(snapshot.operations(), snapshot::render);
+            }
+            Reference.reachabilityFence(retainedPending);
         } finally {
             IntegrationCoordinator.clearLoaders();
         }
+    }
+
+    private static PendingOperationsSnapshot.Operation requireOperation(
+            PendingOperationsSnapshot snapshot,
+            Predicate<PendingOperationsSnapshot.Operation> filter) {
+        return snapshot.operations().stream()
+                .filter(filter)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(snapshot.render()));
     }
 }
