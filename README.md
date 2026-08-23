@@ -45,7 +45,7 @@ Knotra 通过**稳定的发布槽位**、**代际一致性**、**非阻塞在途
 |---|---|---|---|
 | **`Capability`** | 类型化命名服务契约 | **电视频道协议** | 定义“提供什么能力”（如 `Greeting.class` 或 `"payment.primary"`），不绑定具体类实现。 |
 | **`Publication<T>`** | 稳定发布槽位 | **电视机频道（如 CCTV-1）** | 长期存在的稳定槽位。业务方认准这个槽位，发布者可以随时向槽位推送新版本内容。 |
-| **`Registration<T>`** | 已提交的某一代具体能力 | **频道当前播放的具体节目（如第 1 集）** | 属于某一确定代际的具体实现。替换槽位内容会产生新的 Registration，旧代际保持不可变并随历史退场。 |
+| **注册代际（registration generation）** | 内核概念：槽位内某一代已提交的具体能力（非公共 API） | **频道当前播放的具体节目（如第 1 集）** | `Publication.update` 推进代际；旧代际不可变并随在途调用排空退场。 |
 | **`MountHandle`** | 稳定的逻辑挂载点 | **墙上的多功能插座** | 业务逻辑挂载的位置。无论插座上的电器如何重启或重配置，插座的身份始终不变。 |
 | **`Activation`** | 一次运行时的激活尝试 | **插在插座上正在通电运转的电器** | 每次启动、重启或重配置都会产生新的 Activation，捕获当时的依赖和配置；失败可重试。 |
 | **`Settlement`** | 单次操作的传播与排空收敛 | **变更平滑生效并稳定** | 描述单次变更（如 publish/update/transaction）引起的依赖传播、在途排空与子树初始化全部完成。 |
@@ -188,7 +188,7 @@ Knotra 将功能划分为清晰的三层，避免高级概念干扰日常业务�
 | 层次 | 目标使用者 | 核心类与入口 | 设计边界与原则 |
 |---|---|---|---|
 | **Simple API** | 日常业务开发 | `KnotraRuntime`、`Publication`、`Beans`、`MountHandle` | 零事务概念、无原始代际操纵、无底层配置占位类型，开箱即用。 |
-| **Advanced API** | 平台与框架架构师 | `runtime.advanced()` | 支持多操作结构事务、特定代际 `Registration`、多租户 Context 树与全量纯数据快照。 |
+| **Advanced API** | 平台与框架架构师 | `runtime.advanced()` | 支持多操作结构事务、多租户 Context 树与全量纯数据快照。注册代际是内核概念；发布走 `Publication`，事务内暂存走 `tx.provide`。 |
 | **SPI** | 插件与扩展开发者 | `Component`、`ComponentFactory`、`ActivationContext` | 直接实现底层生命周期，管理原生资源并遵循 ClassLoader 隔离规则。 |
 
 ---
@@ -199,7 +199,7 @@ Knotra 将功能划分为清晰的三层，避免高级概念干扰日常业务�
 |---|---|---|
 | `knotra-bom` | 版本依赖集中管理 BOM | 无 |
 | `knotra-starter` | 普通应用快速接入 Starter | Core、Beans |
-| `knotra-core` | Publication、Registration、Mount、事务、生命周期与快照内核 | 无外部第三方运行时依赖 |
+| `knotra-core` | Publication、Mount、事务、生命周期与快照内核 | 无外部第三方运行时依赖 |
 | `knotra-beans` | POJO 构造器注入与生命周期适配 Fluent DSL | Core |
 | `knotra-beans-processor` | 编译期注解处理器（自动生成工厂代码） | Core、Beans |
 | `knotra-events` | 具备在途排空能力的进程内类型化事件总线 | Core |

@@ -11,23 +11,23 @@
 ```mermaid
 graph LR
     subgraph 服务发布维度
-        P["Publication（稳定发布槽位）<br/>长期存在，负责接收 update"] -->|每次更新产生| R["Registration（不可变注册代际）<br/>单向代际，作为绑定凭据"]
+        P["Publication（稳定发布槽位）<br/>长期存在，负责接收 update"] -->|每次更新产生| R["注册代际 registration generation<br/>内核概念：单向代际，作为绑定凭据"]
     end
     subgraph 逻辑挂载维度
         M["MountHandle（稳定逻辑挂载点）<br/>长期存在，代表逻辑节点"] -->|每次激活产生| A["Activation（具体运行时代）<br/>捕获当前依赖与配置，失败可重试"]
     end
 ```
 
-### 1. Publication（发布槽位）vs Registration（注册代际）
-* **Publication**：一个 Context 内长期存在的**稳定逻辑槽位**（如 CCTV-1 频道）。业务调用方只与 Publication 打交道，槽位身份在整个运行期间保持不变。
-* **Registration**：某一特定时刻已提交的**具体能力代际**（如当前播放的第 1 集）。当通过 `publication.update(...)` 升级能力时，内核不会去修改旧的 Registration，而是生成全新的不可变代际；被替换的旧代际失效，等待在途调用排空后平滑退场。
+### 1. Publication（发布槽位）vs 注册代际（registration generation）
+* **Publication**：一个 Context 内长期存在的**稳定逻辑槽位**（如 CCTV-1 频道）。业务调用方只与 Publication 打交道，槽位身份在整个运行期间保持不变。同一坐标的 `runtime.publish` 是 get-or-update 语义；终态槽位不复活，同坐标重新 publish 创建新槽位。
+* **注册代际（registration generation，内核概念，非公共 API）**：某一特定时刻已提交的**具体能力代际**（如当前播放的第 1 集）。当通过 `publication.update(...)` 升级能力时，内核不会去修改旧代际，而是生成全新的不可变代际；被替换的旧代际失效，等待在途调用排空后平滑退场。
 
 ### 2. MountHandle（挂载点）vs Activation（激活代）
 * **MountHandle**：一个组件附加在运行时树上的**稳定逻辑位置**（如墙上的电源插座）。挂载点的身份在多次重启、重配置或依赖更新中保持不变。
 * **Activation**：挂载点在某一确定代际下的**一次具体启动尝试与实例**。每次激活都会精准捕获启动时的配置与依赖绑定集合；启动或清理失败只会影响当前 Activation，挂载点本身依然存在并可随时重试。
 
 ### 3. 操作级收敛（Settlement）vs 节点过渡（Transition）
-* **操作级收敛（Settlement）**：由 `Publication`、`Registration` 以及结构事务返回，递归覆盖本次操作触发的**受管子树与影响集**，确保变更在全局拓扑中平稳收敛。
+* **操作级收敛（Settlement）**：由 `Publication` 以及结构事务返回，递归覆盖本次操作触发的**受管子树与影响集**，确保变更在全局拓扑中平稳收敛。
 * **挂载点自身过渡（Mount Transition）**：`MountHandle.whenSettled()` 仅等待该挂载点自身的状态过渡（返回 `ComponentState`），不等待其拥有的子节点。这种设计允许父挂载点率先进入 ACTIVE 状态，从而让子节点能够及时消费父节点输出的能力，彻底杜绝父子节点互相等待导致的死锁。
 
 ---
@@ -45,7 +45,7 @@ graph TD
 ```
 
 1. **Simple API（业务层）**：开箱即用。使用 `Class<T>` 作为默认能力标识，通过 `Publication<T>` 进行发布与更新，使用 Fluent Beans DSL 挂载组件，通过 `MountHandle` 管理生命周期。
-2. **Advanced API（平台层）**：结构控制。通过 `runtime.advanced()` 进入，提供多操作原子结构事务、显式代际 `Registration<T>`、多租户 Context 树隔离与无引用的全量纯数据快照（`RuntimeSnapshot`）。
+2. **Advanced API（平台层）**：结构控制。通过 `runtime.advanced()` 进入，提供多操作原子结构事务、多租户 Context 树隔离与无引用的全量纯数据快照（`RuntimeSnapshot`）。注册代际是内核概念，不对外暴露类型化句柄：对外发布与热更新走 `Publication`；事务内暂存注册走 `tx.provide`（返回 `StagedRegistration` 只读凭据，供后续事务 `tx.revoke` 使用）。
 3. **SPI（扩展层）**：底层插件开发。直接实现 `Component<C>` 与 `ComponentFactory<C>`，通过 `ActivationContext` 注册受控生命周期资源。
 
 ---
@@ -81,7 +81,7 @@ SettlementReport report = receipt.awaitSettled(Duration.ofSeconds(10));
 `StagedRegistration<T>` 的生命周期规则：
 * 在事务记录阶段携带强类型信息。
 * 事务提交成功后，作为只读不透明句柄供后续事务执行 `tx.revoke(staged)`。
-* 提交失败时随事务自动失效，绝不会静默升级为已提交的 `Registration`。
+* 提交失败时随事务自动失效，绝不会静默升级为内核中已提交的注册代际。
 
 ### 2. Context 树与能力遮蔽（多租户与灰度）
 

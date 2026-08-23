@@ -5,7 +5,6 @@ import io.knotra.ConfiguredMountHandle;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountHandle;
-import io.knotra.Registration;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.beans.BeanDefinition;
 import io.knotra.beans.Beans;

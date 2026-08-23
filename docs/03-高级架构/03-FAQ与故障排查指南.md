@@ -48,7 +48,7 @@ snapshot.diagnostics().stream()
 ### Q1: `awaitSettled()` 正常返回了，为什么组件不一定是 ACTIVE 状态？
 
 **解答**：
-* Publication、Registration 和结构事务返回的 **操作级收敛（Settlement）** 描述的是“本次变更引发的传播与在途排空已经收敛”。
+* Publication 和结构事务返回的 **操作级收敛（Settlement）** 描述的是“本次变更引发的传播与在途排空已经收敛”。
 * 如果下游某个依赖此能力的组件在启动时抛出了异常，该异常会被记录到 `SettlementReport` 中，挂载点会进入 `FAILED`，但这并不妨碍本次变更操作本身的正常收敛。
 * **正确做法**：检查报告中是否存在失败节点，并断言具体挂载点：
 
@@ -84,10 +84,12 @@ handle.requireActive(Duration.ofSeconds(10));
 
 ---
 
-### Q4: 撤销之后还能找回旧的 `Registration` 吗？
+### Q4: 槽位进入终态后会复活吗？并发 update 会冲突吗？
 
 **解答**：
-不能。在 Knotra 中，每一次提交都会生成不可变的单向代际。被 replace 或 revoke 的旧 `Registration` 已经永久失效，后续操作必须基于新生成的代际进行。
+* 终态（`UNPUBLISHED` / `DISPLACED`）不可逆。同一坐标重新 `runtime.publish(...)` 会创建**全新槽位**，旧 `Publication` 句柄保持终态不变，对其调用 `update(...)` 会被拒绝。
+* 并发 `update(...)` 按提交总序线性化，全部成功；`update` 与 `unpublish` 并发时按先后排序；并发 `unpublish(...)` 只有第一个执行真实撤销，其余幂等返回已收敛的终态结果。
+* 注册代际（registration generation）是内核概念：每次提交生成不可变的单向代际，旧代际随在途调用排空后平滑退场，不对外暴露类型化句柄。
 
 ---
 
