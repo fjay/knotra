@@ -12,30 +12,25 @@ import java.util.Set;
 
 /** 分析注册身份与 OPTIONAL 出现/消失对既有 BindingSet 的影响。 */
 final class BindingImpactAnalyzer {
-    private final DefaultKnotraRuntime runtime;
-
-    BindingImpactAnalyzer(DefaultKnotraRuntime runtime) {
-        this.runtime = runtime;
-    }
-
     // 注册身份或 OPTIONAL 出现/消失都会改变 BindingSet；这里统一把受影响 Activation 标记 stale。
     void markBindingImpacts(
+            PublishedKernelState state,
             RuntimeView.Draft draft,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
-        PublishedKernelState state = runtime.publishedState();
         Phase oldPhase = Phase.of(state.view);
         Phase nextPhase = Phase.of(draft);
         Set<String> impacted = findChangedBindings(draft, state, nextPhase, executable);
 
         if (!impacted.isEmpty()) {
-            Set<String> detachTargets = collectDetachTargets(draft, impacted, executable);
-            // disposeOwnershipForActivation has just mutated the Draft. Its graph and binding
-            // caches are a new stable phase; the earlier nextPhase must not be read again.
-            Phase disposalPhase = Phase.of(draft);
-            Set<String> closure = disposalPhase.graph()
-                    .dependentsClosure(draft, detachTargets);
-            runtime.detachInView(draft, closure, dirty, executable);
+            StructureGraphMutator.MutationResult detached =
+                    StructureGraphMutator.disposeOwnersAndDetach(
+                            draft,
+                            impacted,
+                            StructureGraphMutator.activePublicationSlotRefs(
+                                    state.index, executable));
+            detached.applyTo(executable);
+            dirty.addAll(detached.dirty());
         }
 
         resetSuppressedReconcile(draft, state, oldPhase, dirty, executable);
@@ -83,26 +78,6 @@ final class BindingImpactAnalyzer {
             }
         }
         return impacted;
-    }
-
-    private Set<String> collectDetachTargets(
-            RuntimeView.Draft draft,
-            Set<String> impacted,
-            ExecutableCommitPlan executable) {
-        Set<String> detachTargets = new LinkedHashSet<>();
-        for (String handleId : impacted) {
-            RuntimeView.ComponentData component = draft.components.get(handleId);
-            if (component == null || component.currentActivationId() == null) {
-                detachTargets.add(handleId);
-                continue;
-            }
-            detachTargets.addAll(runtime.disposeOwnershipForActivation(
-                    draft,
-                    handleId,
-                    component.currentActivationId(),
-                    executable));
-        }
-        return detachTargets;
     }
 
     private void resetSuppressedReconcile(

@@ -48,13 +48,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -68,21 +66,24 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Runtime 内核的默认实现，拥有宿主事务、Activation 状态机和组件过渡调度。
+ * Runtime 内核默认实现，拥有宿主事务、Activation 状态机与最终状态发布；组件过渡的预约、
+ * 拓扑排序和锁外驱动委托给 {@link TransitionScheduler}。
  *
- * <p>已提交结构保存在 volatile 的 {@link RuntimeView} 中；所有草稿校验、代际发布和可执行索引同步
+ * <p>已提交结构由 {@link KernelStateStore} 以单一 volatile 状态发布；所有草稿校验、代际提交和可执行索引同步
  * 都在 {@code coordinator} 临界区内完成。Factory、normalizer 和用户 {@code start()} 不持有协调器锁，因此
  * 慢用户代码只能阻塞自身 Activation，不能阻塞其他宿主事务或 Snapshot。</p>
  *
  * <p>Activation 最终提交采用固定管线：prepublish 阶段在协调器内校验候选、冻结暂存注册与子挂载、
  * 构造视图/索引草稿并预留 dirty 过渡（除可取消预约外不修改 live 对象）；随后把
- * {@link ActivationCommitCandidate#nextState()} 赋给 {@code published} 作为唯一不可逆 final publish；
+ * {@link ActivationCommitCandidate#nextState()} 连同构造基线提交给
+ * {@link KernelStateStore}，作为唯一不可逆 final publish；
  * owner/activation 效果在发布后以纯赋值显式 apply，预约驱动、lease 排空与额外调度在协调器外执行。
  * final publish 之后的任何故障都不回滚已提交 child/registration/owner，原始过渡 future 以阶段文本
  * 异常完成；prepublish 失败则取消本候选预约，并从最新代际构造一次 STOPPING 中止候选供清理收敛。</p>
  *
- * <p>锁顺序约定：协调器锁优先；Context 处置临界区会在协调器内再取 {@code contextFutures}；
- * 完成组件过渡时协调器可嵌套 {@link ComponentRuntime} 的过渡链锁。LifecycleScope 释放器、
+ * <p>锁顺序约定：协调器锁优先；协调器临界区内允许对 dispose/Context 处置注册表做 CHM 短计算，
+ * 注册表是叶子结构，绝不反向获取协调器或回调 runtime。完成组件过渡时协调器可嵌套
+ * {@link ComponentRuntime} 的过渡链锁。LifecycleScope 释放器、
  * 用户回调和 Future 回调不得反向获取协调器锁。</p>
  */
 final class DefaultKnotraRuntime implements KnotraRuntime {
@@ -91,18 +92,16 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     // 结构一致性主锁：保护视图草稿、代际发布、可执行索引同步和过渡状态裁决。
     final Object coordinator = new Object();
     final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    // 只在协调器内整体替换；无锁读取方拿到的是 view 与 live membership 的同代状态。
-    private volatile PublishedKernelState published;
+    // 过渡预约/拓扑/驱动属调度器；runtime 只保留状态机 driver 与最终发布权。
+    final TransitionScheduler transitionScheduler;
+    // 唯一 volatile 状态持有者：读方一次拿到 view 与 live membership 的同代组合。
+    private final KernelStateStore kernelState;
 
-    // Context 处置去重在协调器内嵌套 contextFutures；单组件 dispose 用独立请求锁合并并发调用。
-    private final Map<String, CompletableFuture<Void>> contextFutures =
-            new ConcurrentHashMap<>();
-    private final Map<String, CompletableFuture<ComponentState>> disposeRequests =
-            new ConcurrentHashMap<>();
-    private final Map<String, RequestPending> disposeRequestPending =
-            new ConcurrentHashMap<>();
-    private final Map<String, ContextDisposalPending> contextDisposalPending =
-            new ConcurrentHashMap<>();
+    // dispose/Context 处置去重与 pending 元数据统一收口到叶子注册表；方法体不回调 runtime。
+    private final DisposeRequestRegistry disposeRequestRegistry =
+            new DisposeRequestRegistry();
+    private final ContextDisposalRequestRegistry contextDisposalRegistry =
+            new ContextDisposalRequestRegistry();
     private final RetiredProviderLeaseRegistry retiredProviderLeases =
             new RetiredProviderLeaseRegistry();
     // close 先于新事务置位；失败的未来可被替换以便重试关闭，成功后复用同一结果。
@@ -112,29 +111,29 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     private volatile long closeStartNanos;
     private volatile boolean closeStartPresent;
     private final AdvancedRuntime advanced = new RuntimeAdvancedFacade(this);
-    private final BindingImpactAnalyzer bindingImpacts = new BindingImpactAnalyzer(this);
+    private final BindingImpactAnalyzer bindingImpacts = new BindingImpactAnalyzer();
+    private final ActivationCandidateFactory activationCandidates;
     private final DynamicCapabilityBroker dynamicBroker = new DynamicCapabilityBroker(this);
     // 包内测试探针：在 Activation 裁决释放协调器后、完成/清理前构造结构事务竞态。
     volatile Runnable activationDecisionProbe;
-    // 包内测试探针：在发布前预约完成后暂停，用于构造 reserve/publish/drive 竞态。
-    volatile Runnable transitionReservationProbe;
     // 包内测试探针：在 Activation prepublish 候选构造完成后、final publish 前注入故障。
     volatile Runnable activationPrepublishProbe;
     // 包内测试探针：在 final publish 计算前注入故障，覆盖 nextState() 抛出的恢复路径。
     volatile Runnable activationFinalPublishProbe;
-    // 包内测试探针：在 final publish 赋值后、效果 apply 前注入提交后效果故障。
+    // 包内测试探针：在 final publish 提交后、效果 apply 前注入提交后效果故障。
     volatile Runnable activationPostPublishEffectProbe;
     // 包内测试探针：在非终态视图发布后、过渡驱动前观察 whenSettled 的可见行为。
     volatile Runnable transitionPublicationProbe;
-    // 包内测试探针：在 whenSettled 读取 published 后、进入 chainLock 前暂停；探针须先清空自身再阻塞。
+    // 包内测试探针：在 whenSettled 读取状态后、进入 chainLock 前暂停；探针须先清空自身再阻塞。
     volatile Runnable whenSettledObservationProbe;
-    // 包内测试探针：在第 N 个过渡预约创建前注入故障；参数为即将创建的预约序号。
-    volatile IntConsumer transitionReservationFaultProbe;
     // 包内测试探针：在第 N 个已提交 provider lease retire 前注入故障。
     volatile IntConsumer providerLeaseRetireFaultProbe;
     // 包内测试探针：在中止候选 final publish 后注入提交后故障。
     volatile Runnable activationRollbackCommitProbe;
-    private final DiagnosticSupport diagnostics = new DiagnosticSupport(this);
+    // 包内测试探针：在 finishCleanup 最终提交前注入竞争代际或故障。
+    volatile Runnable cleanupFinalCommitProbe;
+    // 包内测试探针：在 Context 最终化提交前注入竞争代际或故障。
+    volatile Runnable contextFinalCommitProbe;
 
     DefaultKnotraRuntime(KnotraConfig configuration) {
         this(configuration, System::nanoTime);
@@ -144,8 +143,11 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     DefaultKnotraRuntime(KnotraConfig configuration, LongSupplier ticker) {
         this.configuration = Objects.requireNonNull(configuration, "configuration");
         this.ticker = Objects.requireNonNull(ticker, "ticker");
-        this.published = PublishedKernelState.initial(
-                new ContextHandleImpl(this, "ctx-root"));
+        this.activationCandidates = new ActivationCandidateFactory(configuration);
+        this.transitionScheduler = new TransitionScheduler(
+                coordinator, executor, this::driveTransition, ticker);
+        this.kernelState = KernelStateStore.initial(
+                coordinator, new ContextHandleImpl(this, "ctx-root"));
     }
 
     long pendingTime() {
@@ -153,11 +155,11 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     RuntimeView currentView() {
-        return published.view;
+        return kernelState.read().view;
     }
 
     PublishedKernelState publishedState() {
-        return published;
+        return kernelState.read();
     }
 
     DynamicCapabilityBroker dynamicBroker() {
@@ -171,7 +173,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     @Override
     public ContextHandle root() {
-        return published.index.contextHandles.get("ctx-root");
+        return kernelState.read().index.contextHandles.get("ctx-root");
     }
 
     @Override
@@ -180,7 +182,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     public RuntimeSnapshot snapshot() {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeSnapshot partial = state.view.snapshotWithoutScopes();
         List<RuntimeSnapshot.LifecycleScopeSnapshot> scopes =
                 state.index.activations.values().stream()
@@ -296,7 +298,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     RuntimeView.PublicationSlotData publicationSlot(String slotId) {
-        return published.view.publicationSlots.get(slotId);
+        return kernelState.read().view.publicationSlots.get(slotId);
     }
 
     /**
@@ -305,7 +307,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
      */
     PublicationSlotObservation publicationSlotObservation(
             PublicationSlotTerminalRef ref) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeView.PublicationSlotData slot =
                 state.view.publicationSlots.get(ref.slotId);
         if (slot != null) {
@@ -378,11 +380,12 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         Map<String, ProviderLeaseRuntime> retiredRegistrations = Map.of();
         ExecutableCommitPlan executable = new ExecutableCommitPlan();
         List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
-        boolean published = false;
+        TransitionPlan transitionPlan = TransitionPlan.EMPTY;
+        boolean committed = false;
         RuntimeView committedView = null;
         try {
             synchronized (coordinator) {
-                PublishedKernelState state = this.published;
+                PublishedKernelState state = kernelState.read();
                 if (closing.get()) {
                     throw new TransactionRejectedException(List.of(new RuntimeDiagnostic(
                             DiagnosticCode.INVALID_LIFECYCLE_OPERATION,
@@ -401,40 +404,43 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 boolean viewChanged = false;
                 try {
                     for (Intent intent : intents) {
-                        viewChanged |= applyIntent(draft, intent, dirty, executable);
+                        viewChanged |= applyIntent(
+                                state, draft, intent, dirty, executable);
                     }
-                    bindingImpacts.markBindingImpacts(draft, dirty, executable);
+                    bindingImpacts.markBindingImpacts(state, draft, dirty, executable);
                     if (!viewChanged) {
                         return new TransactionReceipt<>(
                                 callbackValue,
                                 DefaultSettlement.empty(state.view.generation));
                     }
-                    reserveDraftTransitions(
+                    transitionPlan = transitionScheduler.prepare(
+                            state,
                             draft,
                             dirty,
                             executable,
                             indexDraft,
                             reservations);
-                    runTransitionReservationProbe();
-                    diagnostics.refresh(draft);
+                    DiagnosticSupport.refresh(draft, state.index, configuration);
                     RuntimeView next = draft.publishOnce();
                     commitExecutable(next, intents, executable, indexDraft);
                     PublishedKernelState candidate = indexDraft.publish(next);
                     completeTerminalPublicationRefs(executable);
-                    this.published = candidate;
+                    kernelState.commitLocked(state, candidate);
                     committedView = next;
-                    published = true;
+                    committed = true;
                     retiredRegistrations = Map.copyOf(executable.retiredRegistrations);
                     committedGeneration = next.generation;
                     postCommitDirty.addAll(dirty);
                     contextDisposals.addAll(executable.contextDisposals);
+                    requestContextCleanupIntents(
+                            candidate.index, executable.cleanupRetryIntents);
                     runTransitionPublicationProbe();
                 } catch (Reject rejection) {
                     throw new TransactionRejectedException(List.of(rejection.diagnostic()));
                 }
             }
         } finally {
-            if (published) {
+            if (committed) {
                 CommittedLeaseRetirement retirement =
                         retireCommittedRegistrations(
                                 retiredRegistrations,
@@ -445,10 +451,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         retirement.failure());
                 postCommitFailure = appendPostCommitFailure(
                         postCommitFailure,
-                        executeReservedTransitions(reservations));
+                        transitionScheduler.drive(transitionPlan));
             } else {
-                completeCancelledTransitions(
-                        cancelCreatedReservationFutures(reservations));
+                transitionScheduler.completeCancelled(
+                        transitionScheduler.cancelCreated(reservations));
             }
         }
 
@@ -498,7 +504,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             closeStartPresent = true;
         }
         closing.set(true);
-        ContextHandleImpl root = published.index.contextHandles.get("ctx-root");
+        ContextHandleImpl root = kernelState.read().index.contextHandles.get("ctx-root");
         // Runtime close 复用根 Context 处置路径；只有全树清理成功才关闭执行器。
         disposeContextInView(root, true).whenComplete((ignored, error) -> {
             if (error == null) {
@@ -513,7 +519,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     PendingOperationsSnapshot pendingOperations() {
         long now = ticker.getAsLong();
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         List<PendingOperationSample> samples = new ArrayList<>();
         Set<String> transitionTargets = new LinkedHashSet<>();
         for (ComponentRuntime component : state.index.components.values()) {
@@ -523,28 +529,13 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 transitionTargets.add(sample.targetId());
             }
         }
-        for (RequestPending request : disposeRequestPending.values()) {
-            CompletableFuture<ComponentState> future =
-                    disposeRequests.get(request.targetId());
-            if (future == null || future.isDone()
-                    || transitionTargets.contains(request.targetId())) {
+        for (PendingOperationSample sample : disposeRequestRegistry.pending()) {
+            if (transitionTargets.contains(sample.targetId())) {
                 continue;
             }
-            samples.add(new PendingOperationSample(
-                    PendingOperationsSnapshot.Kind.COMPONENT_TRANSITION,
-                    request.targetId(),
-                    PendingOperationsSnapshot.WaitType.COMPONENT,
-                    request.startNanos(),
-                    "mount dispose waiting for component"));
+            samples.add(sample);
         }
-        for (ContextDisposalPending context : contextDisposalPending.values()) {
-            samples.add(new PendingOperationSample(
-                    PendingOperationsSnapshot.Kind.CONTEXT_DISPOSAL,
-                    context.contextId(),
-                    PendingOperationsSnapshot.WaitType.CONTEXT,
-                    context.startNanos(),
-                    "context disposal"));
-        }
+        samples.addAll(contextDisposalRegistry.pending());
         for (ActivationRuntime activation : state.index.activations.values()) {
             samples.addAll(activation.scope.pendingCleanup());
             DynamicCallGate.ActiveSnapshot calls =
@@ -590,7 +581,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     <T> Optional<T> findInContext(String contextId, CapabilityKey<T> key) {
         Objects.requireNonNull(key, "key");
         // 固定本地状态引用，同一次 require/find 不会被并发发布拆到两个代际。
-        RuntimeView current = published.view;
+        RuntimeView current = kernelState.read().view;
         RuntimeView.RegistrationData registration =
                 current.resolve(contextId, key).orElse(null);
         if (registration == null) {
@@ -633,7 +624,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     ContextInfo contextInfo(String contextId) {
-        RuntimeView current = published.view;
+        RuntimeView current = kernelState.read().view;
         RuntimeView.ContextData data = current.contexts.get(contextId);
         if (data == null) {
             return new ContextInfo(
@@ -652,12 +643,12 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     ContextState contextState(String contextId) {
-        RuntimeView.ContextData data = published.view.contexts.get(contextId);
+        RuntimeView.ContextData data = kernelState.read().view.contexts.get(contextId);
         return data == null ? ContextState.DISPOSED : data.state();
     }
 
     ComponentState componentState(String handleId) {
-        RuntimeView.ComponentData data = published.view.components.get(handleId);
+        RuntimeView.ComponentData data = kernelState.read().view.components.get(handleId);
         if (data != null) {
             return data.state();
         }
@@ -665,17 +656,17 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     ComponentGoal componentGoal(String handleId) {
-        RuntimeView.ComponentData data = published.view.components.get(handleId);
+        RuntimeView.ComponentData data = kernelState.read().view.components.get(handleId);
         return data == null ? ComponentGoal.DISPOSED : data.goal();
     }
 
     long componentConfigRevision(String handleId) {
-        RuntimeView.ComponentData data = published.view.components.get(handleId);
+        RuntimeView.ComponentData data = kernelState.read().view.components.get(handleId);
         return data == null ? 0 : data.configRevision();
     }
 
     CompletionStage<ComponentState> whenSettled(String handleId) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         ComponentRuntime runtime = state.index.components.get(handleId);
         if (runtime == null) {
             RuntimeView.ComponentData data = state.view.components.get(handleId);
@@ -689,7 +680,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return runtime.observeSettled(() -> {
             // 必须在 chainLock 内确认无 live transition 后读取当前 published：
             // 调用前捕获的旧代可能在停顿期间被完整处置并清空槽位。
-            PublishedKernelState current = published;
+            PublishedKernelState current = kernelState.read();
             if (current.index.components.get(handleId) == null) {
                 return ComponentState.DISPOSED;
             }
@@ -709,7 +700,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         if (outcome.settledNormally() && outcome.result() == ComponentState.ACTIVE) {
             return handle;
         }
-        DiagnosticSupport.FailureSnapshot snapshot = diagnostics.failureSnapshot(handle.handleId());
+        PublishedKernelState state = kernelState.read();
+        DiagnosticSupport.FailureSnapshot snapshot =
+                DiagnosticSupport.failureSnapshot(state, handle.handleId());
         if (snapshot.state() == ComponentState.ACTIVE) {
             return handle;
         }
@@ -719,7 +712,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         List<RuntimeDiagnostic> diagnostics = snapshot.state() == failureState
                 ? new ArrayList<>(snapshot.diagnostics())
                 : new ArrayList<>();
-        RuntimeDiagnostic detail = this.diagnostics.failureDetail(
+        RuntimeDiagnostic detail = DiagnosticSupport.failureDetail(
                 handle.handleId(),
                 outcome.interrupted(),
                 outcome.failure());
@@ -757,7 +750,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     CompletionStage<ComponentState> retry(MountHandleImpl handle) {
         ComponentRuntime component;
         synchronized (coordinator) {
-            PublishedKernelState state = published;
+            PublishedKernelState state = kernelState.read();
             component = state.index.components.get(handle.handleId());
             if (component == null
                     || state.index.componentHandles.get(handle.handleId()) != handle) {
@@ -771,46 +764,39 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     ? ComponentRuntime.RetryIntent.CLEANUP
                     : ComponentRuntime.RetryIntent.ACTIVATION);
         }
-        return component.enqueue(this, executor);
+        return transitionScheduler.enqueue(component);
     }
 
     CompletionStage<ComponentState> dispose(MountHandleImpl handle) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         if (isAlreadyDisposed(handle, state)) {
             return CompletableFuture.completedFuture(ComponentState.DISPOSED);
         }
-        // 只合并仍在执行的 dispose；已完成请求按 identity 移除，后续显式调用可建立新请求。
-        synchronized (disposeRequests) {
-            state = published;
-            if (isAlreadyDisposed(handle, state)) {
-                return CompletableFuture.completedFuture(ComponentState.DISPOSED);
-            }
-            CompletableFuture<ComponentState> existing =
-                    disposeRequests.get(handle.handleId());
-            if (existing != null && !existing.isDone()) {
-                return existing;
-            }
-            if (existing != null) {
-                removeDisposeRequest(handle.handleId(), existing);
-            }
-            CompletableFuture<ComponentState> request = new CompletableFuture<>();
-            RequestPending pending =
-                    new RequestPending(handle.handleId(), pendingTime());
-            disposeRequests.put(handle.handleId(), request);
-            disposeRequestPending.put(handle.handleId(), pending);
-            try {
-                transact(transaction -> {
-                    transaction.dispose(handle);
-                    return null;
-                });
-            } catch (TransactionRejectedException rejection) {
-                removeDisposeRequest(handle.handleId(), request);
-                request.completeExceptionally(rejection);
-                return request;
-            }
-            settleDisposeRequest(handle.handleId(), request);
+        // 注册表短操作合并并发请求；登记后立即离开注册表锁，事务与 future 完成都在锁外驱动。
+        DisposeRequestRegistry.Registration registration =
+                disposeRequestRegistry.getOrCreate(handle.handleId(), pendingTime());
+        if (!registration.created()) {
+            return registration.future();
+        }
+        CompletableFuture<ComponentState> request = registration.future();
+        state = kernelState.read();
+        if (isAlreadyDisposed(handle, state)) {
+            disposeRequestRegistry.remove(handle.handleId(), request);
+            request.complete(ComponentState.DISPOSED);
             return request;
         }
+        try {
+            transact(transaction -> {
+                transaction.dispose(handle);
+                return null;
+            });
+        } catch (TransactionRejectedException rejection) {
+            disposeRequestRegistry.remove(handle.handleId(), request);
+            request.completeExceptionally(rejection);
+            return request;
+        }
+        settleDisposeRequest(handle.handleId(), request);
+        return request;
     }
 
     private boolean isAlreadyDisposed(
@@ -834,14 +820,14 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 try {
                     executor.execute(() -> settleDisposeRequest(handleId, request));
                 } catch (RejectedExecutionException rejectionError) {
-                    removeDisposeRequest(handleId, request);
+                    disposeRequestRegistry.remove(handleId, request);
                     request.completeExceptionally(
                             new TransitionRejectedStateException(rejectionError));
                 }
                 return;
             }
             if (error != null || state != ComponentState.STOPPING) {
-                removeDisposeRequest(handleId, request);
+                disposeRequestRegistry.remove(handleId, request);
             }
             if (error != null) {
                 request.completeExceptionally(error);
@@ -851,17 +837,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         });
     }
 
-    private void removeDisposeRequest(
-            String handleId,
-            CompletableFuture<ComponentState> request) {
-        RequestPending pending = disposeRequestPending.get(handleId);
-        if (disposeRequests.remove(handleId, request)) {
-            disposeRequestPending.remove(handleId, pending);
-        }
-    }
 
     CompletionStage<Void> disposeContext(ContextHandleImpl handle) {
-        if (published.index.contextHandles.get(handle.contextId()) != handle) {
+        if (kernelState.read().index.contextHandles.get(handle.contextId()) != handle) {
             CompletableFuture<Void> rejected = new CompletableFuture<>();
             rejected.completeExceptionally(new IllegalStateException(
                     "context handle does not belong to this runtime"));
@@ -871,7 +849,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     Object registrationValue(String registrationId) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeView.RegistrationData committed =
                 state.view.registrations.get(registrationId);
         if (committed != null) {
@@ -888,7 +866,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     void validateCapabilityType(CapabilityKey<?> key) {
-        Class<?> existing = liveCapabilityType(published, key.name());
+        Class<?> existing = liveCapabilityType(kernelState.read(), key.name());
         if (existing != null && existing != key.type()) {
             throw new IllegalArgumentException(
                     "capability name already has type " + existing.getName());
@@ -930,32 +908,37 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     boolean mountIdReserved(String contextId, String mountId) {
-        RuntimeView current = published.view;
+        RuntimeView current = kernelState.read().view;
         return current.components.values().stream().anyMatch(component ->
                 component.contextId().equals(contextId)
                         && component.mountId().equals(mountId));
     }
 
     private boolean applyIntent(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             Intent intent,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
         return switch (intent) {
             case ProvideIntent provide -> applyProvide(draft, provide);
-            case RevokeIntent revoke -> applyRevoke(draft, revoke, dirty, executable);
+            case RevokeIntent revoke -> applyRevoke(
+                    baseState, draft, revoke, dirty, executable);
             case PublicationProvideIntent provide ->
-                    applyPublicationProvide(draft, provide, dirty, executable);
+                    applyPublicationProvide(
+                            baseState, draft, provide, dirty, executable);
             case PublicationUnpublishIntent unpublish ->
-                    applyPublicationUnpublish(draft, unpublish, dirty, executable);
+                    applyPublicationUnpublish(
+                            baseState, draft, unpublish, dirty, executable);
             case ChildContextIntent child -> applyChildContext(draft, child);
             case MountIntent mount -> applyMount(draft, mount, dirty, executable);
             case ReconfigureIntent<?> reconfigure ->
-                    applyReconfigure(draft, reconfigure, dirty, executable);
+                    applyReconfigure(baseState, draft, reconfigure, dirty, executable);
             case DisposeIntent dispose ->
-                    applyDispose(draft, dispose, dirty, executable);
+                    applyDispose(baseState, draft, dispose, dirty, executable);
             case ContextDisposeIntent dispose ->
-                    applyContextDispose(draft, dispose, dirty, executable);
+                    applyContextDispose(
+                            baseState, draft, dispose, dirty, executable);
         };
     }
 
@@ -996,6 +979,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     private boolean applyRevoke(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             RevokeIntent intent,
             Set<String> dirty,
@@ -1012,34 +996,16 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     handle.registrationId(),
                     "component registration must be revoked through its component handle");
         }
-        removeRegistrationInView(draft, handle.registrationId(), executable);
-        detachConsumersOfRegistration(draft, handle.registrationId(), dirty, executable);
+        StructureGraphMutator.MutationResult revoked =
+                StructureGraphMutator.detachConsumersOfRegistration(
+                        draft,
+                        handle.registrationId(),
+                        StructureGraphMutator.activePublicationSlotRefs(
+                                baseState.index, executable),
+                        PublicationState.DISPLACED);
+        revoked.applyTo(executable);
+        dirty.addAll(revoked.dirty());
         return true;
-    }
-
-    // Publication UPDATE 与外部 raw revoke 共享：旧注册消失时，直接绑定方按所有权闭包脱离并进入重收敛。
-    private void detachConsumersOfRegistration(
-            RuntimeView.Draft draft,
-            String registrationId,
-            Set<String> dirty,
-            ExecutableCommitPlan executable) {
-        Set<String> direct = BindingImpactAnalyzer.componentsWithBinding(
-                draft,
-                Set.of(registrationId));
-        Set<String> impacted = new LinkedHashSet<>();
-        for (String handleId : direct) {
-            RuntimeView.ComponentData component = draft.components.get(handleId);
-            if (component == null || component.currentActivationId() == null) {
-                impacted.add(handleId);
-                continue;
-            }
-            impacted.addAll(disposeOwnershipForActivation(
-                    draft,
-                    handleId,
-                    component.currentActivationId(),
-                    executable));
-        }
-        detachInView(draft, impacted, dirty, executable);
     }
 
     /**
@@ -1050,6 +1016,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
      * 期望失效抛内部 Stale 异常由句柄重试。UPDATE 只换 current，不进入终态。</p>
      */
     private boolean applyPublicationProvide(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             PublicationProvideIntent intent,
             Set<String> dirty,
@@ -1106,11 +1073,20 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     draft.generation);
             nextEpoch = 0;
         } else {
-            terminalRef = activePublicationSlotRef(executable, slot.slotId());
-            retireRegistrationForSlotSwap(
-                    draft, slot.currentRegistrationId(), executable);
-            detachConsumersOfRegistration(
-                    draft, slot.currentRegistrationId(), dirty, executable);
+            Map<String, PublicationSlotTerminalRef> slotRefs =
+                    StructureGraphMutator.activePublicationSlotRefs(
+                            baseState.index, executable);
+            terminalRef = Objects.requireNonNull(
+                    slotRefs.get(slot.slotId()),
+                    "active publication slot missing terminal ref: " + slot.slotId());
+            StructureGraphMutator.MutationResult updated =
+                    StructureGraphMutator.detachConsumersOfRegistration(
+                            draft,
+                            slot.currentRegistrationId(),
+                            slotRefs,
+                            null);
+            updated.applyTo(executable);
+            dirty.addAll(updated.dirty());
             nextEpoch = slot.epoch() + 1;
         }
 
@@ -1139,6 +1115,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     private boolean applyPublicationUnpublish(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             PublicationUnpublishIntent intent,
             Set<String> dirty,
@@ -1148,17 +1125,15 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 draft, intent.slotId(), context.contextId(), intent.key(),
                 intent.expectedEpoch(), intent.expectedRegistrationId(), "unpublish");
         String registrationId = slot.currentRegistrationId();
-        PublicationSlotTerminalRef terminalRef =
-                activePublicationSlotRef(executable, slot.slotId());
-        retireRegistrationForSlotSwap(draft, registrationId, executable);
-        terminalizePublicationSlotInView(draft, slot);
-        executable.terminalPublicationSlots.putIfAbsent(
-                slot.slotId(),
-                new ExecutableCommitPlan.PublicationTerminalEffect(
-                        terminalRef,
-                        new PublicationSlotTerminalRef.TerminalData(
-                                PublicationState.UNPUBLISHED, draft.generation + 1)));
-        detachConsumersOfRegistration(draft, registrationId, dirty, executable);
+        StructureGraphMutator.MutationResult unpublished =
+                StructureGraphMutator.detachConsumersOfRegistration(
+                        draft,
+                        registrationId,
+                        StructureGraphMutator.activePublicationSlotRefs(
+                                baseState.index, executable),
+                        PublicationState.UNPUBLISHED);
+        unpublished.applyTo(executable);
+        dirty.addAll(unpublished.dirty());
         return true;
     }
 
@@ -1274,6 +1249,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     }
 
     private boolean applyReconfigure(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             ReconfigureIntent<?> intent,
             Set<String> dirty,
@@ -1308,53 +1284,39 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         nextRevision));
         if (data.currentActivationId() != null) {
             executable.staleActivations.add(data.currentActivationId());
-            Set<String> impacted = disposeOwnershipForActivation(
-                    draft,
-                    handle.handleId(),
-                    data.currentActivationId(),
-                    executable);
-            detachInView(draft, impacted, dirty, executable);
+            StructureGraphMutator.MutationResult detached =
+                    StructureGraphMutator.disposeOwnersAndDetach(
+                            draft,
+                            Set.of(handle.handleId()),
+                            StructureGraphMutator.activePublicationSlotRefs(
+                                    baseState.index, executable));
+            detached.applyTo(executable);
+            dirty.addAll(detached.dirty());
         }
         dirty.add(handle.handleId());
         return true;
     }
 
     private boolean applyDispose(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             DisposeIntent intent,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
         MountHandleImpl handle = requireComponent(draft, intent.handle());
-        RuntimeView.ComponentData parent = draft.components.get(handle.handleId());
-        if (parent != null) {
-            draft.components.put(
-                    handle.handleId(),
-                    parent.withGoal(ComponentGoal.DISPOSED));
-            executable.reportedRemovedMounts.putIfAbsent(
-                    handle.handleId(),
-                    new ExecutableCommitPlan.RemovedMount(parent.mountId()));
-        }
-        // 先处置该 Activation 拥有的子树，再闭包到外部依赖方；二者共同决定 STOPPING 顺序。
-        Set<String> live = disposeOwnershipForActivation(
-                draft,
-                handle.handleId(),
-                parent == null ? null : parent.currentActivationId(),
-                executable);
-        Set<String> impacted = draft.dependentsClosure(live);
-        detachInView(draft, impacted, dirty, executable);
-        RuntimeView.ComponentData latest = draft.components.get(handle.handleId());
-        if (latest != null && latest.currentActivationId() == null) {
-            removeComponentInView(draft, handle.handleId());
-            executable.removedComponents.put(
-                    handle.handleId(),
-                    new ExecutableCommitPlan.RemovedMount(handle.mountId()));
-            return true;
-        }
-        dirty.addAll(live);
+        StructureGraphMutator.MutationResult disposed =
+                StructureGraphMutator.disposeComponent(
+                        draft,
+                        handle.handleId(),
+                        StructureGraphMutator.activePublicationSlotRefs(
+                                baseState.index, executable));
+        disposed.applyTo(executable);
+        dirty.addAll(disposed.dirty());
         return true;
     }
 
     private boolean applyContextDispose(
+            PublishedKernelState baseState,
             RuntimeView.Draft draft,
             ContextDisposeIntent intent,
             Set<String> dirty,
@@ -1366,146 +1328,28 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     handle.contextId(),
                     "root context must be disposed through runtime close");
         }
-        executable.contextDisposals.add(handle.contextId());
-        Set<String> subtree = draft.contextSubtree(handle.contextId());
-        for (String contextId : subtree) {
-            RuntimeView.ContextData data = draft.contexts.get(contextId);
-            draft.contexts.put(contextId, data.withState(ContextState.DISPOSING));
-        }
-        for (RuntimeView.RegistrationData registration :
-                draft.registrations.values().stream()
-                        .filter(registration -> subtree.contains(registration.contextId())
-                                && registration.owner() instanceof RuntimeView.OwnerData.Host)
-                        .toList()) {
-            removeRegistrationInView(
-                    draft,
-                    registration.registrationId(),
-                    executable);
-        }
-        // 处置范围包含子树内每个根组件拥有的后代，而不仅是直接位于这些 Context 中的组件。
-        Set<String> handles = draft.components.values().stream()
-                .filter(component -> subtree.contains(component.contextId()))
-                .flatMap(component ->
-                        draft.ownershipDescendants(component.handleId()).stream())
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        for (String handleId : handles) {
-            RuntimeView.ComponentData component = draft.components.get(handleId);
-            if (component == null) {
-                continue;
-            }
-            draft.components.put(
-                    handleId,
-                    component.withGoal(ComponentGoal.DISPOSED));
-            executable.reportedRemovedMounts.putIfAbsent(
-                    handleId,
-                    new ExecutableCommitPlan.RemovedMount(component.mountId()));
-        }
-        requestContextCleanupIntents(handles);
-        Set<String> live = handles.stream()
-                .filter(handleId -> draft.components.get(handleId) != null
-                        && draft.components.get(handleId).currentActivationId() != null)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        Set<String> closure = draft.dependentsClosure(live);
-        detachInView(draft, closure, dirty, executable);
-        for (String handleId : handles) {
-            RuntimeView.ComponentData component = draft.components.get(handleId);
-            if (component != null && component.currentActivationId() == null) {
-                removeComponentInView(draft, handleId);
-                executable.removedComponents.put(
-                        handleId,
-                        new ExecutableCommitPlan.RemovedMount(component.mountId()));
-            } else if (component != null) {
-                dirty.add(handleId);
-            }
-        }
+        StructureGraphMutator.MutationResult disposed =
+                StructureGraphMutator.disposeContext(
+                        draft,
+                        handle.contextId(),
+                        StructureGraphMutator.activePublicationSlotRefs(
+                                baseState.index, executable));
+        disposed.applyTo(executable);
+        dirty.addAll(disposed.dirty());
+        executable.cleanupRetryIntents.addAll(
+                disposed.reportedRemovedMounts().keySet());
         return true;
     }
 
     // 事务与直接 Context 处置都要唤醒已失败的清理；否则子树最终化会永远停在 FAILED。
-    private void requestContextCleanupIntents(Set<String> handles) {
-        ExecutionIndex index = published.index;
+    private void requestContextCleanupIntents(
+            ExecutionIndex index,
+            Set<String> handles) {
         for (String handleId : handles) {
             ComponentRuntime component = index.components.get(handleId);
             if (component != null && component.failedCleanup() != null) {
                 component.requestRetryLocked(ComponentRuntime.RetryIntent.CLEANUP);
             }
-        }
-    }
-
-    // 换代只处置属于旧 Activation 的子挂载；其他 Activation 创建的同名层后代不能被误删。
-    Set<String> disposeOwnershipForActivation(
-            RuntimeView.Draft draft,
-            String parentHandleId,
-            String ownerActivationId,
-            ExecutableCommitPlan executable) {
-        Set<String> ownership = draft.ownershipDescendantsForActivation(
-                parentHandleId,
-                ownerActivationId);
-        Set<String> live = new LinkedHashSet<>();
-        for (String handleId : ownership) {
-            RuntimeView.ComponentData component = draft.components.get(handleId);
-            if (component == null) {
-                continue;
-            }
-            if (handleId.equals(parentHandleId)) {
-                live.add(handleId);
-                continue;
-            }
-            draft.components.put(handleId, component.withGoal(ComponentGoal.DISPOSED));
-            executable.reportedRemovedMounts.putIfAbsent(
-                    handleId,
-                    new ExecutableCommitPlan.RemovedMount(component.mountId()));
-            if (component.currentActivationId() == null) {
-                removeComponentInView(draft, handleId);
-                executable.removedComponents.put(
-                        handleId,
-                        new ExecutableCommitPlan.RemovedMount(component.mountId()));
-            } else {
-                live.add(handleId);
-            }
-        }
-        return live;
-    }
-
-    // 视图中先脱离绑定并标记 STOPPING；实际 LifecycleScope teardown 延迟到依赖方清理完成后。
-    void detachInView(
-            RuntimeView.Draft draft,
-            Set<String> handles,
-            Set<String> dirty,
-            ExecutableCommitPlan executable) {
-        RuntimeGraph graph = draft.graph();
-        Set<String> closure = graph.dependentsClosure(draft, handles);
-        List<String> ownedRegistrations =
-                graph.registrationsOwnedBy(draft, closure);
-        for (String registrationId : ownedRegistrations) {
-            removeRegistrationInView(draft, registrationId, executable);
-        }
-        for (String handleId : closure) {
-            RuntimeView.ComponentData component = draft.components.get(handleId);
-            if (component == null) {
-                continue;
-            }
-            if (component.currentActivationId() != null) {
-                RuntimeView.ActivationData activation = draft.activations.get(
-                        component.currentActivationId());
-                if (activation != null) {
-                    draft.activations.put(
-                            component.currentActivationId(),
-                            activation.detached());
-                }
-                executable.staleActivations.add(component.currentActivationId());
-                draft.components.put(
-                        handleId,
-                        component.withState(ComponentState.STOPPING));
-            }
-            dirty.add(handleId);
-        }
-    }
-
-    private void removeComponentInView(RuntimeView.Draft draft, String handleId) {
-        RuntimeView.ComponentData data = draft.components.remove(handleId);
-        if (data != null && data.currentActivationId() != null) {
-            draft.activations.remove(data.currentActivationId());
         }
     }
 
@@ -1573,89 +1417,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return handle;
     }
 
-    private void removeRegistrationInView(
-            RuntimeView.Draft draft,
-            String registrationId,
-            ExecutableCommitPlan executable) {
-        RuntimeView.RegistrationData registration =
-                draft.registrations.remove(registrationId);
-        if (registration == null) {
-            return;
-        }
-        executable.retiredRegistrations.putIfAbsent(
-                registrationId,
-                registration.leases());
-        if (registration.publicationSlotId() != null) {
-            // 外部 raw 移除 / Context 处置 / runtime 关闭：槽位淘汰而非复活。
-            terminalizePublicationSlot(
-                    draft, executable, registration.publicationSlotId(),
-                    PublicationState.DISPLACED);
-        }
-    }
-
-    // Publication UPDATE 专用：只退休旧注册，槽位保持活跃并由调用方换上新 current。
-    private void retireRegistrationForSlotSwap(
-            RuntimeView.Draft draft,
-            String registrationId,
-            ExecutableCommitPlan executable) {
-        RuntimeView.RegistrationData registration =
-                draft.registrations.remove(registrationId);
-        if (registration != null) {
-            executable.retiredRegistrations.putIfAbsent(
-                    registrationId,
-                    registration.leases());
-        }
-    }
-
-    /**
-     * 终态化活跃 Publication 槽位：视图与坐标索引一并移除（active-only），
-     * 终态效果记录进 executable，由 final commit 在 published 赋值前完成 ref。
-     */
-    private void terminalizePublicationSlot(
-            RuntimeView.Draft draft,
-            ExecutableCommitPlan executable,
-            String slotId,
-            PublicationState state) {
-        RuntimeView.PublicationSlotData slot = draft.publicationSlots.get(slotId);
-        if (slot == null) {
-            return;
-        }
-        PublicationSlotTerminalRef terminalRef =
-                activePublicationSlotRef(executable, slotId);
-        terminalizePublicationSlotInView(draft, slot);
-        executable.terminalPublicationSlots.putIfAbsent(
-                slotId,
-                new ExecutableCommitPlan.PublicationTerminalEffect(
-                        terminalRef,
-                        new PublicationSlotTerminalRef.TerminalData(
-                                state, draft.generation + 1)));
-    }
-
-    private void terminalizePublicationSlotInView(
-            RuntimeView.Draft draft,
-            RuntimeView.PublicationSlotData slot) {
-        draft.publicationSlots.remove(slot.slotId());
-        draft.activePublicationSlots.remove(
-                new RuntimeView.PublicationSlotKey(
-                        slot.contextId(), slot.capabilityName()));
-    }
-
-    /** 同一 slotId 的所有句柄共享同一 ref；活跃槽位的 ref 来自本代索引或本事务新建记录。 */
-    private PublicationSlotTerminalRef activePublicationSlotRef(
-            ExecutableCommitPlan executable, String slotId) {
-        PublicationSlotTerminalRef created =
-                executable.createdPublicationSlots.get(slotId);
-        if (created != null) {
-            return created;
-        }
-        PublicationSlotTerminalRef live =
-                published.index.publicationSlotRefs.get(slotId);
-        if (live == null) {
-            throw new IllegalStateException(
-                    "active publication slot missing terminal ref: " + slotId);
-        }
-        return live;
-    }
 
     private CommittedLeaseRetirement retireCommittedRegistrations(
             Map<String, ProviderLeaseRuntime> retiredRegistrations,
@@ -1823,181 +1584,23 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         executable.terminalPublicationSlots.keySet().forEach(refs::remove);
     }
 
-    // 先在协调器内按最新视图预约并合并过渡，再离开锁提交虚拟线程执行用户代码。
     List<CompletableFuture<ComponentState>> schedule(Set<String> dirty) {
         List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
+        TransitionPlan plan = TransitionPlan.EMPTY;
         List<CompletableFuture<ComponentState>> cancelled = List.of();
         try {
             synchronized (coordinator) {
-                PublishedKernelState state = published;
-                KernelStateDraft indexDraft = new KernelStateDraft(state);
-                reserveDraftTransitions(
-                        new RuntimeView.Draft(state.view),
-                        dirty,
-                        new ExecutableCommitPlan(),
-                        indexDraft,
-                        reservations);
-                runTransitionReservationProbe();
+                plan = transitionScheduler.schedule(
+                        kernelState.read(), dirty, reservations);
             }
         } catch (Throwable error) {
-            cancelled = cancelCreatedReservationFutures(reservations);
-            reservations = List.of();
+            cancelled = transitionScheduler.cancelCreated(reservations);
             throw error;
         } finally {
-            completeCancelledTransitions(cancelled);
+            transitionScheduler.completeCancelled(cancelled);
         }
-        executeReservedTransitions(reservations);
-        return reservations.stream()
-                .map(ComponentRuntime.Reservation::future)
-                .collect(Collectors.toList());
-    }
-
-    // 非终态视图发布前必须先占用过渡槽；观察者因此只能挂到已预约的收敛 Future 上。
-    // reservations 由调用方持有：预约中途抛出时，已创建预约对调用方的取消逻辑可见，不泄漏槽位。
-    private void reserveDraftTransitions(
-            RuntimeView.Draft draft,
-            Set<String> dirty,
-            ExecutableCommitPlan executable,
-            KernelStateDraft indexDraft,
-            List<ComponentRuntime.Reservation> reservations) {
-        for (MountIntent mount : executable.mounts.values()) {
-            String handleId = mount.handle().handleId();
-            if (!draft.components.containsKey(handleId)
-                    || indexDraft.components().containsKey(handleId)) {
-                continue;
-            }
-            executable.componentRuntimes.computeIfAbsent(handleId, ignored ->
-                    new ComponentRuntime(
-                            handleId,
-                            mount.context().contextId(),
-                            mount.mountId(),
-                            mount.prepared(),
-                            coordinator));
-        }
-
-        Set<String> stopping = new LinkedHashSet<>();
-        Set<String> starting = new LinkedHashSet<>();
-        for (String handleId : dirty) {
-            RuntimeView.ComponentData data = draft.components.get(handleId);
-            if (data == null) {
-                continue;
-            }
-            if (data.state() == ComponentState.STOPPING) {
-                stopping.add(handleId);
-            } else if ((data.state() == ComponentState.WAITING
-                    || data.state() == ComponentState.FAILED)
-                    && data.goal() == ComponentGoal.RUNNING) {
-                starting.add(handleId);
-            }
-        }
-
-        for (String handleId : orderForStop(
-                draft, stopping, indexDraft.activations())) {
-            RuntimeView.ComponentData data = draft.components.get(handleId);
-            reserveDraft(
-                    handleId,
-                    executable,
-                    reservations,
-                    stopDetail(data),
-                    indexDraft);
-        }
-        for (String handleId : starting.stream().sorted().toList()) {
-            RuntimeView.ComponentData data = draft.components.get(handleId);
-            reserveDraft(
-                    handleId,
-                    executable,
-                    reservations,
-                    startDetail(data),
-                    indexDraft);
-        }
-    }
-
-    private String stopDetail(RuntimeView.ComponentData data) {
-        if (data == null) {
-            return "component stop";
-        }
-        return data.goal() == ComponentGoal.DISPOSED
-                ? "component dispose"
-                : "component stop";
-    }
-
-    private String startDetail(RuntimeView.ComponentData data) {
-        return data != null && data.state() == ComponentState.FAILED
-                ? "component restart"
-                : "component activation start";
-    }
-
-    private void reserveDraft(
-            String handleId,
-            ExecutableCommitPlan executable,
-            List<ComponentRuntime.Reservation> reservations,
-            String detail,
-            KernelStateDraft indexDraft) {
-        ComponentRuntime runtime = executable.componentRuntimes
-                .computeIfAbsent(handleId, indexDraft.components()::get);
-        if (runtime != null) {
-            runTransitionReservationFaultProbe(reservations.size());
-            reservations.add(runtime.reserveTransition(pendingTime(), detail));
-        }
-    }
-
-    private void runTransitionReservationFaultProbe(int reservationIndex) {
-        IntConsumer probe = transitionReservationFaultProbe;
-        if (probe != null) {
-            probe.accept(reservationIndex);
-        }
-    }
-
-    private String executeReservedTransitions(
-            List<ComponentRuntime.Reservation> reservations) {
-        String failure = null;
-        for (ComponentRuntime.Reservation reservation : reservations) {
-            if (!reservation.created()) {
-                continue;
-            }
-            try {
-                reservation.component().executeReserved(
-                        this,
-                        executor,
-                        reservation.future());
-            } catch (Throwable driveError) {
-                String message = postCommitFailure(
-                        "postcommit transition drive",
-                        "reservation execute",
-                        driveError);
-                failure = appendPostCommitFailure(failure, message);
-                try {
-                    reservation.component().failTransition(
-                            reservation.future(),
-                            new IllegalStateException(message));
-                } catch (Throwable completeError) {
-                    failure = appendPostCommitFailure(failure, postCommitFailure(
-                            "postcommit transition drive",
-                            "reservation failure completion",
-                            completeError));
-                }
-            }
-        }
-        return failure;
-    }
-
-    private List<CompletableFuture<ComponentState>> cancelCreatedReservationFutures(
-            List<ComponentRuntime.Reservation> reservations) {
-        List<CompletableFuture<ComponentState>> cancelled = new ArrayList<>();
-        for (ComponentRuntime.Reservation reservation : reservations) {
-            if (reservation.created()
-                    && reservation.component().cancelTransition(reservation.future())) {
-                cancelled.add(reservation.future());
-            }
-        }
-        return cancelled;
-    }
-
-    private void completeCancelledTransitions(
-            List<CompletableFuture<ComponentState>> cancelled) {
-        for (CompletableFuture<ComponentState> future : cancelled) {
-            future.completeExceptionally(new TransitionCancelledStateException());
-        }
+        transitionScheduler.drive(plan);
+        return plan.futures();
     }
 
     private List<CompletableFuture<ComponentState>> concatFutures(
@@ -2009,12 +1612,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return result;
     }
 
-    private void runTransitionReservationProbe() {
-        Runnable probe = transitionReservationProbe;
-        if (probe != null) {
-            probe.run();
-        }
-    }
 
     private void runTransitionPublicationProbe() {
         Runnable probe = transitionPublicationProbe;
@@ -2027,8 +1624,29 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             ComponentRuntime component,
             CompletableFuture<ComponentState> future,
             ComponentState state) {
-        component.clearTransition(future);
-        return () -> future.complete(state);
+        return component.finishTransition(future, state);
+    }
+
+    // 提交失败路径与正常完成共用锁纪律：锁内只清槽，完成动作出锁派发。
+    private Runnable prepareTransitionFailureCompletion(
+            ComponentRuntime component,
+            CompletableFuture<ComponentState> future,
+            Throwable error) {
+        return component.failTransition(future, error);
+    }
+
+    private void runCleanupFinalCommitProbe() {
+        Runnable probe = cleanupFinalCommitProbe;
+        if (probe != null) {
+            probe.run();
+        }
+    }
+
+    private void runContextFinalCommitProbe() {
+        Runnable probe = contextFinalCommitProbe;
+        if (probe != null) {
+            probe.run();
+        }
     }
 
     private void dispatchCompletion(Runnable completion) {
@@ -2044,218 +1662,115 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
-    // Kahn 拓扑排序先排无提供方，再整体反转，得到依赖方先于提供方的停止顺序。
-    private List<String> orderForStop(
-            RuntimeViewReader current,
-            Set<String> handles,
-            Map<String, ActivationRuntime> activationRuntimes) {
-        if (handles.isEmpty()) {
-            return List.of();
-        }
-        Map<String, Set<String>> providers =
-                stopProviders(current, handles, activationRuntimes);
-        Map<String, Integer> degree = new TreeMap<>();
-        Map<String, Set<String>> dependents = new TreeMap<>();
-        for (String handleId : handles) {
-            Set<String> targets = providers.getOrDefault(handleId, Set.of());
-            degree.put(handleId, targets.size());
-            for (String provider : targets) {
-                dependents.computeIfAbsent(provider, ignored -> new LinkedHashSet<>())
-                        .add(handleId);
-            }
-        }
-        List<String> ready = degree.entrySet().stream()
-                .filter(entry -> entry.getValue() == 0)
-                .map(Map.Entry::getKey)
-                .sorted()
-                .collect(Collectors.toCollection(ArrayList::new));
-        List<String> ordered = new ArrayList<>();
-        while (!ready.isEmpty()) {
-            String currentHandle = ready.removeFirst();
-            ordered.add(currentHandle);
-            for (String dependent : dependents.getOrDefault(
-                    currentHandle, Set.of())) {
-                int next = degree.merge(dependent, -1, Integer::sum);
-                if (next == 0) {
-                    ready.add(dependent);
-                }
-            }
-        }
-        handles.stream()
-                .filter(handleId -> !ordered.contains(handleId))
-                .sorted()
-                .forEach(ordered::add);
-        java.util.Collections.reverse(ordered);
-        return ordered;
-    }
-
-    // 将注册归属还原为提供方 MountHandle，只保留本次也在停止集合内的内部依赖。
-    private Map<String, Set<String>> stopProviders(
-            RuntimeViewReader current,
-            Set<String> handles,
-            Map<String, ActivationRuntime> activationRuntimes) {
-        Map<String, String> activationOwners = new HashMap<>();
-        current.activations().values().forEach(activation ->
-                activationOwners.put(activation.activationId(), activation.handleId()));
-        Map<String, Set<String>> result = new TreeMap<>();
-        for (String handleId : handles) {
-            RuntimeView.ComponentData component = current.components().get(handleId);
-            if (component == null || component.currentActivationId() == null) {
-                continue;
-            }
-            ActivationRuntime activation = activationRuntimes.get(
-                    component.currentActivationId());
-            if (activation == null) {
-                continue;
-            }
-            Set<String> providerHandles = new LinkedHashSet<>();
-            for (RuntimeView.BindingData binding : activation.bindings.values()) {
-                if (!binding.present()) {
-                    continue;
-                }
-                String providerHandle = providerHandleForRegistration(
-                        current,
-                        activationOwners,
-                        activationRuntimes,
-                        binding.registrationId());
-                if (providerHandle != null
-                        && handles.contains(providerHandle)
-                        && !providerHandle.equals(handleId)) {
-                    providerHandles.add(providerHandle);
-                }
-            }
-            result.put(handleId, providerHandles);
-        }
-        return result;
-    }
-
-    private String providerHandleForRegistration(
-            RuntimeViewReader current,
-            Map<String, String> activationOwners,
-            Map<String, ActivationRuntime> activationRuntimes,
-            String registrationId) {
-        RuntimeView.RegistrationData registration =
-                current.registrations().get(registrationId);
-        String ownerActivationId = null;
-        if (registration != null
-                && registration.owner() instanceof RuntimeView.OwnerData.Activation owner) {
-            ownerActivationId = owner.activationId();
-        } else {
-            // 正在启动的提供方可能仍未发布注册；用暂存表识别它，避免新依赖方与提供方重叠清理。
-            for (ActivationRuntime activation : activationRuntimes.values()) {
-                boolean owns = activation.stagedRegistrations.values().stream()
-                        .map(RuntimeView.RegistrationData::registrationId)
-                        .anyMatch(registrationId::equals);
-                if (owns) {
-                    ownerActivationId = activation.activationId;
-                    break;
-                }
-            }
-        }
-        return ownerActivationId == null ? null : activationOwners.get(ownerActivationId);
-    }
 
     // 单组件状态机入口：锁内只选择/登记候选 Activation，用户 start() 随后在锁外执行。
     void driveTransition(ComponentRuntime reserved, CompletableFuture<ComponentState> future) {
         String handleId = reserved.handleId();
-        PublishedKernelState entryState = published;
+        PublishedKernelState entryState = kernelState.read();
         ComponentRuntime component = entryState.index.components.get(handleId);
         if (component == null) {
-            reserved.clearTransition(future);
-            future.complete(ComponentState.DISPOSED);
+            dispatchCompletion(reserved.finishTransition(
+                    future, ComponentState.DISPOSED));
             return;
         }
-        ActivationRuntime activation = null;
-        ComponentState immediateState = null;
-        Runnable completion = null;
-        synchronized (coordinator) {
-            PublishedKernelState state = published;
-            RuntimeView.ComponentData data = state.view.components.get(handleId);
-            if (data == null) {
-                completion = prepareTransitionCompletion(
-                        component, future, ComponentState.DISPOSED);
-            } else {
-                // current 与 failedCleanup 必须来自同一代快照，避免组合撕裂。
-                ComponentRuntime.ActivationSlots slots = component.slots();
-                if (data.state() == ComponentState.STOPPING) {
-                    activation = slots.current();
-                    if (activation == null) {
-                        completion = finalizeOrphanedStoppingLocked(component, data, future);
-                    } else if (slots.failedCleanup() != null
-                            && !component.consumeCleanupRetryIntentLocked()) {
-                        completion = retainFailedCleanupLocked(component, data, future);
-                    }
-                } else if (data.state() == ComponentState.FAILED
-                        && slots.failedCleanup() != null) {
-                    activation = slots.failedCleanup();
-                    if (!component.consumeCleanupRetryIntentLocked()) {
-                        completion = retainFailedCleanupLocked(component, data, future);
-                        activation = null;
-                    }
+        try {
+            ActivationRuntime activation = null;
+            ComponentState immediateState = null;
+            Runnable completion = null;
+            synchronized (coordinator) {
+                PublishedKernelState state = kernelState.read();
+                RuntimeView.ComponentData data = state.view.components.get(handleId);
+                if (data == null) {
+                    completion = prepareTransitionCompletion(
+                            component, future, ComponentState.DISPOSED);
                 } else {
-                    boolean canStartActivation =
-                            (data.state() == ComponentState.WAITING
-                                    || data.state() == ComponentState.FAILED)
-                                    && data.goal() == ComponentGoal.RUNNING
-                                    && !component.suppressAutoRestart()
-                                    && requirementsResolvable(state.view, data);
-                    boolean requiresActivationRetry =
-                            data.state() == ComponentState.FAILED
-                                    && component.pendingStartFailure();
-                    if (canStartActivation
-                            && (!requiresActivationRetry
-                                    || component.consumeActivationRetryIntentLocked())) {
-                        activation = beginActivationLocked(component);
+                    // current 与 failedCleanup 必须来自同一代快照，避免组合撕裂。
+                    ComponentRuntime.ActivationSlots slots = component.slots();
+                    if (data.state() == ComponentState.STOPPING) {
+                        activation = slots.current();
+                        if (activation == null) {
+                            completion = finalizeOrphanedStoppingLocked(component, data, future);
+                        } else if (slots.failedCleanup() != null
+                                && !component.consumeCleanupRetryIntentLocked()) {
+                            completion = retainFailedCleanupLocked(component, data, future);
+                        }
+                    } else if (data.state() == ComponentState.FAILED
+                            && slots.failedCleanup() != null) {
+                        activation = slots.failedCleanup();
+                        if (!component.consumeCleanupRetryIntentLocked()) {
+                            completion = retainFailedCleanupLocked(component, data, future);
+                            activation = null;
+                        }
                     } else {
-                        immediateState = data.state();
-                        completion = prepareTransitionCompletion(
-                                component, future, immediateState);
+                        boolean canStartActivation =
+                                (data.state() == ComponentState.WAITING
+                                        || data.state() == ComponentState.FAILED)
+                                        && data.goal() == ComponentGoal.RUNNING
+                                        && !component.suppressAutoRestart()
+                                        && requirementsResolvable(state.view, data);
+                        boolean requiresActivationRetry =
+                                data.state() == ComponentState.FAILED
+                                        && component.pendingStartFailure();
+                        if (canStartActivation
+                                && (!requiresActivationRetry
+                                        || component.consumeActivationRetryIntentLocked())) {
+                            activation = beginActivationLocked(component);
+                        } else {
+                            immediateState = data.state();
+                            completion = prepareTransitionCompletion(
+                                    component, future, immediateState);
+                        }
                     }
                 }
             }
-        }
 
-        dispatchCompletion(completion);
-        if (completion != null) {
-            return;
-        }
+            dispatchCompletion(completion);
+            if (completion != null) {
+                return;
+            }
 
-        if (activation == null) {
-            ComponentState state = immediateState == null
-                    ? componentState(handleId)
-                    : immediateState;
-            component.finishTransition(future, state);
-            return;
+            if (activation == null) {
+                ComponentState state = immediateState == null
+                        ? componentState(handleId)
+                        : immediateState;
+                dispatchCompletion(component.finishTransition(future, state));
+                return;
+            }
+            // 锁外复核：若结构事务已使候选 stale 或作用域开始清理，直接走回滚路径。
+            // 已 closed 的 Activation 表示 start 已裁决完，只能推进清理，不得重入 start。
+            PublishedKernelState staleState = kernelState.read();
+            RuntimeView.ComponentData staleComponent =
+                    staleState.view.components.get(handleId);
+            RuntimeView.ActivationData staleActivation =
+                    staleState.view.activations.get(activation.activationId);
+            if (activation.closed.get()
+                    || activation.scope.state() != LifecycleState.OPEN
+                    || staleComponent == null
+                    || staleComponent.currentActivationId() == null
+                    || staleActivation == null
+                    || staleActivation.state() == ActivationState.STOPPING) {
+                finishCleanupAfterDependents(component, activation, future);
+                return;
+            }
+            runActivation(component, activation, future);
+        } catch (Throwable transitionError) {
+            dispatchCompletion(component.failTransition(future, new IllegalStateException(
+                    "component transition failed", transitionError)));
         }
-        // 锁外复核：若结构事务已使候选 stale 或作用域开始清理，直接走回滚路径。
-        PublishedKernelState staleState = published;
-        RuntimeView.ComponentData staleComponent =
-                staleState.view.components.get(handleId);
-        RuntimeView.ActivationData staleActivation =
-                staleState.view.activations.get(activation.activationId);
-        if (activation.scope.state() != LifecycleState.OPEN
-                || staleComponent == null
-                || staleComponent.currentActivationId() == null
-                || staleActivation == null
-                || staleActivation.state() == ActivationState.STOPPING) {
-            finishCleanupAfterDependents(component, activation, future);
-            return;
-        }
-        runActivation(component, activation, future);
     }
 
     private Runnable retainFailedCleanupLocked(
             ComponentRuntime component,
             RuntimeView.ComponentData data,
             CompletableFuture<ComponentState> future) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
         KernelStateDraft indexDraft = new KernelStateDraft(state);
         draft.components.put(
                 component.handleId(),
                 data.withState(ComponentState.FAILED));
-        diagnostics.refresh(draft);
-        published = indexDraft.publish(draft.publishOnce());
+        DiagnosticSupport.refresh(draft, state.index, configuration);
+        kernelState.commitLocked(state, indexDraft.publish(draft.publishOnce()));
         return prepareTransitionCompletion(component, future, ComponentState.FAILED);
     }
 
@@ -2263,12 +1778,12 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             ComponentRuntime component,
             RuntimeView.ComponentData data,
             CompletableFuture<ComponentState> future) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
         KernelStateDraft indexDraft = new KernelStateDraft(state);
         ComponentState stateResult;
         if (data.goal() == ComponentGoal.DISPOSED) {
-            removeComponentInView(draft, component.handleId());
+            StructureGraphMutator.removeComponent(draft, component.handleId());
             indexDraft.components().remove(component.handleId());
             indexDraft.componentHandles().remove(component.handleId());
             stateResult = ComponentState.DISPOSED;
@@ -2278,8 +1793,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     data.withState(ComponentState.WAITING).clearActivation());
             stateResult = ComponentState.WAITING;
         }
-        diagnostics.refresh(draft);
-        published = indexDraft.publish(draft.publishOnce());
+        DiagnosticSupport.refresh(draft, state.index, configuration);
+        kernelState.commitLocked(state, indexDraft.publish(draft.publishOnce()));
         return prepareTransitionCompletion(component, future, stateResult);
     }
 
@@ -2302,7 +1817,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     // 在协调器内为 WAITING 组件创建 STARTING 代际，并把 BindingSet 与值一起固定到候选中。
     private ActivationRuntime beginActivationLocked(ComponentRuntime component) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
         KernelStateDraft indexDraft = new KernelStateDraft(state);
         RuntimeView.ComponentData data = draft.components.get(component.handleId());
@@ -2353,9 +1868,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         draft.components.put(
                 component.handleId(),
                 data.withState(ComponentState.STARTING).withActivation(activationId));
-        diagnostics.refresh(draft);
+        DiagnosticSupport.refresh(draft, state.index, configuration);
         indexDraft.activations().put(activationId, activation);
-        published = indexDraft.publish(draft.publishOnce());
+        kernelState.commitLocked(state, indexDraft.publish(draft.publishOnce()));
         component.claimCurrentLocked(activation);
         component.clearStartFailureLocked();
         component.clearBlockedNonConvergentLocked();
@@ -2401,22 +1916,23 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             }
             List<ComponentRuntime.Reservation> createdReservations = new ArrayList<>();
             PublishedKernelState nextState = null;
+            String finalPublishFailure = null;
             try {
-                PublishedKernelState state = published;
-                CommitDecision decision = validateActivation(
-                        runtime,
-                        activation,
-                        frozenPlans,
-                        frozenRegistrations,
-                        startEvidence,
-                        state);
-                candidate = prepareActivationCandidate(
+                PublishedKernelState state = kernelState.read();
+                ActivationCandidateFactory.FrozenActivationInputs inputs =
+                        freezeActivationInputs(
+                                state,
+                                runtime,
+                                activation,
+                                frozenPlans,
+                                frozenRegistrations,
+                                startEvidence);
+                CommitDecision decision =
+                        activationCandidates.validate(inputs, state);
+                candidate = completeActivationCandidate(
+                        activationCandidates.prepare(inputs, state, decision),
                         state,
-                        runtime,
-                        activation,
-                        decision,
                         frozenPlans,
-                        frozenRegistrations,
                         createdReservations);
                 runActivationPrepublishProbe();
                 runActivationFinalPublishProbe();
@@ -2425,25 +1941,48 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 // prepublish/final publish 计算失败：取消本候选已创建的预约，
                 // 不发布任何成功 child/registration。
                 cancelledTransitions =
-                        cancelCreatedReservationFutures(createdReservations);
+                        transitionScheduler.cancelCreated(createdReservations);
                 String message = "activation commit failed: "
                         + LifecycleScopeImpl.safeError(prepublishError);
                 try {
-                    candidate = prepareAbortedActivationCandidate(
-                            runtime,
-                            activation,
-                            frozenPlans,
-                            CommitDecision.commitFailed(message),
+                    PublishedKernelState abortState = kernelState.read();
+                    candidate = completeActivationCandidate(
+                            activationCandidates.prepareAborted(
+                                    freezeActivationInputs(
+                                            abortState,
+                                            runtime,
+                                            activation,
+                                            frozenPlans,
+                                            frozenRegistrations,
+                                            startEvidence),
+                                    abortState,
+                                    CommitDecision.commitFailed(message)),
+                            abortState,
+                            List.of(),
                             createdReservations);
                     nextState = candidate.nextState();
                 } catch (Throwable fatal) {
                     cancelledTransitions = concatFutures(
                             cancelledTransitions,
-                            cancelCreatedReservationFutures(createdReservations));
+                            transitionScheduler.cancelCreated(createdReservations));
                     emergencyRollback = true;
                     try {
-                        candidate = prepareEmergencyActivationCandidate(
-                                runtime, activation, message, true);
+                        PublishedKernelState emergencyState = kernelState.read();
+                        candidate = completeActivationCandidate(
+                                activationCandidates.prepareEmergency(
+                                        freezeActivationInputs(
+                                                emergencyState,
+                                                runtime,
+                                                activation,
+                                                frozenPlans,
+                                                frozenRegistrations,
+                                                startEvidence),
+                                        emergencyState,
+                                        message,
+                                        true),
+                                emergencyState,
+                                List.of(),
+                                createdReservations);
                         nextState = candidate.nextState();
                     } catch (Throwable lastResort) {
                         // 连紧急候选也无法构造/发布：保持最后已发布结构，
@@ -2456,22 +1995,99 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                 }
             }
             if (candidate != null && nextState != null) {
-                // 单一 final publish：赋值即不可逆提交点，此后不得回滚已提交结构或换回旧状态。
+                // 单一 final publish：提交即不可逆提交点，此后不得回滚已提交结构或换回旧状态。
                 // 终态 ref 必须先完成再发布：读到新代际的旧句柄立即观察到终态。
-                candidate.completePublicationTerminals();
-                published = nextState;
                 try {
-                    candidate.applyEffects(activation);
-                    runActivationPostPublishEffectProbe();
-                    cleanupRequired = decisionCleanupRequired(runtime);
-                    if (candidate.abortedCandidate()) {
-                        runActivationRollbackCommitProbe();
+                    candidate.completePublicationTerminals();
+                    kernelState.commitLocked(candidate.base(), nextState);
+                } catch (Throwable finalPublishError) {
+                    finalPublishFailure = "activation final publish failed: "
+                            + LifecycleScopeImpl.safeError(finalPublishError);
+                    cancelledTransitions = concatFutures(
+                            cancelledTransitions,
+                            transitionScheduler.cancelCreated(
+                                    candidate.transitionPlan().reservations()));
+                    // 首候选的成功 child/registration 从未发布。仍在同一临界区内，从最新代际
+                    // 重新认领 STARTING activation 并构造中止清理候选，按最新 expected 提交；
+                    // 恢复提交也失败时退到紧急 FAILED + failedCleanup/retry 意图。
+                    try {
+                        runtime.claimCurrentLocked(activation);
+                        PublishedKernelState recoveryState = kernelState.read();
+                        candidate = completeActivationCandidate(
+                                activationCandidates.prepareAborted(
+                                        freezeActivationInputs(
+                                                recoveryState,
+                                                runtime,
+                                                activation,
+                                                frozenPlans,
+                                                frozenRegistrations,
+                                                startEvidence),
+                                        recoveryState,
+                                        CommitDecision.commitFailed(finalPublishFailure)),
+                                recoveryState,
+                                List.of(),
+                                createdReservations);
+                        nextState = candidate.nextState();
+                        candidate.completePublicationTerminals();
+                        kernelState.commitLocked(candidate.base(), nextState);
+                    } catch (Throwable recoveryError) {
+                        cancelledTransitions = concatFutures(
+                                cancelledTransitions,
+                                transitionScheduler.cancelCreated(createdReservations));
+                        emergencyRollback = true;
+                        try {
+                            PublishedKernelState lastState = kernelState.read();
+                            candidate = completeActivationCandidate(
+                                    activationCandidates.prepareEmergency(
+                                            freezeActivationInputs(
+                                                    lastState,
+                                                    runtime,
+                                                    activation,
+                                                    frozenPlans,
+                                                    frozenRegistrations,
+                                                    startEvidence),
+                                            lastState,
+                                            finalPublishFailure,
+                                            true),
+                                    lastState,
+                                    List.of(),
+                                    createdReservations);
+                            nextState = candidate.nextState();
+                            candidate.completePublicationTerminals();
+                            kernelState.commitLocked(candidate.base(), nextState);
+                        } catch (Throwable lastResort) {
+                            // 连恢复与紧急候选都无法提交：保持最后已发布结构，
+                            // 下方仅以异常完成原始 future，绝不留下 pending。
+                            candidate = null;
+                            nextState = null;
+                            emergencyFailure = finalPublishFailure
+                                    + "; recovery publish failed: "
+                                    + LifecycleScopeImpl.safeError(recoveryError)
+                                    + "; emergency publish failed: "
+                                    + LifecycleScopeImpl.safeError(lastResort);
+                        }
                     }
-                    runTransitionPublicationProbe();
-                } catch (Throwable postpublishError) {
-                    // 已提交结构保持不变；预约在协调器外照常驱动，原始 future 异常完成。
-                    postCommitFailure = "activation postcommit failed after publish: "
-                            + LifecycleScopeImpl.safeError(postpublishError);
+                }
+                if (candidate != null && nextState != null) {
+                    try {
+                        candidate.applyEffects(activation);
+                        runActivationPostPublishEffectProbe();
+                        cleanupRequired = decisionCleanupRequired(runtime);
+                        if (candidate.abortedCandidate()) {
+                            runActivationRollbackCommitProbe();
+                        }
+                        runTransitionPublicationProbe();
+                    } catch (Throwable postpublishError) {
+                        // 已提交结构保持不变；预约在协调器外照常驱动，原始 future 异常完成。
+                        postCommitFailure = "activation postcommit failed after publish: "
+                                + LifecycleScopeImpl.safeError(postpublishError);
+                    }
+                    if (finalPublishFailure != null) {
+                        // 首选 final publish 已被拒绝：原始 future 必须异常完成；
+                        // 恢复候选的清理预约照常驱动，组件不得悬停在 STARTING。
+                        postCommitFailure = appendPostCommitFailure(
+                                postCommitFailure, finalPublishFailure);
+                    }
                 }
             }
         }
@@ -2483,27 +2099,28 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     postCommitFailure,
                     retirement.failure());
         }
-        completeCancelledTransitions(cancelledTransitions);
+        transitionScheduler.completeCancelled(cancelledTransitions);
         Runnable decisionProbe = activationDecisionProbe;
         if (decisionProbe != null) {
             decisionProbe.run();
         }
 
         if (candidate == null) {
-            runtime.failTransition(
+            dispatchCompletion(runtime.failTransition(
                     future,
-                    new IllegalStateException(emergencyFailure));
+                    new IllegalStateException(emergencyFailure)));
             return;
         }
 
         // 后续提交后效果若失败，lease 已登记 retired registry，结构保持 final publish。
         postCommitFailure = appendPostCommitFailure(
                 postCommitFailure,
-                executeReservedTransitions(candidate.reservations()));
+                transitionScheduler.drive(candidate.transitionPlan()));
         if (emergencyRollback) {
-            runtime.failTransition(
+            dispatchCompletion(runtime.failTransition(
                     future,
-                    new IllegalStateException(candidate.emergencyMessage()));
+                    new IllegalStateException("emergency activation rollback: "
+                            + candidate.emergencyMessage())));
             return;
         }
         try {
@@ -2517,9 +2134,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
         if (postCommitFailure != null) {
             // 已提交结构保持不变；原始过渡 future 异常完成，不得永久 pending。
-            runtime.failTransition(
+            dispatchCompletion(runtime.failTransition(
                     future,
-                    new IllegalStateException(postCommitFailure));
+                    new IllegalStateException(postCommitFailure)));
             if (cleanupRequired) {
                 finishCleanupAfterDependents(runtime, activation, future);
             }
@@ -2530,7 +2147,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         if (!cleanupRequired) {
             synchronized (coordinator) {
                 // 结构事务可能在 Activation 裁决释放锁后把同一 future 改成 STOPPING。
-                PublishedKernelState state = published;
+                PublishedKernelState state = kernelState.read();
                 RuntimeView.ComponentData data =
                         state.view.components.get(runtime.handleId());
                 ComponentState currentState =
@@ -2553,286 +2170,81 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         }
     }
 
-    // 常规中止候选也失败时的最后防线：FAILED 视图与 failedCleanup/retry 意图同代裁决。
-    void emergencyRollbackActivation(
-            ComponentRuntime runtime,
-            ActivationRuntime activation) {
-        ActivationCommitCandidate candidate = prepareEmergencyActivationCandidate(
-                runtime, activation, "emergency activation rollback", false);
-        PublishedKernelState nextState = candidate.nextState();
-        candidate.completePublicationTerminals();
-        published = nextState;
-        candidate.applyEffects(activation);
-    }
-
-    // 基于最新代际裁决候选；stale/配置/绑定检查排在用户 start 失败之前，避免把召回误报为业务失败。
-    private CommitDecision validateActivation(
+    // coordinator 内先把 live 可变状态冻结为纯 facts；候选工厂不再读取 ComponentRuntime 字段。
+    private ActivationCandidateFactory.FrozenActivationInputs freezeActivationInputs(
+            PublishedKernelState state,
             ComponentRuntime runtime,
             ActivationRuntime activation,
             List<ChildMountPlan> plans,
             Map<String, RuntimeView.RegistrationData> stagedRegistrations,
-            StartFailureEvidence startFailure,
-            PublishedKernelState state) {
-        RuntimeView current = state.view;
-        RuntimeView.ComponentData data = current.components.get(runtime.handleId());
-        if (data == null || data.goal() != ComponentGoal.RUNNING) {
-            return CommitDecision.stale("component goal changed");
+            StartFailureEvidence startEvidence) {
+        List<ActivationCandidateFactory.FrozenActivationInputs.PendingActivation>
+                pendingActivations = new ArrayList<>();
+        for (Map.Entry<String, ActivationRuntime> entry
+                : state.index.activations.entrySet()) {
+            ActivationRuntime pending = entry.getValue();
+            pendingActivations.add(
+                    new ActivationCandidateFactory.FrozenActivationInputs.PendingActivation(
+                            pending.activationId,
+                            pending.stale.get(),
+                            pending.stagedRegistrations));
         }
-        RuntimeView.ContextData context = current.contexts.get(data.contextId());
-        if (context == null || context.state() != ContextState.ACTIVE) {
-            return CommitDecision.stale("context changed");
-        }
-        DesiredComponentState desired = runtime.desiredState();
-        if (data.configRevision() != activation.configRevision
-                || desired.revision() != activation.configRevision) {
-            return CommitDecision.stale("configuration changed");
-        }
-        if (activation.stale.get()) {
-            return CommitDecision.stale("activation became stale");
-        }
-        RuntimeGraph currentGraph = RuntimeGraph.of(current, stagedRegistrations);
-        RuntimeGraph.ResolutionCache resolutions = RuntimeGraph.resolutionCache();
-        Map<String, RuntimeView.BindingData> effectiveBindings =
-                currentGraph.effectiveBindings(
-                        current, stagedRegistrations, resolutions, data);
-        for (CapabilityRequirement requirement
-                : data.descriptor().sortedRequirements()) {
-            if (requirement.binding()
-                    == CapabilityRequirement.CapabilityBinding.DYNAMIC) {
-                if (requirement.mode() == CapabilityRequirement.Mode.REQUIRED) {
-                    boolean initialPresence = activation.initialDynamicRequiredPresence
-                            .getOrDefault(requirement.key().name(), false);
-                    boolean currentPresence = currentGraph.resolve(
-                            current,
-                            stagedRegistrations,
-                            resolutions,
-                            data.contextId(),
-                            requirement.key())
-                            .isPresent();
-                    if (initialPresence != currentPresence) {
-                        return CommitDecision.stale("dynamic binding presence changed: "
-                                        + requirement.key().name());
-                    }
-                }
-                continue;
-            }
-            RuntimeView.BindingData captured =
-                    activation.bindings.get(requirement.key().name());
-            RuntimeView.BindingData effective =
-                    effectiveBindings.get(requirement.key().name());
-            if (!BindingImpactAnalyzer.bindingIdentityEqual(captured, effective)) {
-                return CommitDecision.stale("binding changed: " + requirement.key().name());
-            }
-        }
-        for (RuntimeView.RegistrationData staged
-                : stagedRegistrations.values()) {
-            Class<?> existing = liveCapabilityType(
-                    state,
-                    staged.key().name());
-            if (existing != null && existing != staged.key().type()) {
-                return CommitDecision.startFailed(
-                        "staged capability type conflict: " + staged.key().name());
-            }
-            boolean occupied = current.registrations.values().stream().anyMatch(
-                    registration -> registration.contextId()
-                                    .equals(staged.contextId())
-                            && registration.key().name().equals(staged.key().name()));
-            if (occupied) {
-                return CommitDecision.startFailed("staged capability slot occupied: " + staged.key().name());
-            }
-        }
-        String childConflict = childPlanConflict(
-                current, state, data.contextId(), plans);
-        if (childConflict != null) {
-            return CommitDecision.startFailed(childConflict);
-        }
-        if (RuntimeGraph.hasCycle(
-                currentGraph.dependencyGraph(current, stagedRegistrations))) {
-            return CommitDecision.cycleRejected("binding cycle rejected: " + runtime.handleId());
-        }
-        if (startFailure.failed()) {
-            return CommitDecision.startFailed(startFailure.summary());
-        }
-        return CommitDecision.success();
-    }
-
-    private String childPlanConflict(
-            RuntimeView current,
-            PublishedKernelState state,
-            String contextId,
-            List<ChildMountPlan> plans) {
-        // 类型检查覆盖其他仍在 STARTING 的暂存 Activation，防止并发批次合 publish 后破坏名称类型固定。
-        Map<String, Class<?>> tentativeTypes = liveCapabilityTypes(state);
-        for (RuntimeView.RegistrationData staged
-                : activationRegistrationsForValidation(current, state, plans).values()) {
-            Class<?> existing = tentativeTypes.putIfAbsent(
-                    staged.key().name(), staged.key().type());
-            if (existing != null && existing != staged.key().type()) {
-                return "staged capability type conflict: " + staged.key().name();
-            }
-        }
-
-        Set<String> batchIds = new LinkedHashSet<>();
-        for (ChildMountPlan plan : plans) {
-            String identity = contextId + "/" + plan.mountId();
-            if (!batchIds.add(identity)) {
-                return "staged child mountId conflicts in transaction: " + plan.mountId();
-            }
-            boolean occupied = current.components.values().stream().anyMatch(component ->
-                    component.contextId().equals(contextId)
-                            && component.mountId().equals(plan.mountId()));
-            if (occupied) {
-                return "staged child mountId conflicts latest view: " + plan.mountId();
-            }
-            for (CapabilityRequirement requirement
-                    : plan.prepared().descriptor().sortedRequirements()) {
-                Class<?> existing = tentativeTypes.putIfAbsent(
-                        requirement.key().name(), requirement.key().type());
-                if (existing != null && existing != requirement.key().type()) {
-                    return "staged child capability type conflict: "
-                            + requirement.key().name();
-                }
-            }
-        }
-        return null;
-    }
-
-    private Map<String, RuntimeView.RegistrationData> activationRegistrationsForValidation(
-            RuntimeView current,
-            PublishedKernelState state,
-            List<ChildMountPlan> plans) {
-        Map<String, RuntimeView.RegistrationData> registrations = new HashMap<>();
-        for (ActivationRuntime activation : state.index.activations.values()) {
-            if (activation.stale.get()
-                    || !current.activations.containsKey(activation.activationId)
-                    || current.activations.get(activation.activationId).state()
-                            == ActivationState.STOPPING) {
-                continue;
-            }
-            registrations.putAll(activation.stagedRegistrations);
-        }
-        return registrations;
-    }
-    // 把裁决写入草稿：成功时暂存注册、子挂载和 ACTIVE 状态同代际发布；失败时脱离并保留清理责任。
-    // 只写草稿；owner/activation 的 live 效果由 ActivationOwnerEffect 在 final publish 后统一 apply。
-    private Set<String> publishActivationDecision(
-            RuntimeView.Draft draft,
-            ComponentRuntime runtime,
-            ActivationRuntime activation,
-            CommitDecision decision,
-            List<ChildMountPlan> plans,
-            Map<String, RuntimeView.RegistrationData> stagedRegistrations,
-            ExecutableCommitPlan executable) {
-        RuntimeView.ComponentData data = draft.components.get(runtime.handleId());
-        RuntimeView.ActivationData activationData =
-                draft.activations.get(activation.activationId);
-        if (data == null || activationData == null) {
-            return Set.of();
-        }
-        if (decision.successful()) {
-            // 提交成功才把暂存注册复制到已发布视图；子挂载同批进入 WAITING。
-            for (RuntimeView.RegistrationData staged : stagedRegistrations.values()) {
-                draft.registrations.put(
-                        staged.registrationId(),
-                        staged);
-                draft.capabilityTypes.putIfAbsent(
-                        staged.key().name(),
-                        staged.key().type());
-            }
-            for (ChildMountPlan plan : plans) {
-                for (CapabilityRequirement requirement
-                        : plan.prepared().descriptor().sortedRequirements()) {
-                    draft.capabilityTypes.putIfAbsent(
-                            requirement.key().name(),
-                            requirement.key().type());
-                }
-                String childId = plan.handle().handleId();
-                draft.components.put(childId, new RuntimeView.ComponentData(
-                        childId,
-                        data.contextId(),
-                        plan.mountId(),
-                        plan.prepared().descriptor().componentId(),
-                        plan.prepared().factoryId(),
-                        plan.prepared().options().origin(),
-                        activation.activationId,
+        ComponentRuntime.ComponentFailureState failure = runtime.failureState();
+        ComponentRuntime.ComponentReconcileState reconcile = runtime.reconcileState();
+        return new ActivationCandidateFactory.FrozenActivationInputs(
+                state,
+                plans,
+                stagedRegistrations,
+                startEvidence,
+                liveCapabilityTypes(state),
+                pendingActivations,
+                new ActivationCandidateFactory.FrozenActivationInputs.OwnerFacts(
                         runtime.handleId(),
-                        ComponentState.WAITING,
-                        ComponentGoal.RUNNING,
-                        1,
-                        null,
-                        null,
-                        plan.prepared().descriptor(),
-                        plan.prepared().options()));
-            }
-            draft.activations.put(
-                    activation.activationId,
-                    activationData.withState(ActivationState.ACTIVE));
-            draft.components.put(
-                    runtime.handleId(),
-                    data.withState(ComponentState.ACTIVE));
+                        runtime.desiredState().revision(),
+                        failure.pendingStartFailure(),
+                        failure.lastStartError(),
+                        failure.lastStartFailure(),
+                        reconcile.suppressAutoRestart()),
+                new ActivationCandidateFactory.FrozenActivationInputs.ActivationFacts(
+                        activation.activationId,
+                        activation.configRevision,
+                        activation.bindings,
+                        activation.initialDynamicRequiredPresence,
+                        activation.stale.get()));
+    }
 
-            // 新注册可能遮蔽已有提供方；提交时同步找出 BindingSet 变化的外部消费方。
-            Set<String> changed = new LinkedHashSet<>();
-            RuntimeGraph effectiveGraph = RuntimeGraph.of(draft, stagedRegistrations);
-            RuntimeGraph.ResolutionCache effectiveResolutions =
-                    RuntimeGraph.resolutionCache();
-            for (RuntimeView.ComponentData component : draft.components.values()) {
-                if (component.currentActivationId() == null
-                        || component.handleId().equals(runtime.handleId())) {
-                    continue;
-                }
-                RuntimeView.ActivationData other = draft.activations.get(
-                        component.currentActivationId());
-                if (other == null
-                        || !RuntimeView.activationTracksGraph(other.state())) {
-                    continue;
-                }
-                Map<String, RuntimeView.BindingData> effective =
-                        effectiveGraph.effectiveBindings(
-                                draft,
-                                stagedRegistrations,
-                                effectiveResolutions,
-                                component);
-                for (CapabilityRequirement requirement
-                        : component.descriptor().sortedRequirements()) {
-                    RuntimeView.BindingData old =
-                            other.bindings().get(requirement.key().name());
-                    RuntimeView.BindingData next =
-                            effective.get(requirement.key().name());
-                    if (!BindingImpactAnalyzer.bindingIdentityEqual(old, next)) {
-                        changed.add(component.handleId());
-                        break;
-                    }
-                }
-            }
-            Set<String> dirty = new LinkedHashSet<>();
-            Set<String> detachTargets = new LinkedHashSet<>();
-            for (String handleId : changed) {
-                RuntimeView.ComponentData component =
-                        draft.components.get(handleId);
-                if (component == null || component.currentActivationId() == null) {
-                    detachTargets.add(handleId);
-                    continue;
-                }
-                detachTargets.addAll(disposeOwnershipForActivation(
-                        draft,
-                        handleId,
-                        component.currentActivationId(),
-                        executable));
-            }
-            Set<String> closure = draft.dependentsClosure(detachTargets);
-            detachInView(draft, closure, dirty, executable);
-            return dirty;
+    // 候选草稿完成后由 runtime 注入 transition 预约；工厂本身始终不触碰调度器。
+    private ActivationCommitCandidate completeActivationCandidate(
+            ActivationCandidateFactory.PreparedCandidate prepared,
+            PublishedKernelState state,
+            List<ChildMountPlan> plans,
+            List<ComponentRuntime.Reservation> createdReservations) {
+        if (prepared.indexDraft().base() != state) {
+            throw new IllegalStateException(
+                    "activation candidate is not based on caller state");
         }
-
-        // 失败路径不发布暂存内容；Activation 脱离绑定后由 LifecycleScope 回滚已接受资源。
-        draft.activations.put(
-                activation.activationId,
-                activationData.detached());
-        draft.components.put(
-                runtime.handleId(),
-                data.withState(ComponentState.STOPPING));
-        return new LinkedHashSet<>(Set.of(runtime.handleId()));
+        TransitionPlan transitionPlan = TransitionPlan.EMPTY;
+        if (prepared.scheduleTransitions()) {
+            precreateChildRuntimes(
+                    prepared.draft(),
+                    plans,
+                    prepared.executable(),
+                    prepared.indexDraft());
+            transitionPlan = transitionScheduler.prepare(
+                    state,
+                    prepared.draft(),
+                    prepared.dirty(),
+                    prepared.executable(),
+                    prepared.indexDraft(),
+                    createdReservations);
+        }
+        DiagnosticSupport.refresh(prepared.draft(), state.index, configuration);
+        applyIndexEffects(
+                prepared.draft(),
+                prepared.indexDraft(),
+                prepared.executable(),
+                plans);
+        return prepared.toCandidate(transitionPlan);
     }
 
     private void precreateChildRuntimes(
@@ -2854,149 +2266,6 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                             plan.prepared(),
                             coordinator));
         }
-    }
-
-    // prepublish：校验通过后的候选构造只写草稿与可取消预约，不修改 live 可变对象。
-    private ActivationCommitCandidate prepareActivationCandidate(
-            PublishedKernelState state,
-            ComponentRuntime runtime,
-            ActivationRuntime activation,
-            CommitDecision decision,
-            List<ChildMountPlan> plans,
-            Map<String, RuntimeView.RegistrationData> stagedRegistrations,
-            List<ComponentRuntime.Reservation> createdReservations) {
-        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
-        KernelStateDraft indexDraft = new KernelStateDraft(state);
-        ExecutableCommitPlan executable = new ExecutableCommitPlan();
-        Set<String> dirty = publishActivationDecision(
-                draft, runtime, activation, decision, plans, stagedRegistrations, executable);
-        precreateChildRuntimes(draft, plans, executable, indexDraft);
-        reserveDraftTransitions(
-                draft, dirty, executable, indexDraft, createdReservations);
-        runTransitionReservationProbe();
-        diagnostics.refresh(draft);
-        applyIndexEffects(draft, indexDraft, executable, plans);
-        return new ActivationCommitCandidate(
-                draft,
-                indexDraft,
-                createdReservations,
-                ownerEffectFor(runtime, decision),
-                new ActivationPostCommitEffects(
-                        Set.copyOf(dirty),
-                        Map.copyOf(executable.retiredRegistrations)),
-                executable.staleActivations,
-                false,
-                "",
-                executable);
-    }
-
-    // prepublish 失败后的中止候选：从最新已发布代际构造一次 STOPPING 收敛发布。
-    private ActivationCommitCandidate prepareAbortedActivationCandidate(
-            ComponentRuntime runtime,
-            ActivationRuntime activation,
-            List<ChildMountPlan> plans,
-            CommitDecision decision,
-            List<ComponentRuntime.Reservation> createdReservations) {
-        PublishedKernelState state = published;
-        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
-        KernelStateDraft indexDraft = new KernelStateDraft(state);
-        ExecutableCommitPlan executable = new ExecutableCommitPlan();
-        Set<String> dirty = publishActivationDecision(
-                draft, runtime, activation, decision, plans, Map.of(), executable);
-        // 只驱动中止候选新建的预约；首候选已取消的预约是 no-op，不得混入驱动列表。
-        int reservationBaseline = createdReservations.size();
-        reserveDraftTransitions(
-                draft, dirty, executable, indexDraft, createdReservations);
-        runTransitionReservationProbe();
-        diagnostics.refresh(draft);
-        applyIndexEffects(draft, indexDraft, executable, List.of());
-        return new ActivationCommitCandidate(
-                draft,
-                indexDraft,
-                createdReservations.subList(
-                        reservationBaseline, createdReservations.size()),
-                ownerEffectFor(runtime, decision),
-                new ActivationPostCommitEffects(
-                        Set.copyOf(dirty),
-                        Map.copyOf(executable.retiredRegistrations)),
-                executable.staleActivations,
-                true,
-                "",
-                executable);
-    }
-
-    // 紧急回滚候选：FAILED 视图、failedCleanup 归属与 CLEANUP retry 意图在同一协调器裁决。
-    private ActivationCommitCandidate prepareEmergencyActivationCandidate(
-            ComponentRuntime runtime,
-            ActivationRuntime activation,
-            String message,
-            boolean fatalPath) {
-        PublishedKernelState state = published;
-        RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
-        KernelStateDraft indexDraft = new KernelStateDraft(state);
-        RuntimeView.ComponentData data = draft.components.get(runtime.handleId());
-        if (data != null) {
-            draft.components.put(
-                    runtime.handleId(),
-                    data.withState(ComponentState.FAILED));
-        }
-        RuntimeView.ActivationData activationData =
-                draft.activations.get(activation.activationId);
-        if (activationData != null) {
-            draft.activations.put(
-                    activation.activationId,
-                    activationData.withState(ActivationState.FAILED));
-        }
-        diagnostics.refresh(draft);
-        // 两条紧急路径都保留既有 suppressAutoRestart 语义：紧急回滚只召回清理，不重置周期抑制位。
-        ActivationOwnerEffect ownerEffect = new ActivationOwnerEffect(
-                fatalPath,
-                fatalPath || runtime.pendingStartFailure(),
-                runtime.suppressAutoRestart(),
-                true,
-                fatalPath ? message : runtime.lastStartError(),
-                runtime.lastStartFailure());
-        ExecutableCommitPlan executable = new ExecutableCommitPlan();
-        return new ActivationCommitCandidate(
-                draft,
-                indexDraft,
-                List.of(),
-                ownerEffect,
-                ActivationPostCommitEffects.empty(),
-                Set.of(),
-                true,
-                message,
-                executable);
-    }
-
-    // owner/activation 效果在 prepublish 冻结为纯值，final publish 后统一 apply。
-    private ActivationOwnerEffect ownerEffectFor(
-            ComponentRuntime runtime,
-            CommitDecision decision) {
-        boolean successful = decision.successful();
-        boolean staleCandidate = decision.staleCandidate();
-        String lastStartError;
-        FailureInfo lastStartFailure;
-        if (successful || staleCandidate) {
-            lastStartError = "";
-            lastStartFailure = FailureInfo.EMPTY;
-        } else {
-            lastStartError = decision.message();
-            lastStartFailure = FailureInfo.EMPTY.equals(runtime.lastStartFailure())
-                    ? FailureCapture.capture(
-                            new IllegalStateException(decision.message()),
-                            FailurePhase.ACTIVATION,
-                            configuration.failureDetailPolicy(),
-                            null)
-                    : runtime.lastStartFailure();
-        }
-        return new ActivationOwnerEffect(
-                !successful || staleCandidate,
-                !successful && !staleCandidate && !decision.suppressCycle(),
-                decision.suppressCycle(),
-                false,
-                lastStartError,
-                lastStartFailure);
     }
 
     // 索引侧效果在 prepublish 内随草稿一起构造，与视图同代发布；只操作草稿集合。
@@ -3077,7 +2346,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     private boolean decisionCleanupRequired(ComponentRuntime runtime) {
         RuntimeView.ComponentData data =
-                published.view.components.get(runtime.handleId());
+                kernelState.read().view.components.get(runtime.handleId());
         return data != null && data.state() == ComponentState.STOPPING;
     }
 
@@ -3095,7 +2364,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             dependents = dependentsForProvider(runtime.handleId());
         }
         List<CompletableFuture<ComponentState>> settlements = dependents.stream()
-                .map(dependent -> dependent.enqueue(this, executor))
+                .map(transitionScheduler::enqueue)
                 .toList();
         CompletableFuture<Void> prerequisite = settlements.isEmpty()
                 ? activationDrain
@@ -3118,12 +2387,11 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
 
     // 从提供方反向扩散到所有传递依赖，并纳入其拥有的子挂载，但只调度仍处 STOPPING 的目标。
     private List<ComponentRuntime> dependentsForProvider(String providerHandleId) {
-        PublishedKernelState state = published;
+        PublishedKernelState state = kernelState.read();
         RuntimeView current = state.view;
-        Map<String, Set<String>> dependencies = stopProviders(
-                current,
-                new LinkedHashSet<>(current.components.keySet()),
-                state.index.activations);
+        Map<String, Set<String>> dependencies = transitionScheduler.stopProviders(
+                state,
+                new LinkedHashSet<>(current.components.keySet()));
         Set<String> directAndIndirect = new LinkedHashSet<>();
         Set<String> frontier = new LinkedHashSet<>();
         for (Map.Entry<String, Set<String>> entry : dependencies.entrySet()) {
@@ -3198,9 +2466,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                                 java.time.Instant.now());
             }
             synchronized (coordinator) {
-                PublishedKernelState kernelState = published;
-                RuntimeView.Draft draft = new RuntimeView.Draft(kernelState.view);
-                KernelStateDraft indexDraft = new KernelStateDraft(kernelState);
+                PublishedKernelState kernelSnapshot = kernelState.read();
+                RuntimeView.Draft draft = new RuntimeView.Draft(kernelSnapshot.view);
+                KernelStateDraft indexDraft = new KernelStateDraft(kernelSnapshot);
                 RuntimeView.ComponentData data =
                         draft.components.get(runtime.handleId());
                 if (data == null) {
@@ -3234,7 +2502,8 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         draft.activations.remove(activation.activationId);
                         indexDraft.activations().remove(activation.activationId);
                         if (latestGoal == ComponentGoal.DISPOSED) {
-                            removeComponentInView(draft, runtime.handleId());
+                            StructureGraphMutator.removeComponent(
+                                    draft, runtime.handleId());
                             indexDraft.components().remove(runtime.handleId());
                             indexDraft.componentHandles().remove(runtime.handleId());
                             state = ComponentState.DISPOSED;
@@ -3261,24 +2530,35 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         }
                     }
                 }
-                diagnostics.refresh(draft);
-                published = indexDraft.publish(draft.publishOnce());
-                // 仍在协调器内替换过渡链，随后到锁外提交新 Activation，保证旧请求先有结果。
-                if (restart) {
-                    restartReservation = runtime.replaceTransition(
-                            pendingTime(), "component restart");
-                } else {
-                    transitionCompletion = prepareTransitionCompletion(runtime, future, state);
+                DiagnosticSupport.refresh(draft, kernelSnapshot.index, configuration);
+                runCleanupFinalCommitProbe();
+                try {
+                    kernelState.commitLocked(
+                            kernelSnapshot, indexDraft.publish(draft.publishOnce()));
+                } catch (Throwable commitError) {
+                    // 锁内只清过渡槽；异常完成必须出锁派发，避免回调重入协调器死锁。
+                    Throwable failure = new IllegalStateException(
+                            "component cleanup publish failed: "
+                                    + LifecycleScopeImpl.safeError(commitError),
+                            commitError);
+                    transitionCompletion = prepareTransitionFailureCompletion(
+                            runtime, future, failure);
+                }
+                if (transitionCompletion == null) {
+                    // 仍在协调器内替换过渡链，随后到锁外提交新 Activation，保证旧请求先有结果。
+                    if (restart) {
+                        restartReservation = runtime.replaceTransition(
+                                pendingTime(), "component restart");
+                    } else {
+                        transitionCompletion = prepareTransitionCompletion(runtime, future, state);
+                    }
                 }
             }
 
             dispatchCompletion(transitionCompletion);
             if (restartReservation != null) {
                 runtime.finishTransition(future);
-                restartReservation.component().executeReserved(
-                        this,
-                        executor,
-                        restartReservation.future());
+                transitionScheduler.driveReservation(restartReservation);
                 restartReservation.future().whenComplete((next, error) -> {
                     if (error != null) {
                         future.completeExceptionally(error);
@@ -3321,7 +2601,7 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
     // 第一轮调度直接受影响者；提交后可能新出现的 WAITING 组件再补一轮，避免漏掉级联收敛。
     private void scheduleAfterCommit(Set<String> dirty) {
         schedule(dirty);
-        RuntimeView current = published.view;
+        RuntimeView current = kernelState.read().view;
         Set<String> waiting = current.components.values().stream()
                 .filter(component -> component.state() == ComponentState.WAITING
                         && component.goal() == ComponentGoal.RUNNING)
@@ -3341,97 +2621,60 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         List<CompletableFuture<Void>> registrationDrains = List.of();
         Map<String, ProviderLeaseRuntime> retiredRegistrations = Map.of();
         List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
-        boolean published = false;
+        TransitionPlan transitionPlan = TransitionPlan.EMPTY;
+        boolean committed = false;
         try {
             synchronized (coordinator) {
-                PublishedKernelState state = this.published;
+                PublishedKernelState state = kernelState.read();
                 RuntimeView.ContextData data =
                         state.view.contexts.get(handle.contextId());
                 if (data == null || data.state() == ContextState.DISPOSED) {
                     return CompletableFuture.completedFuture(null);
                 }
-                synchronized (contextFutures) {
-                    CompletableFuture<Void> existing =
-                            contextFutures.get(handle.contextId());
-                    if (existing != null && !existing.isCompletedExceptionally()) {
-                        return existing;
-                    }
-                    if (existing != null) {
-                        removeContextFuture(handle.contextId(), existing);
-                    }
-                    future = new CompletableFuture<>();
-                    ContextDisposalPending pending = new ContextDisposalPending(
-                            handle.contextId(), pendingTime());
-                    contextFutures.put(handle.contextId(), future);
-                    contextDisposalPending.put(handle.contextId(), pending);
+                // 注册表合并是 CHM 叶子短操作：允许协调器内调用，但不形成第二把嵌套监视器。
+                ContextDisposalRequestRegistry.Registration disposalRegistration =
+                        contextDisposalRegistry.getOrCreate(
+                                handle.contextId(), pendingTime());
+                if (!disposalRegistration.created()) {
+                    return disposalRegistration.future();
                 }
+                future = disposalRegistration.future();
 
                 RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
                 KernelStateDraft indexDraft = new KernelStateDraft(state);
                 ExecutableCommitPlan executable = new ExecutableCommitPlan();
-                dirty = new LinkedHashSet<>();
-                subtree = draft.contextSubtree(handle.contextId());
-                for (String contextId : subtree) {
-                    RuntimeView.ContextData child = draft.contexts.get(contextId);
-                    draft.contexts.put(contextId, child.withState(ContextState.DISPOSING));
-                }
-                for (RuntimeView.RegistrationData registration :
-                        draft.registrations.values().stream()
-                                .filter(registration -> subtree.contains(registration.contextId())
-                                        && registration.owner() instanceof RuntimeView.OwnerData.Host)
-                                .toList()) {
-                    removeRegistrationInView(
-                            draft,
-                            registration.registrationId(),
-                            executable);
-                }
-                Set<String> handles = draft.components.values().stream()
-                        .filter(component -> subtree.contains(component.contextId()))
-                        .flatMap(component ->
-                                draft.ownershipDescendants(component.handleId()).stream())
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-                for (String handleId : handles) {
-                    RuntimeView.ComponentData component = draft.components.get(handleId);
-                    if (component == null) {
-                        continue;
-                    }
-                    draft.components.put(
-                            handleId,
-                            component.withGoal(ComponentGoal.DISPOSED));
-                }
-                requestContextCleanupIntents(handles);
-                Set<String> live = handles.stream()
-                        .filter(handleId -> draft.components.get(handleId) != null
-                                && draft.components.get(handleId).currentActivationId() != null)
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-                Set<String> closure = draft.dependentsClosure(live);
-                detachInView(draft, closure, dirty, executable);
-                for (String handleId : handles) {
-                    RuntimeView.ComponentData component = draft.components.get(handleId);
-                    if (component != null && component.currentActivationId() == null) {
-                        removeComponentInView(draft, handleId);
-                        executable.removedComponents.put(
-                                handleId,
-                                new ExecutableCommitPlan.RemovedMount(component.mountId()));
-                    } else if (component != null) {
-                        dirty.add(handleId);
-                    }
-                }
-                reserveDraftTransitions(
-                        draft, dirty, executable, indexDraft, reservations);
-                runTransitionReservationProbe();
-                diagnostics.refresh(draft);
+                StructureGraphMutator.MutationResult disposed =
+                        StructureGraphMutator.disposeContext(
+                                draft,
+                                handle.contextId(),
+                                StructureGraphMutator.activePublicationSlotRefs(
+                                        state.index, executable));
+                disposed.applyTo(executable);
+                dirty = new LinkedHashSet<>(disposed.dirty());
+                subtree = disposed.subtree();
+                executable.cleanupRetryIntents.addAll(
+                        disposed.reportedRemovedMounts().keySet());
+                transitionPlan = transitionScheduler.prepare(
+                        state,
+                        draft,
+                        dirty,
+                        executable,
+                        indexDraft,
+                        reservations);
+                DiagnosticSupport.refresh(draft, state.index, configuration);
                 RuntimeView next = draft.publishOnce();
                 commitExecutable(next, List.of(), executable, indexDraft);
                 PublishedKernelState candidate = indexDraft.publish(next);
                 completeTerminalPublicationRefs(executable);
-                this.published = candidate;
-                published = true;
+                kernelState.commitLocked(state, candidate);
+                committed = true;
+                requestContextCleanupIntents(
+                        candidate.index, executable.cleanupRetryIntents);
                 retiredRegistrations = Map.copyOf(executable.retiredRegistrations);
                 runTransitionPublicationProbe();
             }
         } finally {
-            if (published) {
+            if (committed) {
                 CommittedLeaseRetirement retirement =
                         retireCommittedRegistrations(
                                 retiredRegistrations,
@@ -3442,12 +2685,12 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                         retirement.failure());
                 postCommitFailure = appendPostCommitFailure(
                         postCommitFailure,
-                        executeReservedTransitions(reservations));
+                        transitionScheduler.drive(transitionPlan));
             } else {
-                completeCancelledTransitions(
-                        cancelCreatedReservationFutures(reservations));
+                transitionScheduler.completeCancelled(
+                        transitionScheduler.cancelCreated(reservations));
                 if (future != null) {
-                    removeContextFuture(handle.contextId(), future);
+                    contextDisposalRegistry.remove(handle.contextId(), future);
                     future.completeExceptionally(new IllegalStateException(
                             "context disposal commit failed"));
                 }
@@ -3476,9 +2719,9 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
             Set<String> subtree,
             CompletableFuture<Void> future,
             String postCommitFailure) {
-        Runnable contextCompletion;
+        Runnable contextCompletion = null;
         synchronized (coordinator) {
-            PublishedKernelState state = published;
+            PublishedKernelState state = kernelState.read();
             RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
             KernelStateDraft indexDraft = new KernelStateDraft(state);
             boolean failed = postCommitFailure != null
@@ -3501,39 +2744,38 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
                     }
                 }
             }
-            diagnostics.refresh(draft);
+            DiagnosticSupport.refresh(draft, state.index, configuration);
             RuntimeView next = draft.publishOnce();
-            published = indexDraft.publish(next);
-            for (String contextId : subtree) {
-                CompletableFuture<Void> currentFuture =
-                        contextFutures.get(contextId);
-                if (currentFuture != null) {
-                    removeContextFuture(contextId, currentFuture);
+            runContextFinalCommitProbe();
+            try {
+                kernelState.commitLocked(state, indexDraft.publish(next));
+            } catch (Throwable commitError) {
+                contextDisposalRegistry.removeAll(subtree);
+                if (future != null) {
+                    // 锁内只移除去重表；异常完成出锁派发，回调可安全重入协调器。
+                    Throwable failure = new IllegalStateException(
+                            "context finalization publish failed", commitError);
+                    contextCompletion = () -> future.completeExceptionally(failure);
                 }
             }
-            boolean finalFailed = failed;
-            contextCompletion = () -> {
-                if (finalFailed) {
-                    future.completeExceptionally(new IllegalStateException(
-                            postCommitFailure == null
-                                    ? "context cleanup failed"
-                                    : postCommitFailure));
-                } else {
-                    future.complete(null);
-                }
-            };
+            if (contextCompletion == null) {
+                contextDisposalRegistry.removeAll(subtree);
+                boolean finalFailed = failed;
+                contextCompletion = () -> {
+                    if (finalFailed) {
+                        future.completeExceptionally(new IllegalStateException(
+                                postCommitFailure == null
+                                        ? "context cleanup failed"
+                                        : postCommitFailure));
+                    } else {
+                        future.complete(null);
+                    }
+                };
+            }
         }
         dispatchCompletion(contextCompletion);
     }
 
-    private void removeContextFuture(
-            String contextId,
-            CompletableFuture<Void> future) {
-        ContextDisposalPending pending = contextDisposalPending.get(contextId);
-        if (contextFutures.remove(contextId, future)) {
-            contextDisposalPending.remove(contextId, pending);
-        }
-    }
     // 事务内处置在组件收敛完成后才结算；这里为外层 Context 创建去重的最终化 Future。
     private CompletableFuture<Void> settleContextDisposal(
             String contextId,
@@ -3542,25 +2784,16 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         Set<String> subtree;
         Set<String> components;
         synchronized (coordinator) {
-            RuntimeView current = published.view;
+            RuntimeView current = kernelState.read().view;
             if (!current.contexts.containsKey(contextId)) {
                 return CompletableFuture.completedFuture(null);
             }
-            synchronized (contextFutures) {
-                CompletableFuture<Void> existing =
-                        contextFutures.get(contextId);
-                if (existing != null && !existing.isCompletedExceptionally()) {
-                    return existing;
-                }
-                if (existing != null) {
-                    removeContextFuture(contextId, existing);
-                }
-                future = new CompletableFuture<>();
-                ContextDisposalPending pending = new ContextDisposalPending(
-                        contextId, pendingTime());
-                contextFutures.put(contextId, future);
-                contextDisposalPending.put(contextId, pending);
+            ContextDisposalRequestRegistry.Registration registration =
+                    contextDisposalRegistry.getOrCreate(contextId, pendingTime());
+            if (!registration.created()) {
+                return registration.future();
             }
+            future = registration.future();
             subtree = current.contextSubtree(contextId);
             components = current.components.values().stream()
                     .filter(component -> subtree.contains(component.contextId()))
@@ -3589,11 +2822,5 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         CompletableFuture<T> future = new CompletableFuture<>();
         future.completeExceptionally(new IllegalStateException(message));
         return future;
-    }
-
-    record RequestPending(String targetId, long startNanos) {
-    }
-
-    record ContextDisposalPending(String contextId, long startNanos) {
     }
 }

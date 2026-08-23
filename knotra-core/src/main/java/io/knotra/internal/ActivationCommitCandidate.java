@@ -9,7 +9,7 @@ import java.util.Set;
  * <p>候选在 prepublish 阶段于协调器内构造：视图草稿、执行索引草稿、dirty 过渡
  * 预约、owner/activation 效果与提交后效果全部冻结在此。构造期间除可取消的
  * transition 预约外不得修改任何 live 可变对象；{@link #nextState()} 是唯一的
- * final publish 计算点，调用方把返回值赋给 {@code published} 即为不可逆提交点。</p>
+ * final publish 计算点，调用方连同 {@link #base()} 一起提交给状态存储即为不可逆提交点。</p>
  *
  * <p>实例生命周期仅限于单次提交：发布与效果 apply 完成后即可丢弃，不进入公开
  * 快照或长期故障诊断。</p>
@@ -17,7 +17,8 @@ import java.util.Set;
 final class ActivationCommitCandidate {
     private final RuntimeView.Draft draft;
     private final KernelStateDraft indexDraft;
-    private final List<ComponentRuntime.Reservation> reservations;
+    private final PublishedKernelState base;
+    private final TransitionPlan transitionPlan;
     private final ActivationOwnerEffect ownerEffect;
     private final ActivationPostCommitEffects postCommitEffects;
     private final Set<String> staleActivations;
@@ -28,7 +29,7 @@ final class ActivationCommitCandidate {
     ActivationCommitCandidate(
             RuntimeView.Draft draft,
             KernelStateDraft indexDraft,
-            List<ComponentRuntime.Reservation> reservations,
+            TransitionPlan transitionPlan,
             ActivationOwnerEffect ownerEffect,
             ActivationPostCommitEffects postCommitEffects,
             Set<String> staleActivations,
@@ -37,7 +38,8 @@ final class ActivationCommitCandidate {
             ExecutableCommitPlan executable) {
         this.draft = draft;
         this.indexDraft = indexDraft;
-        this.reservations = List.copyOf(reservations);
+        this.base = indexDraft.base();
+        this.transitionPlan = transitionPlan;
         this.ownerEffect = ownerEffect;
         this.postCommitEffects = postCommitEffects;
         this.staleActivations = Set.copyOf(staleActivations);
@@ -46,13 +48,18 @@ final class ActivationCommitCandidate {
         this.publicationTerminals = List.copyOf(executable.terminalPublicationSlots.values());
     }
 
-    /** 唯一的 final publish 计算点；把返回值赋给 published 即为不可逆提交。 */
+    /** Exact construction baseline required by the kernel state commit. */
+    PublishedKernelState base() {
+        return base;
+    }
+
+    /** 唯一的 final publish 计算点；提交 store 后即为不可逆提交。 */
     PublishedKernelState nextState() {
         return indexDraft.publish(draft.publishOnce());
     }
 
     /**
-     * final commit 专用：在把 nextState() 赋给 published 前完成全部终态 ref。
+     * final commit 专用：在提交 nextState() 前完成全部终态 ref。
      * 纯赋值，不得抛出；prepublish 失败的候选永远不会到达这里。
      */
     void completePublicationTerminals() {
@@ -72,8 +79,8 @@ final class ActivationCommitCandidate {
         }
     }
 
-    List<ComponentRuntime.Reservation> reservations() {
-        return reservations;
+    TransitionPlan transitionPlan() {
+        return transitionPlan;
     }
 
     ActivationPostCommitEffects postCommitEffects() {

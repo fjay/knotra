@@ -22,6 +22,7 @@ final class ExecutableCommitPlan {
     final Map<String, RemovedMount> reportedRemovedMounts = new java.util.LinkedHashMap<>();
     final Set<String> resetAutoRestart = new LinkedHashSet<>();
     final Set<String> contextDisposals = new LinkedHashSet<>();
+    final Set<String> cleanupRetryIntents = new LinkedHashSet<>();
     final Map<String, ProviderLeaseRuntime> retiredRegistrations = new HashMap<>();
     // Publication 槽位效果：新槽位登记共享 ref；终态槽位记录 (ref, 终态数据)，
     // 由 final commit 路径在 published 赋值前统一完成。

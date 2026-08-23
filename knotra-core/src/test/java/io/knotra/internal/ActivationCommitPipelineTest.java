@@ -42,8 +42,8 @@ final class ActivationCommitPipelineTest {
         runtime.activationPrepublishProbe = null;
         runtime.activationFinalPublishProbe = null;
         runtime.activationPostPublishEffectProbe = null;
-        runtime.transitionReservationFaultProbe = null;
-        runtime.transitionReservationProbe = null;
+        runtime.transitionScheduler.transitionReservationFaultProbe = null;
+        runtime.transitionScheduler.transitionReservationProbe = null;
         runtime.transitionPublicationProbe = null;
         runtime.activationRollbackCommitProbe = null;
         publicRuntime.close();
@@ -417,7 +417,7 @@ final class ActivationCommitPipelineTest {
         AtomicReference<CompletableFuture<ComponentState>> captured =
                 new AtomicReference<>();
         AtomicBoolean injected = new AtomicBoolean();
-        runtime.transitionReservationFaultProbe = index -> {
+        runtime.transitionScheduler.transitionReservationFaultProbe = index -> {
             if (index == 1 && !injected.getAndSet(true)) {
                 reservationReached.countDown();
                 try {
@@ -475,24 +475,38 @@ final class ActivationCommitPipelineTest {
 
     @Test
     void emergencyRollbackPreservesSuppressAutoRestart() throws Exception {
+        CountDownLatch startEntered = new CountDownLatch(1);
+        CompletableFuture<Void> releaseStart = new CompletableFuture<>();
         MountHandle handle = publicRuntime.advanced().transact(
                 transaction -> transaction.mount(
                         publicRuntime.root(),
                         "emergency-suppress",
-                        idleFactory("emergency-suppress"))).value();
-        assertEquals(ComponentState.ACTIVE, handle.whenSettled()
-                .toCompletableFuture().get(10, TimeUnit.SECONDS));
-
+                        MountFactory.of("emergency-suppress-factory",
+                                ComponentDescriptor.named("emergency-suppress"),
+                                context -> {
+                                    startEntered.countDown();
+                                    releaseStart.get(10, TimeUnit.SECONDS);
+                                }))).value();
+        assertTrue(startEntered.await(10, TimeUnit.SECONDS));
         ComponentRuntime component = runtime.publishedState()
                 .index.components.get(handle.handleId());
-        ActivationRuntime activation = component.current();
         synchronized (runtime.coordinator) {
             component.suppressAutoRestartLocked(true);
         }
-        synchronized (runtime.coordinator) {
-            runtime.emergencyRollbackActivation(component, activation);
-        }
 
+        java.util.concurrent.atomic.AtomicInteger attempts =
+                new java.util.concurrent.atomic.AtomicInteger();
+        runtime.transitionScheduler.transitionReservationProbe = () -> {
+            if (attempts.incrementAndGet() < 3) {
+                throw new IllegalStateException("injected candidate preparation failure");
+            }
+            runtime.transitionScheduler.transitionReservationProbe = null;
+        };
+        releaseStart.complete(null);
+
+        assertTrue(rootCause(assertThrows(ExecutionException.class, () ->
+                        handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS)))
+                .getMessage().contains("emergency activation rollback"));
         assertTrue(component.suppressAutoRestart(),
                 "emergency rollback must not reset cycle suppression");
         assertEquals(ComponentState.FAILED, handle.state());

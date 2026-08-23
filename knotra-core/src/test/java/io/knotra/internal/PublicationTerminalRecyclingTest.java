@@ -42,7 +42,7 @@ final class PublicationTerminalRecyclingTest {
 
     @AfterEach
     void tearDown() {
-        internal.transitionReservationProbe = null;
+        internal.transitionScheduler.transitionReservationProbe = null;
         internal.providerLeaseRetireFaultProbe = null;
         runtime.close();
     }
@@ -191,7 +191,7 @@ final class PublicationTerminalRecyclingTest {
                 CapabilityKey.of("prepublish-fail-slot", String.class);
         PublicationImpl<String> publication =
                 (PublicationImpl<String>) runtime.publish(key, "one").publication();
-        internal.transitionReservationProbe = () -> {
+        internal.transitionScheduler.transitionReservationProbe = () -> {
             throw new IllegalStateException("injected prepublish failure");
         };
         assertThrows(IllegalStateException.class, publication::unpublish);
@@ -203,7 +203,7 @@ final class PublicationTerminalRecyclingTest {
                 .get(publication.slotId()));
         internal.publishedState().validateInvariants();
 
-        internal.transitionReservationProbe = null;
+        internal.transitionScheduler.transitionReservationProbe = null;
         publication.unpublish().awaitSettled(Duration.ofSeconds(10));
         assertEquals(PublicationState.UNPUBLISHED, publication.state());
         assertEquals(PublicationState.UNPUBLISHED,

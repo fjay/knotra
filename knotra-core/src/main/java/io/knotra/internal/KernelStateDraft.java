@@ -74,6 +74,10 @@ final class KernelStateDraft {
         return publicationSlotRefs;
     }
 
+    PublishedKernelState base() {
+        return base;
+    }
+
     PublishedKernelState publish(RuntimeView next) {
         syncProviderLeases(next);
         return new PublishedKernelState(

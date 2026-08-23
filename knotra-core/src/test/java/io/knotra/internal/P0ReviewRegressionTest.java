@@ -32,7 +32,7 @@ final class P0ReviewRegressionTest {
 
     @AfterEach
     void tearDown() {
-        runtime.transitionReservationProbe = null;
+        runtime.transitionScheduler.transitionReservationProbe = null;
         runtime.transitionPublicationProbe = null;
         runtime.activationRollbackCommitProbe = null;
         publicRuntime.close();
@@ -97,7 +97,7 @@ final class P0ReviewRegressionTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
         AtomicReference<CompletableFuture<ComponentState>> observed = new AtomicReference<>();
-        runtime.transitionReservationProbe = () -> {
+        runtime.transitionScheduler.transitionReservationProbe = () -> {
             observed.set(handle.whenSettled().toCompletableFuture());
             throw new IllegalStateException("reservation commit failed");
         };
@@ -201,8 +201,7 @@ final class P0ReviewRegressionTest {
                 .index.components.get(queued.handleId());
         ComponentRuntime.Reservation queuedReservation = queuedRuntime.reserveTransition(
                 System.nanoTime(), "test transition");
-        queuedRuntime.executeReserved(
-                runtime, runtime.executor, queuedReservation.future());
+        runtime.transitionScheduler.driveReservation(queuedReservation);
         ExecutionException queuedFailure = assertThrows(
                 ExecutionException.class,
                 () -> queuedReservation.future().get(10, TimeUnit.SECONDS));

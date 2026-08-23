@@ -95,9 +95,10 @@ final class ComponentRuntimeStateTest {
         ComponentRuntime.Reservation reservation =
                 component.reserveTransition(System.nanoTime(), "test");
         assertTrue(reservation.created());
-        assertDoesNotThrow(() -> component.finishTransition(
+        Runnable completion = assertDoesNotThrow(() -> component.finishTransition(
                 reservation.future(),
                 io.knotra.ComponentState.WAITING));
+        completion.run();
         assertTrue(reservation.future().isDone());
         assertNull(component.pendingSnapshot());
     }

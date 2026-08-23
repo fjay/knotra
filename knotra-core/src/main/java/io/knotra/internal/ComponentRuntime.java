@@ -5,7 +5,7 @@ import io.knotra.FailureInfo;
 import io.knotra.PendingOperationsSnapshot;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -309,20 +309,15 @@ final class ComponentRuntime {
     // 过渡链：只用 chainLock/pendingLock，不要求协调器锁。
     // ------------------------------------------------------------------
 
-    CompletableFuture<io.knotra.ComponentState> enqueue(
-            DefaultKnotraRuntime runtime,
-            ExecutorService executor) {
+    CompletableFuture<io.knotra.ComponentState> enqueue(TransitionScheduler scheduler) {
         Reservation reservation;
         // 与预约同锁采样展示标签，避免 pending 详情与实际过渡意图错位。
         synchronized (chainLock) {
             reservation = reserveTransition(
-                    runtime.pendingTime(), transitionDetail());
+                    scheduler.pendingTime(), transitionDetail());
         }
         if (reservation.created()) {
-            reservation.component().executeReserved(
-                    runtime,
-                    executor,
-                    reservation.future());
+            scheduler.driveReservation(reservation);
         }
         return reservation.future();
     }
@@ -387,20 +382,24 @@ final class ComponentRuntime {
         }
     }
 
-    void executeReserved(
-            DefaultKnotraRuntime runtime,
-            ExecutorService executor,
+    boolean executeReserved(
+            Executor executor,
+            TransitionDriver driver,
             CompletableFuture<ComponentState> future) {
         synchronized (chainLock) {
-            if (transition.get() != future) {
-                return;
+            if (transition.get() != future || requestedDriver.get() != null) {
+                return false;
             }
             requestedDriver.set(future);
         }
         try {
-            executor.execute(() -> runtime.driveTransition(this, future));
+            executor.execute(() -> driver.drive(this, future));
+            return true;
         } catch (RejectedExecutionException error) {
-            failTransition(future, new TransitionRejectedStateException(error));
+            Runnable completion = failTransition(
+                    future, new TransitionRejectedStateException(error));
+            completion.run();
+            return true;
         }
     }
 
@@ -425,19 +424,21 @@ final class ComponentRuntime {
             boolean cancelled = transition.compareAndSet(future, null);
             if (cancelled) {
                 clearPending();
+                requestedDriver.compareAndSet(future, null);
             }
             return cancelled;
         }
     }
 
-    void failTransition(
+    Runnable failTransition(
             CompletableFuture<io.knotra.ComponentState> future,
             Throwable error) {
         synchronized (chainLock) {
             if (transition.compareAndSet(future, null)) {
                 clearPending();
+                requestedDriver.compareAndSet(future, null);
             }
-            future.completeExceptionally(error);
+            return () -> future.completeExceptionally(error);
         }
     }
 
@@ -446,6 +447,7 @@ final class ComponentRuntime {
             CompletableFuture<io.knotra.ComponentState> created = new CompletableFuture<>();
             publishPending(pendingSample(startNanos, detail));
             transition.set(created);
+            requestedDriver.set(null);
             return new Reservation(this, created, true);
         }
     }
@@ -454,6 +456,7 @@ final class ComponentRuntime {
         synchronized (chainLock) {
             if (transition.compareAndSet(future, null)) {
                 clearPending();
+                requestedDriver.compareAndSet(future, null);
             }
         }
     }
@@ -462,14 +465,15 @@ final class ComponentRuntime {
         clearTransition(future);
     }
 
-    void finishTransition(
+    Runnable finishTransition(
             CompletableFuture<io.knotra.ComponentState> future,
             io.knotra.ComponentState state) {
         synchronized (chainLock) {
             if (transition.compareAndSet(future, null)) {
                 clearPending();
+                requestedDriver.compareAndSet(future, null);
             }
-            future.complete(state);
+            return () -> future.complete(state);
         }
     }
 

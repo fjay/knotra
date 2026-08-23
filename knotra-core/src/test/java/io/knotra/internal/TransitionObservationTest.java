@@ -33,7 +33,7 @@ final class TransitionObservationTest {
     @AfterEach
     void tearDown() throws Exception {
         runtime.transitionPublicationProbe = null;
-        runtime.transitionReservationProbe = null;
+        runtime.transitionScheduler.transitionReservationProbe = null;
         runtime.activationDecisionProbe = null;
         publicRuntime.close();
     }
@@ -100,7 +100,7 @@ final class TransitionObservationTest {
         AtomicReference<CompletableFuture<ComponentState>> reserved =
                 new AtomicReference<>();
 
-        runtime.transitionReservationProbe = () -> {
+        runtime.transitionScheduler.transitionReservationProbe = () -> {
             reserved.set(handle.whenSettled().toCompletableFuture());
             reserveEntered.countDown();
             await(releaseReserve);
@@ -133,7 +133,7 @@ final class TransitionObservationTest {
         } finally {
             releaseReserve.countDown();
             releasePublish.countDown();
-            runtime.transitionReservationProbe = null;
+            runtime.transitionScheduler.transitionReservationProbe = null;
             runtime.transitionPublicationProbe = null;
             executor.shutdown();
             assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
@@ -329,38 +329,38 @@ final class TransitionObservationTest {
                 new java.util.concurrent.atomic.AtomicInteger();
         java.util.concurrent.atomic.AtomicInteger cleanups =
                 new java.util.concurrent.atomic.AtomicInteger();
+        CountDownLatch startEntered = new CountDownLatch(1);
+        CompletableFuture<Void> releaseStart = new CompletableFuture<>();
         MountHandle handle = publicRuntime.advanced().transact(transaction -> transaction.mount(
                 publicRuntime.root(),
                 "emergency",
                 factory(context -> {
-                    starts.incrementAndGet();
                     context.lifecycle().onClose("cleanup", () -> {
                         int attempt = cleanups.incrementAndGet();
                         if (attempt < 2) {
                             throw new IllegalStateException("cleanup failure " + attempt);
                         }
                     });
+                    startEntered.countDown();
+                    releaseStart.get(10, TimeUnit.SECONDS);
+                    if (starts.incrementAndGet() == 1) {
+                        throw new IllegalStateException("first start failure");
+                    }
                 }))).value();
-        assertEquals(ComponentState.ACTIVE, handle.whenSettled()
-                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertTrue(startEntered.await(10, TimeUnit.SECONDS));
 
-        ComponentRuntime component = runtime.publishedState()
-                .index.components.get(handle.handleId());
-        ActivationRuntime activation = component.current();
-        ComponentRuntime.Reservation reservation = component.replaceTransition(
-                System.nanoTime(), "test transition");
-        synchronized (runtime.coordinator) {
-            component.recordStartFailureLocked(
-                    true,
-                    component.lastStartError(),
-                    component.lastStartFailure());
-            runtime.emergencyRollbackActivation(component, activation);
-        }
-        component.failTransition(
-                reservation.future(),
-                new IllegalStateException("commit and rollback failed"));
+        java.util.concurrent.atomic.AtomicInteger attempts =
+                new java.util.concurrent.atomic.AtomicInteger();
+        runtime.transitionScheduler.transitionReservationProbe = () -> {
+            if (attempts.incrementAndGet() < 3) {
+                throw new IllegalStateException("injected candidate preparation failure");
+            }
+            runtime.transitionScheduler.transitionReservationProbe = null;
+        };
+        releaseStart.complete(null);
 
-        assertTrue(assertFailure(reservation.future()).contains("commit and rollback failed"));
+        assertTrue(assertFailure(handle.whenSettled().toCompletableFuture())
+                .contains("emergency activation rollback"));
         assertEquals(ComponentState.FAILED, handle.state());
 
         assertEquals(ComponentState.FAILED, handle.retryAsync()

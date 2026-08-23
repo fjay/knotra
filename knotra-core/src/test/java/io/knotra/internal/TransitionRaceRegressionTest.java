@@ -80,10 +80,15 @@ final class TransitionRaceRegressionTest {
 
     @Test
     void provideAndDisposeRaceAlwaysHasOneTransitionDriver() throws Exception {
+        assertProvideAndDisposeRaceHasOneDriver(500);
+        assertProvideAndDisposeRaceHasOneDriver(1000);
+    }
+
+    private void assertProvideAndDisposeRaceHasOneDriver(int rounds) throws Exception {
         ExecutorService executor = Executors.newFixedThreadPool(4);
         boolean diagnosticFailure = false;
         try {
-            for (int round = 0; round < 500; round++) {
+            for (int round = 0; round < rounds; round++) {
                 final int mountRound = round;
                 final MountHandle handle = publicRuntime.advanced().transact(transaction ->
                         transaction.mount(publicRuntime.root(), "race-" + mountRound, factory()))
