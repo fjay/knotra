@@ -1,6 +1,7 @@
 package io.knotra.it;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
@@ -20,9 +21,8 @@ import io.knotra.loader.KnotraLoader;
 import io.knotra.loader.ReconcileResult;
 import io.knotra.pf4j.ArtifactState;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,27 +31,16 @@ final class CrossModuleCloseIntegrationTest {
 
     private static final FactoryRef GREETING = FactoryRef.of("integration-greeting");
 
-    private KnotraRuntime runtime;
+    @RegisterExtension
+    private final KnotraIntegrationExtension runtimeExtension =
+            KnotraIntegrationExtension.manualRuntimeClose();
 
-    @BeforeEach
-    void setUp() {
-        IntegrationCoordinator.reset();
-        IntegrationCoordinator.clearLoaders();
-        runtime = KnotraRuntime.create();
-    }
-
-    @AfterEach
-    void tearDown() throws Exception {
-        IntegrationTestKit.drainIntegrations();
-        runtime.close();
-    }
-
-    private MountHandle mountBus() {
+    private MountHandle mountBus(KnotraRuntime runtime) {
         return runtime.mount("bus", new EventBusFactory());
     }
-
     @Test
     void concurrentClosesFromAllOwnersConvergeAndStayIdempotent(
+            KnotraRuntime runtime,
             @TempDir Path pluginsRoot) throws Exception {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
@@ -62,11 +51,11 @@ final class CrossModuleCloseIntegrationTest {
                     runtime,
                     runtime.root(),
                     Pf4jFactoryResolver.of(adapter));
-            MountHandle bus = mountBus();
+            MountHandle bus = mountBus(runtime);
             ReconcileResult reconcile = loader.reconcile(ComponentTree.of(
                     ComponentEntry.configured("greeting", GREETING, "loader")));
             assertTrue(reconcile.converged(), () -> reconcile.diagnostics().toString());
-            assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(bus));
+            assertEquals(ComponentState.ACTIVE, bus.awaitSettled(Duration.ofSeconds(30)));
 
             try (ExecutorService executor = Executors.newFixedThreadPool(3)) {
                 CompletableFuture<Void> adapterClose = CompletableFuture.runAsync(
@@ -92,6 +81,7 @@ final class CrossModuleCloseIntegrationTest {
 
     @Test
     void reverseOrderClosesConvergeAndRepeatedCallsAreIdempotent(
+            KnotraRuntime runtime,
             @TempDir Path pluginsRoot) throws Exception {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
@@ -121,7 +111,8 @@ final class CrossModuleCloseIntegrationTest {
     }
 
     @Test
-    void failedArtifactCleanupRetriesOnTheNextCloseAttempt(@TempDir Path pluginsRoot)
+    void failedArtifactCleanupRetriesOnTheNextCloseAttempt(
+            KnotraRuntime runtime, @TempDir Path pluginsRoot)
             throws Exception {
         Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
         try {
@@ -129,7 +120,7 @@ final class CrossModuleCloseIntegrationTest {
             MountHandle handle = adapter.factories()
                     .resolveNoConfig("integration-failing-cleanup").orElseThrow()
                     .mount(runtime.root(), "failing");
-            assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(handle));
+            assertEquals(ComponentState.ACTIVE, handle.awaitSettled(Duration.ofSeconds(30)));
 
             IntegrationCoordinator.failNextCleanup();
             CompletableFuture<Void> firstClose = adapter.closeAsync().toCompletableFuture();
@@ -145,9 +136,11 @@ final class CrossModuleCloseIntegrationTest {
                     IntegrationTestKit.ARTIFACT_ID).orElseThrow().state());
             assertEquals(ComponentState.DISPOSED, handle.state());
             assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
+            runtime.close();
         } finally {
             IntegrationCoordinator.allowCleanup();
             adapter.close();
+            runtime.close();
         }
     }
 }

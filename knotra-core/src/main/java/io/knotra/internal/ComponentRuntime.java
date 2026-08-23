@@ -5,7 +5,7 @@ import io.knotra.FailureInfo;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
-
+import java.util.function.Supplier;
 
 /**
  * 单个稳定 MountHandle 的可执行运行时记录。
@@ -29,6 +29,8 @@ final class ComponentRuntime {
     volatile ActivationRuntime failedCleanup;
     // 用户 start() 自身失败：清理完成后需要显式 retry，避免自动重启掩盖外部故障。
     volatile boolean pendingStartFailure;
+    // retryAsync 校验成功后写入的一次性意图；由状态机在实际重启/重跑清理时消费。
+    private volatile RetryIntent retryIntent = RetryIntent.NONE;
     // 绑定环等结构性失败在拓扑指纹变化前不重试，防止无限无效 Activation。
     volatile boolean suppressAutoRestart;
     volatile boolean blockedNonConvergent;
@@ -42,6 +44,8 @@ final class ComponentRuntime {
     // 过渡链表锁：同一 MountHandle 的并发 whenSettled/dispose/retry 共享一个 Future。
     private final Object chainLock = new Object();
     private final AtomicReference<CompletableFuture<io.knotra.ComponentState>> transition =
+            new AtomicReference<>();
+    private final AtomicReference<CompletableFuture<io.knotra.ComponentState>> requestedDriver =
             new AtomicReference<>();
 
     ComponentRuntime(
@@ -68,7 +72,38 @@ final class ComponentRuntime {
         }
         return reservation.future();
     }
-    // 预约必须在协调器临界区外执行：先合并调用方，再由一个虚拟线程驱动实际状态迁移。
+
+    void requestRetry(RetryIntent intent) {
+        this.retryIntent = intent;
+    }
+
+    boolean consumeActivationRetryIntent() {
+        if (retryIntent != RetryIntent.ACTIVATION) {
+            return false;
+        }
+        retryIntent = RetryIntent.NONE;
+        return true;
+    }
+
+    boolean consumeCleanupRetryIntent() {
+        if (retryIntent != RetryIntent.CLEANUP) {
+            return false;
+        }
+        retryIntent = RetryIntent.NONE;
+        return true;
+    }
+
+    CompletableFuture<io.knotra.ComponentState> observeSettled(
+            Supplier<io.knotra.ComponentState> currentState) {
+        synchronized (chainLock) {
+            CompletableFuture<io.knotra.ComponentState> existing = transition.get();
+            if (existing != null && !existing.isDone()) {
+                return existing;
+            }
+            return CompletableFuture.completedFuture(currentState.get());
+        }
+    }
+    // 预约可在发布前于协调器内发生；实际驱动必须等协调器释放后提交到虚拟线程。
     Reservation reserveTransition() {
         synchronized (chainLock) {
             CompletableFuture<io.knotra.ComponentState> existing = transition.get();
@@ -89,10 +124,20 @@ final class ComponentRuntime {
             if (transition.get() != future) {
                 return;
             }
+            requestedDriver.set(future);
         }
         executor.execute(() -> runtime.driveTransition(handleId, future));
     }
 
+    String transitionDiagnostic() {
+        CompletableFuture<io.knotra.ComponentState> current = transition.get();
+        CompletableFuture<io.knotra.ComponentState> driver = requestedDriver.get();
+        return "slot=" + System.identityHashCode(current)
+                + "/" + (current == null ? "null" : current.isDone())
+                + " driver=" + System.identityHashCode(driver)
+                + "/" + (driver == null ? "null" : driver.isDone())
+                + " ownsDriver=" + (current == driver);
+    }
 
     void cancelTransition(CompletableFuture<io.knotra.ComponentState> future) {
         synchronized (chainLock) {
@@ -117,10 +162,14 @@ final class ComponentRuntime {
         }
     }
 
-    void finishTransition(CompletableFuture<io.knotra.ComponentState> future) {
+    void clearTransition(CompletableFuture<io.knotra.ComponentState> future) {
         synchronized (chainLock) {
             transition.compareAndSet(future, null);
         }
+    }
+
+    void finishTransition(CompletableFuture<io.knotra.ComponentState> future) {
+        clearTransition(future);
     }
 
     void finishTransition(
@@ -141,5 +190,11 @@ final class ComponentRuntime {
             ComponentRuntime component,
             CompletableFuture<io.knotra.ComponentState> future,
             boolean created) {
+    }
+
+    enum RetryIntent {
+        NONE,
+        ACTIVATION,
+        CLEANUP
     }
 }

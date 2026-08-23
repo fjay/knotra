@@ -6,6 +6,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.example.integration.contract.IntegrationCoordinator;
+import io.knotra.ComponentDescriptor;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountFactory;
@@ -19,9 +20,8 @@ import io.knotra.loader.ReconcileResult;
 import io.knotra.pf4j.ArtifactState;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
 import io.knotra.pf4j.loader.Pf4jFactoryResolver;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.awaitility.Awaitility.await;
@@ -38,23 +38,13 @@ final class LoaderPf4jBridgeIntegrationTest {
     private static final FactoryRef LOCAL = FactoryRef.of("local-recovery");
     private static final FactoryRef FLAKY = FactoryRef.of("flaky");
 
-    private KnotraRuntime runtime;
-
-    @BeforeEach
-    void setUp() {
-        IntegrationCoordinator.reset();
-        IntegrationCoordinator.clearLoaders();
-        runtime = KnotraRuntime.create();
-    }
-
-    @AfterEach
-    void tearDown() throws Exception {
-        IntegrationTestKit.drainIntegrations();
-        runtime.close();
-    }
+    @RegisterExtension
+    private final KnotraIntegrationExtension runtimeExtension =
+            KnotraIntegrationExtension.defaults();
 
     @Test
     void officialBridgeReconcilesNestedTreeWithDecoderIdentityAndOwnership(
+            KnotraRuntime runtime,
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
@@ -113,6 +103,7 @@ final class LoaderPf4jBridgeIntegrationTest {
 
     @Test
     void officialBridgeRejectsVersionMismatchBeforeCreatingStructure(
+            KnotraRuntime runtime,
             @TempDir Path pluginsRoot) throws Exception {
         FactoryRef incompatible = FactoryRef.of("integration-greeting", "9.0.0");
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime);
@@ -133,11 +124,14 @@ final class LoaderPf4jBridgeIntegrationTest {
 
     @Test
     void reconcileAndArtifactDrainRaceLeavesNoPartialStateAndConvergesOnRetry(
+            KnotraRuntime runtime,
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
-            MountFactory local = IntegrationTestKit.classpathFactory(
-                    "local-recovery", context -> {
+            MountFactory local = MountFactory.of(
+                    "local-recovery",
+                    ComponentDescriptor.named("local-recovery"),
+                    context -> {
                     });
             ClasspathFactoryResolver classpath = ClasspathFactoryResolver.builder()
                     .add(LOCAL, local)
@@ -183,10 +177,11 @@ final class LoaderPf4jBridgeIntegrationTest {
     }
 
     @Test
-    void loaderRetryConvergesAfterAFailedStart() throws Exception {
+    void loaderRetryConvergesAfterAFailedStart(KnotraRuntime runtime) throws Exception {
         AtomicInteger starts = new AtomicInteger();
-        MountFactory flaky = IntegrationTestKit.classpathFactory(
+        MountFactory flaky = MountFactory.of(
                 "flaky",
+                ComponentDescriptor.named("flaky"),
                 context -> {
                     if (starts.incrementAndGet() == 1) {
                         throw new IllegalStateException("intentional first-start failure");

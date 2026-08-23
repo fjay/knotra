@@ -12,8 +12,7 @@ import io.knotra.PublicationState;
 import io.knotra.SettlementReport;
 import io.knotra.beans.Beans;
 import io.knotra.beans.BeanDefinition;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -50,20 +49,13 @@ final class SimpleApiEndToEndTest {
         }
     }
 
-    private KnotraRuntime runtime;
-
-    @BeforeEach
-    void setUp() {
-        runtime = KnotraRuntime.create();
-    }
-
-    @AfterEach
-    void tearDown() throws Exception {
-        runtime.close();
-    }
+    @RegisterExtension
+    private final KnotraIntegrationExtension runtimeExtension =
+            KnotraIntegrationExtension.defaults();
 
     @Test
-    void stablePublicationAndDynamicBeanFollowTheSimpleApiLifecycle() throws Exception {
+    void stablePublicationAndDynamicBeanFollowTheSimpleApiLifecycle(
+            KnotraRuntime runtime) throws Exception {
         PublicationChange<Gateway> first = runtime.publish(Gateway.class, new ConstantGateway("one"));
         Publication<Gateway> publication = first.publication();
 

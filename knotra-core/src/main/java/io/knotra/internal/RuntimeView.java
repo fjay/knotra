@@ -657,7 +657,7 @@ final class RuntimeView {
         }
 
         // 复用 RuntimeView 的不可变快照语义做图计算，保证草稿查询与最终发布使用同一解析规则。
-        private RuntimeView asView() {
+        RuntimeView asView() {
             return new RuntimeView(
                     generation,
                     contexts,

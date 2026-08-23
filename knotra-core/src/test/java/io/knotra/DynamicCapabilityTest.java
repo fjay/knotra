@@ -317,6 +317,32 @@ final class DynamicCapabilityTest {
     }
 
     @Test
+    void activeDynamicConsumerDoesNotRestartForProviderReplacement() throws Exception {
+        AtomicInteger starts = new AtomicInteger();
+        AtomicReference<DynamicCapability<Api>> dynamic = new AtomicReference<>();
+        mount("replacement-consumer", (context, config) -> {
+            starts.incrementAndGet();
+            dynamic.set(context.subscribe(API));
+        }, CapabilityRequirement.dynamicOptional(API));
+
+        CountDownLatch staged = new CountDownLatch(1);
+        CompletableFuture<Void> release = new CompletableFuture<>();
+        var provider = mountProvider(
+                "replacement-provider", new ProviderConfig("v1"), staged, release);
+        assertTrue(staged.await(10, TimeUnit.SECONDS));
+        release.complete(null);
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
+        assertEquals("v1", dynamic.get().call(Api::value));
+
+        provider.reconfigureAsync(new ProviderConfig("v2"))
+                .toCompletableFuture().get(10, TimeUnit.SECONDS);
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(provider).call());
+        assertEquals("v2", dynamic.get().call(Api::value));
+        assertEquals(1, starts.get());
+    }
+
+
+    @Test
     void proxyAsyncMethodHoldsLeaseUntilCompletion() throws Exception {
         AtomicReference<DynamicCapability<Api>> dynamic = new AtomicReference<>();
         mount("consumer", (context, config) -> dynamic.set(context.subscribe(API)),

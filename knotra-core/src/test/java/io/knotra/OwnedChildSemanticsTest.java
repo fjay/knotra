@@ -90,15 +90,23 @@ final class OwnedChildSemanticsTest {
         AtomicReference<MountHandle> oldChild = new AtomicReference<>();
         AtomicReference<MountHandle> newChild = new AtomicReference<>();
         AtomicInteger starts = new AtomicInteger();
+        CountDownLatch cleanupEntered = new CountDownLatch(1);
+        CountDownLatch releaseCleanup = new CountDownLatch(1);
 
         RegistrationHandle firstProvider = TestKit.provide(
                 runtime, runtime.root(), A, "one");
         var parent = TestKit.mount(runtime, runtime.root(), "parent",
                 (context, config) -> {
+                    boolean firstGeneration = starts.incrementAndGet() == 1;
                     MountHandle child = context.mountChild(
-                            "child", childFactory("ignored-grandchild", new AtomicReference<>()),
+                            "child",
+                            firstGeneration
+                                    ? blockedChildFactory(
+                                            cleanupEntered, releaseCleanup)
+                                    : childFactory(
+                                            "second-grandchild", new AtomicReference<>()),
                             NoConfig.INSTANCE);
-                    if (starts.incrementAndGet() == 1) {
+                    if (firstGeneration) {
                         oldChild.set(child);
                     } else {
                         newChild.set(child);
@@ -113,15 +121,23 @@ final class OwnedChildSemanticsTest {
             return null;
         });
         TestKit.assertCommitted(replacement);
+        assertTrue(cleanupEntered.await(10, TimeUnit.SECONDS));
 
-        RuntimeSnapshot stopping = runtime.advanced().snapshot();
-        RuntimeSnapshot.ActivationSnapshot oldActivation = stopping.activations().stream()
-                .filter(activation -> activation.handleId().equals(parent.handleId()))
-                .findFirst().orElseThrow();
-        assertEquals(ActivationState.STOPPING, oldActivation.state());
-        assertTrue(oldActivation.bindings().stream()
-                .filter(binding -> binding.capability().name().equals(A.name()))
-                .allMatch(binding -> !binding.present() && binding.registrationId() == null));
+        RuntimeSnapshot stopping;
+        RuntimeSnapshot.ActivationSnapshot oldActivation;
+        try {
+            stopping = runtime.advanced().snapshot();
+            oldActivation = stopping.activations().stream()
+                    .filter(activation -> activation.handleId().equals(parent.handleId()))
+                    .findFirst().orElseThrow();
+            assertEquals(ActivationState.STOPPING, oldActivation.state());
+            assertTrue(oldActivation.bindings().stream()
+                    .filter(binding -> binding.capability().name().equals(A.name()))
+                    .allMatch(binding -> !binding.present()
+                            && binding.registrationId() == null));
+        } finally {
+            releaseCleanup.countDown();
+        }
 
         replacement.settlement().whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertEquals(ComponentState.ACTIVE, TestKit.settle(parent).call(),
@@ -222,7 +238,6 @@ final class OwnedChildSemanticsTest {
             other.close();
         }
     }
-
 
     @Test
     void ownedChildSettlementWaitsForChildWithoutBlockingParentVisibility() throws Exception {
@@ -357,6 +372,29 @@ final class OwnedChildSemanticsTest {
 
     }
 
+    private ComponentFactory<NoConfig> blockedChildFactory(
+            CountDownLatch cleanupEntered,
+            CountDownLatch releaseCleanup) {
+        AtomicReference<MountHandle> ignored = new AtomicReference<>();
+        return TestKit.factory("child-owner", new TestKit.Scripted<>(
+                ComponentDescriptor.named("child-owner"),
+                (context, config) -> {
+                    ignored.set(context.mountChild(
+                            "blocked-grandchild",
+                            TestKit.factory("grandchild", new TestKit.Scripted<>(
+                                    ComponentDescriptor.named("grandchild"),
+                                    (grandchildContext, grandchildConfig) -> { })),
+                            NoConfig.INSTANCE));
+                    context.lifecycle().onClose("block-cleanup", () -> {
+                        cleanupEntered.countDown();
+                        try {
+                            releaseCleanup.await();
+                        } catch (InterruptedException error) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+                }));
+    }
 
     private ComponentFactory<NoConfig> childFactory(
             String mountId,
@@ -458,7 +496,6 @@ final class OwnedChildSemanticsTest {
         public CompletionStage<ComponentState> whenSettled() {
             throw new UnsupportedOperationException();
         }
-
 
         @Override
         public CompletionStage<ComponentState> retryAsync() {

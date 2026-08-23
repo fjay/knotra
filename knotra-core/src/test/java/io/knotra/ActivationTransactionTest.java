@@ -196,6 +196,51 @@ final class ActivationTransactionTest {
     }
 
     @Test
+    void observingFailedStartDoesNotImplicitlyRetryIt() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        var handle = mount("observe-start", (context, config) -> {
+            if (attempts.incrementAndGet() == 1) {
+                throw new IllegalStateException("temporary");
+            }
+        });
+
+        awaitState(handle, ComponentState.FAILED);
+        assertEquals(ComponentState.FAILED, handle.whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(1, attempts.get());
+
+        assertEquals(ComponentState.ACTIVE, handle.retryAsync()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(2, attempts.get());
+    }
+
+    @Test
+    void dirtyPropagationDoesNotBypassExplicitStartRetry() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicReference<Config> observedConfig = new AtomicReference<>();
+        Component<Config> component = new TestKit.Scripted<>(
+                ComponentDescriptor.named("configured"), (context, config) -> {
+                    observedConfig.set(config);
+                    if (attempts.incrementAndGet() == 1) {
+                        throw new IllegalStateException("temporary");
+                    }
+                });
+        var handle = runtime.advanced().transact(mutation -> mutation.mount(
+                runtime.root(), "dirty-retry", TestKit.factory("configured", component),
+                new Config("one"))).value();
+
+        awaitState(handle, ComponentState.FAILED);
+        assertEquals(ComponentState.FAILED, handle.reconfigureAsync(new Config("two"))
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(1, attempts.get());
+
+        assertEquals(ComponentState.ACTIVE, handle.retryAsync()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(2, attempts.get());
+        assertEquals(new Config("two"), observedConfig.get());
+    }
+
+    @Test
     void retryRejectedWhenComponentIsNotFailed() throws Exception {
         var handle = mount("active", (context, config) -> {});
         assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
@@ -303,6 +348,51 @@ final class ActivationTransactionTest {
         assertEquals(2, cleanupAttempts.get());
     }
 
-    private record Config(String value) {}
+    @Test
+    void observingFailedCleanupDoesNotImplicitlyRetryIt() throws Exception {
+        AtomicBoolean failCleanup = new AtomicBoolean(true);
+        AtomicInteger cleanupAttempts = new AtomicInteger();
+        var handle = mount("observe-cleanup", (context, config) ->
+                context.lifecycle().onClose("cleanup", () -> {
+                    cleanupAttempts.incrementAndGet();
+                    if (failCleanup.getAndSet(false)) {
+                        throw new IllegalStateException("temporary");
+                    }
+                }));
 
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(handle).call());
+        runtime.advanced().transact(transaction -> {
+            transaction.dispose(handle);
+            return null;
+        });
+
+        awaitState(handle, ComponentState.FAILED);
+        assertEquals(ComponentState.FAILED, handle.whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(1, cleanupAttempts.get());
+
+        var firstDisposeAfterFailure = handle.disposeAsync();
+        assertEquals(ComponentState.FAILED, firstDisposeAfterFailure
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        var secondDisposeAfterFailure = handle.disposeAsync();
+        assertNotSame(firstDisposeAfterFailure, secondDisposeAfterFailure);
+        assertEquals(ComponentState.FAILED, secondDisposeAfterFailure
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(1, cleanupAttempts.get());
+        assertEquals(ComponentState.DISPOSED, handle.retryAsync()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(2, cleanupAttempts.get());
+    }
+
+    private static void awaitState(MountHandle handle, ComponentState expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (handle.state() != expected) {
+            if (System.nanoTime() - deadline >= 0) {
+                fail("expected " + expected + " but remained " + handle.state());
+            }
+            Thread.yield();
+        }
+    }
+
+    private record Config(String value) {}
 }

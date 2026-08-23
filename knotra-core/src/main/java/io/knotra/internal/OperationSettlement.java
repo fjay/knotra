@@ -47,9 +47,11 @@ final class OperationSettlement {
                         return CompletableFuture.completedFuture(null);
                     }
                     affectedMounts.addAll(next);
-                    return awaitTransitions(next.stream()
-                            .map(runtime::whenSettled)
-                            .toList());
+                    List<CompletionStage<ComponentState>> ownedTransitions =
+                            new ArrayList<>(runtime.schedule(next));
+                    next.forEach(handleId ->
+                            ownedTransitions.add(runtime.whenSettled(handleId)));
+                    return awaitTransitions(ownedTransitions);
                 }, runtime.executor);
     }
 

@@ -61,7 +61,7 @@ public final class QuickStartExample {
         AtomicInteger rendererInstances = new AtomicInteger();
 
         // try-with-resources 用于保持示例精简；其 close() 会无界阻塞等待停机。
-        // 生产环境应调用 closeAsync() 并使用有界 get(timeout) 等待，详见 docs/Knotra 线程模型与生产实践.md。
+        // 生产环境应调用 closeAsync() 并使用有界 get(timeout) 等待，详见 docs/02-中级进阶/02-线程模型与生产实践.md。
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
             PublicationChange<Greeting> firstChange =
                     runtime.publish(Greeting.class, new ConstantGreeting("v1"));

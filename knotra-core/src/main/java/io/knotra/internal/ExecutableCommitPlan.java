@@ -14,6 +14,7 @@ import java.util.Set;
  */
 final class ExecutableCommitPlan {
     final Map<String, MountIntent> mounts = new HashMap<>();
+    final Map<String, ComponentRuntime> componentRuntimes = new HashMap<>();
     final Map<String, ConfigUpdate> configs = new HashMap<>();
     final Set<String> staleActivations = new LinkedHashSet<>();
     final Map<String, RemovedMount> removedComponents = new java.util.LinkedHashMap<>();

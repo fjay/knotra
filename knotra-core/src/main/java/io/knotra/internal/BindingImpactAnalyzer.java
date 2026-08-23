@@ -87,6 +87,8 @@ final class BindingImpactAnalyzer {
 
         // 曾因拓扑失败而压制的 WAITING 组件，只有在相关拓扑确实变化后才能重置重试预算。
         RuntimeView old = runtime.currentView();
+        boolean dynamicTopologyChanged = !globalDynamicDependencyFingerprint(old)
+                .equals(globalDynamicDependencyFingerprint(draft.asView()));
         for (RuntimeView.ComponentData component : draft.components.values()) {
             if (component.state() == ComponentState.WAITING
                     && component.goal() == ComponentGoal.RUNNING) {
@@ -98,7 +100,8 @@ final class BindingImpactAnalyzer {
                             old.effectiveBindings(previous, Map.of());
                     Map<String, RuntimeView.BindingData> after =
                             draft.effectiveBindings(component, Map.of());
-                    topologyChanged = !bindingsEqual(before, after);
+                    topologyChanged = !bindingsEqual(before, after)
+                            || dynamicTopologyChanged;
                 }
                 if (topologyChanged) {
                     executable.resetAutoRestart.add(component.handleId());
@@ -106,6 +109,40 @@ final class BindingImpactAnalyzer {
                 }
             }
         }
+    }
+
+    // 环可能由其他组件的 DYNAMIC 边触发；指纹只记录存在的 provider owner 边。
+    private static String globalDynamicDependencyFingerprint(RuntimeView view) {
+        return view.components.values().stream()
+                .flatMap(component -> component.descriptor().sortedRequirements().stream()
+                        .filter(requirement -> requirement.binding()
+                                == CapabilityRequirement.CapabilityBinding.DYNAMIC)
+                        .map(requirement -> dynamicDependencyEdge(view, component, requirement)))
+                .filter(edge -> edge != null)
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(";"));
+    }
+
+    private static String dynamicDependencyEdge(
+            RuntimeView view,
+            RuntimeView.ComponentData component,
+            CapabilityRequirement requirement) {
+        RuntimeView.RegistrationData registration =
+                view.resolve(component.contextId(), requirement.key()).orElse(null);
+        if (registration == null) {
+            return null;
+        }
+        String owner;
+        if (registration.owner() instanceof RuntimeView.OwnerData.Activation activationOwner) {
+            RuntimeView.ActivationData activation =
+                    view.activations.get(activationOwner.activationId());
+            owner = activation == null
+                    ? "activation:" + activationOwner.activationId()
+                    : "mount:" + activation.handleId();
+        } else {
+            owner = "host:" + registration.contextId();
+        }
+        return requirement.key().name() + "=" + owner;
     }
 
     static boolean bindingsEqual(

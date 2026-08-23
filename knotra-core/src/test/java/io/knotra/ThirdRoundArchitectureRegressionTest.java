@@ -79,7 +79,18 @@ final class ThirdRoundArchitectureRegressionTest {
                         }, executor);
 
                 provide.get(10, TimeUnit.SECONDS);
-                assertEquals(ComponentState.DISPOSED, dispose.get(10, TimeUnit.SECONDS));
+                final int failureRound = round;
+                ComponentState disposedState;
+                try {
+                    disposedState = dispose.get(10, TimeUnit.SECONDS);
+                } catch (java.util.concurrent.TimeoutException error) {
+                    throw new AssertionError("round=" + failureRound
+                            + " state=" + handle.state()
+                            + " snapshot=" + runtime.advanced().snapshot(), error);
+                }
+                assertEquals(ComponentState.DISPOSED, disposedState,
+                        () -> "round=" + failureRound + " state=" + handle.state()
+                                + " snapshot=" + runtime.advanced().snapshot());
                 RegistrationHandle registration = provide.join().value();
                 TestKit.assertCommitted(runtime.advanced().transact(mutation -> {
                     mutation.revoke(registration);

@@ -1,9 +1,9 @@
 package io.knotra.it;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
-import com.example.integration.contract.IntegrationCoordinator;
 import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
 import io.knotra.ConfiguredMountHandle;
@@ -14,32 +14,21 @@ import io.knotra.pf4j.ArtifactFactoryCatalogEntry;
 import io.knotra.pf4j.ArtifactFactoryHandle;
 import io.knotra.pf4j.ArtifactState;
 import io.knotra.pf4j.Pf4jArtifactAdapter;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 final class Pf4jArtifactIntegrationTest {
 
-    private KnotraRuntime runtime;
-
-    @BeforeEach
-    void setUp() {
-        IntegrationCoordinator.reset();
-        IntegrationCoordinator.clearLoaders();
-        runtime = KnotraRuntime.create();
-    }
-
-    @AfterEach
-    void tearDown() throws Exception {
-        IntegrationTestKit.drainIntegrations();
-        runtime.close();
-    }
+    @RegisterExtension
+    private final KnotraIntegrationExtension runtimeExtension =
+            KnotraIntegrationExtension.defaults();
 
     @Test
-    void loadStartDiscoversControlledFactoriesWithoutMountingMounts(@TempDir Path pluginsRoot)
+    void loadStartDiscoversControlledFactoriesWithoutMountingMounts(
+            KnotraRuntime runtime, @TempDir Path pluginsRoot)
             throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             var snapshot = adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
@@ -73,7 +62,8 @@ final class Pf4jArtifactIntegrationTest {
     }
 
     @Test
-    void controlledMountNormalizesConfigAndKeepsArtifactOrigin(@TempDir Path pluginsRoot)
+    void controlledMountNormalizesConfigAndKeepsArtifactOrigin(
+            KnotraRuntime runtime, @TempDir Path pluginsRoot)
             throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
@@ -82,7 +72,7 @@ final class Pf4jArtifactIntegrationTest {
 
             ConfiguredMountHandle<String> handle = factory.mount(
                     runtime.root(), "greeting", "  hello  ");
-            assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(handle));
+            assertEquals(ComponentState.ACTIVE, handle.awaitSettled(Duration.ofSeconds(30)));
             assertTrue(handle instanceof ConfiguredMountHandle<?>);
 
             RuntimeSnapshot.MountSnapshot mount = runtime.advanced().snapshot().mounts()
@@ -105,13 +95,14 @@ final class Pf4jArtifactIntegrationTest {
 
     @Test
     void artifactChildMountInheritsParentOriginAndDrainsWithTheArtifact(
+            KnotraRuntime runtime,
             @TempDir Path pluginsRoot) throws Exception {
         try (Pf4jArtifactAdapter adapter = IntegrationTestKit.adapter(pluginsRoot, runtime)) {
             adapter.loadArtifactAsync(IntegrationTestKit.fixture()).toCompletableFuture().join();
             MountHandle parent = adapter.factories()
                     .resolveNoConfig("integration-parent").orElseThrow()
                     .mount(runtime.root(), "parent");
-            assertEquals(ComponentState.ACTIVE, IntegrationTestKit.settle(parent));
+            assertEquals(ComponentState.ACTIVE, parent.awaitSettled(Duration.ofSeconds(30)));
             assertFalse(parent instanceof ConfiguredMountHandle<?>);
 
             RuntimeSnapshot.MountSnapshot child = runtime.advanced().snapshot().mounts().stream()
