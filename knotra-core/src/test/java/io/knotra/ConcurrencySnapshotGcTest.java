@@ -318,7 +318,110 @@ final class ConcurrencySnapshotGcTest {
         assertNull(loaderReference.get(), "runtime retained disposed component ClassLoader");
     }
 
-    private WeakReference<URLClassLoader> mountAndDisposeComponentFromIsolatedLoader() throws Exception {
+    @Test
+    void shadowProviderRemovalReleasesWaitingOwnedChildClassLoader() throws Exception {
+        Path directory = Files.createTempDirectory("knotra-owned-child-gc");
+        compileWaitingChildFactory(directory);
+        URLClassLoader loader = new URLClassLoader(
+                new URL[]{directory.toUri().toURL()}, getClass().getClassLoader());
+        AtomicReference<ClassLoader> activeLoader = new AtomicReference<>(loader);
+        AtomicReference<MountHandle> child = new AtomicReference<>();
+        ContextHandle workspace = TestKit.child(runtime, runtime.root(), "owned-child-gc");
+        TestKit.provide(runtime, runtime.root(), X, "root");
+
+        MountHandle consumer = TestKit.mount(
+                runtime,
+                workspace,
+                "consumer",
+                (context, config) -> {
+                    ComponentFactory<NoConfig> factory = (ComponentFactory<NoConfig>)
+                            Class.forName(
+                                            "io.knotra.WaitingOwnedChildFactory",
+                                            true,
+                                            activeLoader.get())
+                                    .getConstructor()
+                                    .newInstance();
+                    child.set(context.mountChild(
+                            "waiting-child", factory, NoConfig.INSTANCE));
+                    activeLoader.set(null);
+                },
+                CapabilityRequirement.required(X));
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(consumer).call());
+        assertEquals(ComponentState.WAITING, TestKit.settle(child.get()).call());
+        assertNull(activeLoader.get());
+        RuntimeSnapshot oldSnapshot = runtime.advanced().snapshot();
+        assertTrue(oldSnapshot.mounts().stream()
+                .anyMatch(mount -> mount.handleId().equals(child.get().handleId())));
+
+        MountHandle shadow = TestKit.mount(
+                runtime,
+                workspace,
+                "shadow-provider",
+                (context, config) -> context.provide(X, "shadow"));
+        assertEquals(ComponentState.ACTIVE, TestKit.settle(shadow).call());
+        assertEquals(ComponentState.DISPOSED, child.get().state());
+
+        oldSnapshot = null;
+        WeakReference<URLClassLoader> loaderReference = new WeakReference<>(loader);
+        loader = null;
+        awaitClassLoaderCollected(loaderReference);
+    }
+
+    @Test
+    void pluginCapabilityKeyIdentityIsReleasedAndStillRejectsSameNameDifferentClass()
+            throws Exception {
+        WeakReference<URLClassLoader> firstReference =
+                mountAndDisposeComponentFromIsolatedLoader();
+        awaitClassLoaderCollected(firstReference);
+
+        Path firstDirectory = Files.createTempDirectory("knotra-capability-gc-a");
+        compileGcComponent(firstDirectory);
+        URLClassLoader firstLoader = new URLClassLoader(
+                new URL[]{firstDirectory.toUri().toURL()}, getClass().getClassLoader());
+        var first = mountPluginCapabilityComponent(firstLoader, "capability-first");
+        assertEquals(ComponentState.ACTIVE, first.whenSettled()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+
+        Path secondDirectory = Files.createTempDirectory("knotra-capability-gc-b");
+        compileGcComponent(secondDirectory);
+        URLClassLoader secondLoader = new URLClassLoader(
+                new URL[]{secondDirectory.toUri().toURL()}, getClass().getClassLoader());
+        try {
+            TransactionRejectedException rejected = assertThrows(
+                    TransactionRejectedException.class,
+                    () -> mountPluginCapabilityComponent(secondLoader, "capability-second"));
+            assertEquals(DiagnosticCode.CAPABILITY_TYPE_CONFLICT,
+                    rejected.diagnostics().getFirst().code());
+        } finally {
+            secondLoader.close();
+        }
+
+        assertEquals(ComponentState.DISPOSED, first.disposeAsync()
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+    }
+
+    private MountHandle mountPluginCapabilityComponent(
+            URLClassLoader loader, String mountId) throws Exception {
+        Class<?> componentClass = loader.loadClass("io.knotra.GcComponent");
+        ComponentFactory<NoConfig> factory = new IsolatedFactoryAdapter(
+                componentClass.getDeclaredConstructor().newInstance());
+        return runtime.advanced().transact(transaction -> transaction.mount(
+                runtime.root(),
+                mountId,
+                factory,
+                NoConfig.INSTANCE)).value();
+    }
+
+    private static void awaitClassLoaderCollected(WeakReference<URLClassLoader> reference) {
+        for (int i = 0; i < 50 && reference.get() != null; i++) {
+            System.gc();
+            Thread.onSpinWait();
+        }
+        assertNull(reference.get(), "runtime retained plugin capability ClassLoader");
+    }
+
+    private WeakReference<URLClassLoader> mountAndDisposeComponentFromIsolatedLoader()
+            throws Exception {
         Path directory = Files.createTempDirectory("knotra-gc");
         compileGcComponent(directory);
         URLClassLoader loader = new URLClassLoader(
@@ -334,8 +437,56 @@ final class ConcurrencySnapshotGcTest {
         assertEquals(ComponentState.DISPOSED, result.value().disposeAsync()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
         WeakReference<URLClassLoader> reference = new WeakReference<>(loader);
+        result = null;
+        componentClass = null;
         loader = null;
         return reference;
+    }
+
+    private static void compileWaitingChildFactory(Path directory) throws Exception {
+        Files.createDirectories(directory.resolve("io/knotra"));
+        Path source = directory.resolve("io/knotra/WaitingOwnedChildFactory.java");
+        Files.writeString(source, """
+                package io.knotra;
+
+                public final class WaitingOwnedChildFactory
+                        implements ComponentFactory<NoConfig> {
+                    private static final CapabilityKey<String> MISSING =
+                            CapabilityKey.of("owned-child-missing-capability", String.class);
+
+                    @Override public String factoryId() { return "waiting-child"; }
+
+                    @Override public Component<NoConfig> create() {
+                        return new Component<>() {
+                            @Override public ComponentDescriptor descriptor() {
+                                return ComponentDescriptor.named(
+                                        "waiting-child", CapabilityRequirement.required(MISSING));
+                            }
+
+                            @Override public void start(
+                                    ActivationContext context, NoConfig config) {
+                            }
+                        };
+                    }
+                }
+                """, StandardCharsets.UTF_8);
+        JavaFileObject unit = new SimpleJavaFileObject(
+                URI.create("string:///" + source),
+                javax.tools.JavaFileObject.Kind.SOURCE) {
+            @Override
+            public CharSequence getCharContent(boolean ignoreEncodingErrors) {
+                try {
+                    return Files.readString(source, StandardCharsets.UTF_8);
+                } catch (Exception error) {
+                    throw new IllegalStateException(error);
+                }
+            }
+        };
+        boolean success = ToolProvider.getSystemJavaCompiler().run(
+                null, null, null,
+                "-classpath", System.getProperty("java.class.path"),
+                "-d", directory.toString(), source.toString()) == 0;
+        assertTrue(success);
     }
 
     private static final class IsolatedFactoryAdapter implements ComponentFactory<NoConfig> {
@@ -397,11 +548,21 @@ final class ConcurrencySnapshotGcTest {
                 package io.knotra;
 
                 public final class GcComponent implements ComponentFactory<NoConfig> {
+                    public static final class Signal {}
+
+                    private static final CapabilityKey<Signal> KEY =
+                            CapabilityKey.of("plugin-defined-capability", Signal.class);
+
+                    public static CapabilityKey<Signal> capabilityKey() {
+                        return KEY;
+                    }
+
                     @Override public String factoryId() { return "gc"; }
                     @Override public Component<NoConfig> create() {
                         return new Component<>() {
                             @Override public ComponentDescriptor descriptor() {
-                                return ComponentDescriptor.named("gc");
+                                return ComponentDescriptor.named(
+                                        "gc", CapabilityRequirement.optional(KEY));
                             }
                             @Override public void start(ActivationContext context, NoConfig config) {}
                         };

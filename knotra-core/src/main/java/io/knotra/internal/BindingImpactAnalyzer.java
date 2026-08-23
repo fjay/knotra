@@ -22,6 +22,7 @@ final class BindingImpactAnalyzer {
             RuntimeView.Draft draft,
             Set<String> dirty,
             ExecutableCommitPlan executable) {
+        PublishedKernelState state = runtime.publishedState();
         Set<String> impacted = new LinkedHashSet<>();
         for (RuntimeView.ComponentData component : draft.components.values()) {
             if (component.currentActivationId() == null) {
@@ -35,7 +36,7 @@ final class BindingImpactAnalyzer {
             boolean tracksGraph =
                     RuntimeView.activationTracksGraph(activation.state());
             ComponentRuntime executableRuntime =
-                    runtime.components.get(component.handleId());
+                    state.index.components.get(component.handleId());
             boolean cleaningForRestart =
                     component.goal() == ComponentGoal.RUNNING
                             && (component.state() == ComponentState.STOPPING
@@ -46,7 +47,7 @@ final class BindingImpactAnalyzer {
                 continue;
             }
             ActivationRuntime executableActivation =
-                    runtime.activations.get(component.currentActivationId());
+                    state.index.activations.get(component.currentActivationId());
             Map<String, RuntimeView.BindingData> previousBindings =
                     tracksGraph || executableActivation == null
                             ? activation.bindings()
@@ -86,7 +87,7 @@ final class BindingImpactAnalyzer {
         }
 
         // 曾因拓扑失败而压制的 WAITING 组件，只有在相关拓扑确实变化后才能重置重试预算。
-        RuntimeView old = runtime.currentView();
+        RuntimeView old = state.view;
         boolean dynamicTopologyChanged = !globalDynamicDependencyFingerprint(old)
                 .equals(globalDynamicDependencyFingerprint(draft.asView()));
         for (RuntimeView.ComponentData component : draft.components.values()) {

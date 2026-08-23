@@ -16,6 +16,7 @@ import io.knotra.ContextInfo;
 import io.knotra.ContextState;
 import io.knotra.ContextView;
 import io.knotra.MountHandle;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.loader.ControlledMountContext;
 import io.knotra.loader.FactoryRef;
 import io.knotra.loader.ResolvedFactory;
@@ -157,6 +158,11 @@ final class Pf4jFactoryResolverTest {
         @Override
         public CompletionStage<Void> retryDrainAsync(String artifactId) {
             throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public PendingOperationsSnapshot pendingOperations() {
+            return new PendingOperationsSnapshot(false, List.of(), 0);
         }
 
         @Override

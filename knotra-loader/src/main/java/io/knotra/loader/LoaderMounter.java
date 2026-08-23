@@ -1,5 +1,6 @@
 package io.knotra.loader;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -19,6 +20,9 @@ import static io.knotra.loader.LoaderStateStore.ManagedEntry;
 /**
  * 受控挂载协作类：执行单次受控挂载、收口 commit 后失败路径，并提供新增批次
  * 失败时的 LIFO 回滚。任何 commit 后的失败都不会遗留未跟踪挂载。
+ *
+ * <p>挂载策略执行（用户回调）、挂载 settlement 与补偿释放的同步等待会推进显式传入的
+ * 令牌，阶段信息只用于诊断，不影响挂载行为。</p>
  */
 final class LoaderMounter {
 
@@ -46,7 +50,8 @@ final class LoaderMounter {
     MountResult mount(
             PreparedEntry entry,
             ContextHandle context,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         if (context == null || context.state() != ContextState.ACTIVE) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
@@ -54,9 +59,15 @@ final class LoaderMounter {
                     "mount context is not active"));
             return MountResult.REJECTED;
         }
+        operation.phase(
+                LoaderOperationTracker.Phase.MOUNT_EXECUTION,
+                entry.path(),
+                entry.path(),
+                "",
+                Duration.ZERO);
         AllocatedMountContext mountContext = new AllocatedMountContext(
                 runtime, context, entry.path(),
-                timeouts.get().settlement(), timeouts.get().recovery());
+                timeouts.get().settlement(), timeouts.get().recovery(), operation);
         MountHandle handle = null;
         boolean rejected = false;
         try {
@@ -107,7 +118,7 @@ final class LoaderMounter {
                         LoaderDiagnosticCode.STRUCTURE_REJECTED,
                         entry.path(),
                         "controlled mount returned a mount handle outside its allocated slot"));
-                disposer.disposeHandle(entry.path(), handle, diagnostics);
+                disposer.disposeHandle(entry.path(), handle, diagnostics, operation);
                 return rejectedWithoutOrphan(entry, context, mountContext, diagnostics);
             }
             SettlementReport report = mountContext.lastReport();
@@ -175,13 +186,14 @@ final class LoaderMounter {
     void rollbackAdd(
             List<ManagedEntry> mounted,
             Map<String, ContextHandle> created,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         List<LoaderDiagnostic> compensation = new ArrayList<>();
         for (int index = mounted.size() - 1; index >= 0; index--) {
             ManagedEntry entry = mounted.get(index);
-            disposer.disposeHandle(entry.path(), entry.handle(), compensation);
+            disposer.disposeHandle(entry.path(), entry.handle(), compensation, operation);
         }
-        rollbackContexts(created, compensation);
+        rollbackContexts(created, compensation, operation);
         if (!compensation.isEmpty()) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.COMPENSATION_FAILED,
@@ -201,9 +213,10 @@ final class LoaderMounter {
     /** Context 创建事务失败后的补偿：只释放新建子树并把补偿诊断并入结果。 */
     void rollbackCreatedContexts(
             Map<String, ContextHandle> created,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         List<LoaderDiagnostic> compensation = new ArrayList<>();
-        rollbackContexts(created, compensation);
+        rollbackContexts(created, compensation, operation);
         diagnostics.addAll(compensation);
         created.clear();
     }
@@ -211,7 +224,8 @@ final class LoaderMounter {
     // 只释放新建子树的根；释放根 Context 会级联子孙，逐个释放会重复处置。
     private void rollbackContexts(
             Map<String, ContextHandle> created,
-            List<LoaderDiagnostic> compensation) {
+            List<LoaderDiagnostic> compensation,
+            LoaderOperationTracker.Operation operation) {
         List<String> roots = created.keySet().stream()
                 .filter(path -> {
                     String parent = DesiredTreePreparer.parentPath(path);
@@ -222,7 +236,7 @@ final class LoaderMounter {
         for (String path : roots) {
             ContextHandle context = created.get(path);
             if (context != null) {
-                disposer.disposeHandlelessContext(path, context, compensation);
+                disposer.disposeHandlelessContext(path, context, compensation, operation);
             }
         }
     }

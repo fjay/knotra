@@ -1,6 +1,8 @@
 package io.knotra.pf4j;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -27,10 +29,15 @@ import org.pf4j.PluginWrapper;
 final class ManagedArtifactStore {
 
     private final Object stateLock = new Object();
+    private final PendingOperationTracker pendingTracker;
     private final Map<String, ManagedArtifact> artifacts = new LinkedHashMap<>();
     private final Map<String, ArtifactDiagnostic> loadFailures = new LinkedHashMap<>();
     private final Map<String, ArtifactSnapshot> terminalSnapshots = new LinkedHashMap<>();
     private final Map<String, ManagedFactory> catalog = new LinkedHashMap<>();
+
+    ManagedArtifactStore(PendingOperationTracker pendingTracker) {
+        this.pendingTracker = pendingTracker;
+    }
 
     List<ArtifactFactoryCatalogEntry> catalogEntries() {
         synchronized (stateLock) {
@@ -87,6 +94,26 @@ final class ManagedArtifactStore {
                     .map(artifact -> artifact.artifactId)
                     .toList();
         }
+    }
+
+    Map<String, PendingMetadata> pendingMetadata(Collection<String> artifactIds) {
+        synchronized (stateLock) {
+            Map<String, PendingMetadata> result = new LinkedHashMap<>();
+            for (String artifactId : artifactIds) {
+                ManagedArtifact artifact = artifacts.get(artifactId);
+                if (artifact == null) {
+                    continue;
+                }
+                result.put(artifactId, new PendingMetadata(
+                        artifactId,
+                        artifact.mountsInFlight,
+                        List.copyOf(artifact.directHandles.keySet())));
+            }
+            return Collections.unmodifiableMap(result);
+        }
+    }
+
+    record PendingMetadata(String artifactId, int mountsInFlight, List<String> rootHandleIds) {
     }
 
     ArtifactSnapshot snapshot(String artifactId, List<ArtifactOwnership> ownership) {
@@ -203,6 +230,7 @@ final class ManagedArtifactStore {
         synchronized (stateLock) {
             requireMountable(handle);
             handle.artifact.mountsInFlight++;
+            pendingTracker.beginMount(handle.artifact);
         }
     }
 
@@ -231,6 +259,9 @@ final class ManagedArtifactStore {
                 if (future != null) {
                     future.complete(null);
                 }
+            }
+            if (artifact.mountsInFlight == 0) {
+                pendingTracker.endMount(artifact);
             }
         }
     }

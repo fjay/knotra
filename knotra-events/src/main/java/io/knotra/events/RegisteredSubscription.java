@@ -6,6 +6,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -20,9 +21,13 @@ final class RegisteredSubscription implements EventSubscription {
     private final Object listener;
     private final ReentrantReadWriteLock lock;
     private final RemovalCallback removalCallback;
-    private final AtomicBoolean active = new AtomicBoolean(true);
-    private final ConcurrentLinkedQueue<CompletableFuture<Void>> acceptedDispatches =
+    private volatile boolean active = true;
+    private final AtomicBoolean unsubscribeRequested = new AtomicBoolean(false);
+    // 锁序固定为总线写锁 -> membershipLock；release 只取 membershipLock。
+    private final ReentrantLock membershipLock = new ReentrantLock();
+    private final ConcurrentLinkedQueue<AcceptedDispatch> acceptedDispatches =
             new ConcurrentLinkedQueue<>();
+    private final SubscriptionDrainTracker drainTracker;
     private CompletableFuture<Void> closeFuture;
 
     RegisteredSubscription(
@@ -31,13 +36,15 @@ final class RegisteredSubscription implements EventSubscription {
             EventDefinition<?> definition,
             Object listener,
             ReentrantReadWriteLock lock,
-            RemovalCallback removalCallback) {
+            RemovalCallback removalCallback,
+            SubscriptionDrainTracker drainTracker) {
         this.subscriptionId = Objects.requireNonNull(subscriptionId, "subscriptionId");
         this.sequence = sequence;
         this.definition = Objects.requireNonNull(definition, "definition");
         this.listener = Objects.requireNonNull(listener, "listener");
         this.lock = Objects.requireNonNull(lock, "lock");
         this.removalCallback = Objects.requireNonNull(removalCallback, "removalCallback");
+        this.drainTracker = Objects.requireNonNull(drainTracker, "drainTracker");
     }
 
     @Override
@@ -62,18 +69,23 @@ final class RegisteredSubscription implements EventSubscription {
 
     @Override
     public boolean active() {
-        return active.get();
+        return active;
     }
 
     @Override
     public void unsubscribe() {
-        // 先原子抢占状态，保证重复取消和回调内自取消都幂等，同时避免阻塞在总线写锁上。
-        if (!active.compareAndSet(true, false)) {
+        // 只用原子标志合并重复取消；active 的发布点在总线写锁内，
+        // 保证 inactive 后不再接受新分发。
+        if (!unsubscribeRequested.compareAndSet(false, true)) {
             return;
         }
         lock.writeLock().lock();
         try {
-            removalCallback.remove(this);
+            try {
+                removalCallback.remove(this);
+            } finally {
+                deactivateForDrain();
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -84,24 +96,48 @@ final class RegisteredSubscription implements EventSubscription {
         unsubscribe();
         // unsubscribe 只影响未来分发；这里快照并等待本订阅在关闭观察前已接受的租约。
         if (closeFuture == null) {
-            List<CompletableFuture<Void>> pending = new ArrayList<>();
-            for (CompletableFuture<Void> dispatch : acceptedDispatches) {
-                if (!dispatch.isDone()) {
-                    pending.add(dispatch);
-                }
-            }
-            closeFuture = CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new));
+            closeFuture = CompletableFuture.allOf(pendingDispatches().stream()
+                    .map(AcceptedDispatch::settled)
+                    .toArray(CompletableFuture[]::new));
         }
         return closeFuture;
     }
 
-    void accept(CompletableFuture<Void> dispatch) {
+    void accept(AcceptedDispatch dispatch) {
         // 即使串行/瀑布链最终跳过该监听，已入队的租约也由 finish 统一释放。
-        acceptedDispatches.add(dispatch);
+        membershipLock.lock();
+        try {
+            acceptedDispatches.add(dispatch);
+        } finally {
+            membershipLock.unlock();
+        }
     }
 
-    void release(CompletableFuture<Void> dispatch) {
-        acceptedDispatches.remove(dispatch);
+    void release(AcceptedDispatch dispatch) {
+        membershipLock.lock();
+        try {
+            acceptedDispatches.remove(dispatch);
+            if (!active && acceptedDispatches.isEmpty()) {
+                drainTracker.untrack(this);
+            }
+        } finally {
+            membershipLock.unlock();
+        }
+    }
+
+    List<AcceptedDispatch> pendingDispatches() {
+        membershipLock.lock();
+        try {
+            List<AcceptedDispatch> result = new ArrayList<>();
+            for (AcceptedDispatch dispatch : acceptedDispatches) {
+                if (!dispatch.settled().isDone()) {
+                    result.add(dispatch);
+                }
+            }
+            return result;
+        } finally {
+            membershipLock.unlock();
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -157,7 +193,25 @@ final class RegisteredSubscription implements EventSubscription {
     }
 
     void markClosed() {
-        active.set(false);
+        deactivateForDrain();
+    }
+
+    /**
+     * 必须在总线写锁内调用：accept 与注册表移除同样持有该锁，
+     * 因此 active=false 后不会再有新的 accept。
+     */
+    private void deactivateForDrain() {
+        membershipLock.lock();
+        try {
+            active = false;
+            if (acceptedDispatches.isEmpty()) {
+                drainTracker.untrack(this);
+            } else {
+                drainTracker.track(this);
+            }
+        } finally {
+            membershipLock.unlock();
+        }
     }
 
     private void verifyMode(EventMode expectedMode) {

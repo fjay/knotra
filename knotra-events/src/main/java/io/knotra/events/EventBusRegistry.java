@@ -18,9 +18,11 @@ final class EventBusRegistry {
     private final EventBindingRegistry eventBindings = new EventBindingRegistry();
     private final AtomicLong sequences = new AtomicLong();
     private final ReentrantReadWriteLock lock;
+    private final SubscriptionDrainTracker drainTracker;
 
-    EventBusRegistry(ReentrantReadWriteLock lock) {
+    EventBusRegistry(ReentrantReadWriteLock lock, SubscriptionDrainTracker drainTracker) {
         this.lock = lock;
+        this.drainTracker = drainTracker;
     }
 
     RegisteredSubscription register(String busId, EventDefinition<?> definition, Object listener) {
@@ -33,7 +35,8 @@ final class EventBusRegistry {
                 definition,
                 listener,
                 lock,
-                this::remove);
+                this::remove,
+                drainTracker);
         subscriptions.computeIfAbsent(
                         index(definition, binding.eventType()),
                         ignored -> new ArrayList<>())

@@ -1,6 +1,7 @@
 package io.knotra.events;
 
 import io.knotra.AsyncCloseable;
+import io.knotra.PendingOperationsSnapshot;
 
 import java.util.concurrent.CompletionStage;
 
@@ -96,6 +97,18 @@ public interface EventBus extends AsyncCloseable {
 
     /** 返回当前订阅的稳定 Snapshot。Snapshot 不引用监听对象或 Throwable。 */
     EventBusSnapshot snapshot();
+
+    /**
+     * 获取总线排空过程中的挂起操作 point-in-time 快照。
+     *
+     * <p>任意总线生命周期阶段（活跃、关闭中、已关闭）均可调用。该方法不等待任何 Future、
+     * 不执行监听或用户代码，也不改变 {@link #closeAsync()} 的收敛语义。快照只读取在分发
+     * 接受时提前字符串化的纯元数据，不引用事件值、监听对象、事件 Class 或 ClassLoader；
+     * 各操作来自不同并发结构的 point-in-time 采样，不承诺全局原子性。</p>
+     *
+     * @return 排序且有界的挂起操作快照
+     */
+    PendingOperationsSnapshot pendingOperations();
 
     /** 返回在本次调用被观察到之前已接受分发的收敛 stage。 */
     CompletionStage<Void> whenIdle();

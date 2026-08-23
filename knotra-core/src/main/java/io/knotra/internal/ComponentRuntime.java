@@ -25,8 +25,7 @@ final class ComponentRuntime {
     final PreparedComponent<?> prepared;
 
     // 宿主事务提交后的期望状态；正在运行的 Activation 仍持有启动时捕获的旧配置。
-    volatile Object desiredConfig;
-    volatile long desiredRevision = 1;
+    private volatile DesiredComponentState desired = DesiredComponentState.INITIAL;
     // 当前启动或等待清理的 Activation；清理失败时会转入 failedCleanup，阻止新代际提前启动。
     volatile ActivationRuntime current;
     volatile ActivationRuntime failedCleanup;
@@ -63,7 +62,7 @@ final class ComponentRuntime {
         this.contextId = contextId;
         this.mountId = mountId;
         this.prepared = prepared;
-        this.desiredConfig = prepared.config();
+        this.desired = new DesiredComponentState(prepared.config(), 1);
     }
 
     CompletableFuture<io.knotra.ComponentState> enqueue(
@@ -250,9 +249,12 @@ final class ComponentRuntime {
         }
     }
 
+    DesiredComponentState desiredState() {
+        return desired;
+    }
+
     void updateConfig(Object config, long revision) {
-        this.desiredConfig = config;
-        this.desiredRevision = revision;
+        this.desired = new DesiredComponentState(config, revision);
     }
 
     record Reservation(

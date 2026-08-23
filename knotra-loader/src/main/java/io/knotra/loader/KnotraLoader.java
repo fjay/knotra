@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
@@ -16,11 +15,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.ContextState;
 import io.knotra.KnotraRuntime;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.SettlementReport;
 import io.knotra.TransactionReceipt;
@@ -67,13 +69,16 @@ public final class KnotraLoader implements AutoCloseable {
     private final LoaderDisposer disposer;
     private final LoaderMounter mounter;
     private final DesiredTreePreparer preparer;
+    private final LongSupplier ticker;
+    private final LoaderOperationTracker operationTracker;
     private CompletableFuture<Void> closeAttempt;
 
     private KnotraLoader(
             KnotraRuntime runtime,
             ContextHandle baseContext,
             ComponentFactoryResolver resolver,
-            boolean owned) {
+            boolean owned,
+            LongSupplier ticker) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.resolver = Objects.requireNonNull(resolver, "resolver");
         this.loaderId = "loader-" + NEXT_ID.incrementAndGet();
@@ -99,6 +104,8 @@ public final class KnotraLoader implements AutoCloseable {
         this.disposer = new LoaderDisposer(runtime, this.baseContext, state, () -> timeouts);
         this.mounter = new LoaderMounter(runtime, state, disposer, () -> timeouts);
         this.preparer = new DesiredTreePreparer(runtime, this.baseContext, resolver, state);
+        this.ticker = ticker;
+        this.operationTracker = new LoaderOperationTracker(ticker);
         state.publish(List.of());
     }
 
@@ -112,7 +119,7 @@ public final class KnotraLoader implements AutoCloseable {
     public static KnotraLoader owned(
             KnotraRuntime runtime,
             ComponentFactoryResolver resolver) {
-        return new KnotraLoader(runtime, null, resolver, true);
+        return new KnotraLoader(runtime, null, resolver, true, System::nanoTime);
     }
 
     /**
@@ -126,7 +133,20 @@ public final class KnotraLoader implements AutoCloseable {
             KnotraRuntime runtime,
             ContextHandle context,
             ComponentFactoryResolver resolver) {
-        return new KnotraLoader(runtime, context, resolver, false);
+        return new KnotraLoader(runtime, context, resolver, false, System::nanoTime);
+    }
+
+    /**
+     * 包内测试注入点：替换挂起诊断使用的单调时钟。ticker 只影响 age 与剩余
+     * deadline 的计算，不参与任何行为分支；负值或回退值会被钳制为非负 age。
+     */
+    static KnotraLoader over(
+            KnotraRuntime runtime,
+            ContextHandle context,
+            ComponentFactoryResolver resolver,
+            LongSupplier ticker) {
+        return new KnotraLoader(runtime, context, resolver, false,
+                Objects.requireNonNull(ticker, "ticker"));
     }
 
     /** Loader 实例 ID；owned 模式下同时用作专属基础 Context 的名称。 */
@@ -185,7 +205,7 @@ public final class KnotraLoader implements AutoCloseable {
                             "",
                             "loader is closed"))));
         }
-        return enqueue(() -> performReconcile(desired));
+        return enqueue("reconcile", operation -> performReconcile(desired, operation));
     }
 
     /**
@@ -220,7 +240,7 @@ public final class KnotraLoader implements AutoCloseable {
                             normalized,
                             "loader is closed"))));
         }
-        return enqueue(() -> performRetry(normalized));
+        return enqueue("retry", operation -> performRetry(normalized, operation));
     }
 
     /** 阻塞执行 {@link #retryAsync(String)}；异常约定与 {@link #reconcile(ComponentTree)} 一致。 */
@@ -260,6 +280,23 @@ public final class KnotraLoader implements AutoCloseable {
     }
 
     /**
+     * 返回 Loader 排空过程中的挂起操作快照（point-in-time，无副作用）。
+     *
+     * <p>该方法不进入协调器，可在任意阶段、任意线程（包括协调器线程）调用。
+     * 操作条目来自协调器队列与各收敛阶段的短锁采样：包含 reconcile / retry /
+     * close 的当前阶段、稳定目标标识与有界 detail，不引用组件、句柄、Context、
+     * 工厂、配置、期望树或 ClassLoader。
+     *
+     * <p>closeRequested 一旦 closeAsync 已请求即为 true 并保持粘性：close 尝试
+     * 失败后处于可重试状态时仍视为“已请求关闭”，与 {@link #snapshot()} 的
+     * closed 语义一致。各操作来自叶子锁的独立采样，不承诺全局原子性；排序
+     * 与截断由公共 DTO 构造器统一完成。
+     */
+    public PendingOperationsSnapshot pendingOperations() {
+        return operationTracker.snapshot(ticker.getAsLong(), state.isClosed());
+    }
+
+    /**
      * 异步关闭 Loader 并释放其管理的结构。
      *
      * <p>owned 模式整体释放基础 Context；over 模式只释放自己创建的顶层子树。
@@ -276,7 +313,7 @@ public final class KnotraLoader implements AutoCloseable {
                 return closeAttempt;
             }
             state.markClosed();
-            closeAttempt = enqueue(this::performClose);
+            closeAttempt = enqueue("close", this::performClose);
             return closeAttempt;
         }
     }
@@ -310,26 +347,34 @@ public final class KnotraLoader implements AutoCloseable {
      * 把操作排入单线程协调器。coordinatorThread 用于识别协调器线程本身，
      * 拒绝受控策略或组件代码在协调器线程内重入调用 Loader，防止自等待死锁。
      */
-    private <T> CompletableFuture<T> enqueue(Callable<T> operation) {
+    private <T> CompletableFuture<T> enqueue(
+            String operationType,
+            Function<LoaderOperationTracker.Operation, T> operation) {
         rejectReentrant("coordinator operation");
         CompletableFuture<T> outcome = new CompletableFuture<>();
+        LoaderOperationTracker.Operation tracked =
+                operationTracker.begin(operationType, loaderId);
         try {
             coordinator.execute(() -> {
-                Thread thread = Thread.currentThread();
-                Thread previous = coordinatorThread.getAndSet(thread);
-                if (previous != null && previous != thread) {
-                    outcome.completeExceptionally(new IllegalStateException(
-                            "loader coordinator thread changed"));
-                    return;
-                }
                 try {
-                    outcome.complete(operation.call());
+                    Thread thread = Thread.currentThread();
+                    Thread previous = coordinatorThread.getAndSet(thread);
+                    if (previous != null && previous != thread) {
+                        outcome.completeExceptionally(new IllegalStateException(
+                                "loader coordinator thread changed"));
+                        return;
+                    }
+                    tracked.running();
+                    outcome.complete(operation.apply(tracked));
                 } catch (Throwable error) {
                     outcome.completeExceptionally(error);
+                } finally {
+                    tracked.complete();
                 }
             });
         } catch (RuntimeException error) {
             outcome.completeExceptionally(error);
+            tracked.complete();
         }
         return outcome;
     }
@@ -347,30 +392,34 @@ public final class KnotraLoader implements AutoCloseable {
      * 挂载；工厂替换在配置更新之前完成，后者只处理实现身份已匹配的条目。
      * 最后统一收集 FAILED 诊断，把重试决策留给显式 retry。
      */
-    private ReconcileResult performReconcile(ComponentTree desired) {
+    private ReconcileResult performReconcile(
+            ComponentTree desired,
+            LoaderOperationTracker.Operation operation) {
         List<LoaderDiagnostic> diagnostics = new ArrayList<>();
         List<ReconcileResult.Change> changes = new ArrayList<>();
         boolean proposed = true;
         try {
+            operation.phase(LoaderOperationTracker.Phase.PREPARE,
+                    loaderId, "", "", Duration.ZERO);
             PreparedTree prepared = preparer.prepare(desired, diagnostics);
             if (!diagnostics.isEmpty()) {
                 return finish(false, changes, diagnostics);
             }
 
             pruneExternallyDisposed();
-            if (!settleFailedDesiredContexts(prepared, diagnostics)) {
+            if (!settleFailedDesiredContexts(prepared, diagnostics, operation)) {
                 return finish(false, changes, diagnostics);
             }
-            if (!removeMissing(prepared, changes, diagnostics)) {
+            if (!removeMissing(prepared, changes, diagnostics, operation)) {
                 return finish(false, changes, diagnostics);
             }
-            if (!replaceChangedFactories(prepared, changes, diagnostics)) {
+            if (!replaceChangedFactories(prepared, changes, diagnostics, operation)) {
                 return finish(false, changes, diagnostics);
             }
-            if (!addMissing(prepared, changes, diagnostics)) {
+            if (!addMissing(prepared, changes, diagnostics, operation)) {
                 return finish(false, changes, diagnostics);
             }
-            updateConfigs(prepared, changes, diagnostics);
+            updateConfigs(prepared, changes, diagnostics, operation);
             addUnconvergedDiagnostics(prepared, diagnostics);
         } catch (Throwable error) {
             proposed = false;
@@ -386,7 +435,9 @@ public final class KnotraLoader implements AutoCloseable {
      * 显式恢复单条路径：FAILED 组件走 handle.retry 重新激活；FAILED Context
      * 先整树释放，让下一次 reconcile 重建，避免在失败的 Context 上反复挂载。
      */
-    private ReconcileResult performRetry(String path) {
+    private ReconcileResult performRetry(
+            String path,
+            LoaderOperationTracker.Operation operation) {
         List<LoaderDiagnostic> diagnostics = new ArrayList<>();
         List<ReconcileResult.Change> changes = new ArrayList<>();
         ManagedEntry entry = state.entry(path);
@@ -400,6 +451,12 @@ public final class KnotraLoader implements AutoCloseable {
 
         if (entry.handle().state() == ComponentState.FAILED) {
             try {
+                operation.phase(
+                        LoaderOperationTracker.Phase.RETRY_ACTIVATION,
+                        entry.handle().handleId(),
+                        path,
+                        entry.handle().handleId(),
+                        Duration.ZERO);
                 ComponentState retried = entry.handle().retryAsync()
                         .toCompletableFuture().get();
                 state.put(entry.withHandle(entry.handle()));
@@ -422,7 +479,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
 
         if (entry.context().state() == ContextState.FAILED) {
-            if (disposer.disposeContext(path, diagnostics)) {
+            if (disposer.disposeContext(path, diagnostics, operation)) {
                 changes.add(ReconcileResult.Change.of(
                         ReconcileResult.ChangeType.REMOVED,
                         path));
@@ -441,7 +498,7 @@ public final class KnotraLoader implements AutoCloseable {
      * 关闭主体。若运行时已在释放根 Context，说明运行时 close 已经负责本次
      * teardown，Loader 只清空记账并停机，避免把竞态误报为清理失败。
      */
-    private Void performClose() throws Exception {
+    private Void performClose(LoaderOperationTracker.Operation operation) {
         List<LoaderDiagnostic> diagnostics = new ArrayList<>();
         pruneExternallyDisposed();
         if (disposer.isRuntimeClosingBase()) {
@@ -453,10 +510,10 @@ public final class KnotraLoader implements AutoCloseable {
 
         boolean converged = true;
         if (owned) {
-            converged &= disposer.disposeContext("", diagnostics);
+            converged &= disposer.disposeContext("", diagnostics, operation);
         } else {
             for (String path : topLevelPaths()) {
-                converged &= disposer.disposeContext(path, diagnostics);
+                converged &= disposer.disposeContext(path, diagnostics, operation);
             }
         }
         if (converged) {
@@ -497,11 +554,12 @@ public final class KnotraLoader implements AutoCloseable {
      */
     private boolean settleFailedDesiredContexts(
             PreparedTree desired,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         for (String path : desired.paths()) {
             if (state.context(path) != null
                     && state.context(path).state() == ContextState.FAILED) {
-                if (!disposer.disposeContext(path, diagnostics)) {
+                if (!disposer.disposeContext(path, diagnostics, operation)) {
                     return false;
                 }
             }
@@ -516,13 +574,14 @@ public final class KnotraLoader implements AutoCloseable {
     private boolean removeMissing(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         List<String> missing = state.contextPaths().stream()
                 .filter(path -> !desired.paths().contains(path))
                 .filter(this::isRemovalRoot)
                 .toList();
         for (String path : missing) {
-            if (disposer.disposeContext(path, diagnostics)) {
+            if (disposer.disposeContext(path, diagnostics, operation)) {
                 changes.add(ReconcileResult.Change.of(
                         ReconcileResult.ChangeType.REMOVED,
                         path));
@@ -560,14 +619,15 @@ public final class KnotraLoader implements AutoCloseable {
     private boolean replaceChangedFactories(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         for (String path : desired.paths()) {
             ManagedEntry old = state.entry(path);
             PreparedEntry next = desired.entry(path);
             if (old == null || old.definition().identity().equals(next.definition().identity())) {
                 continue;
             }
-            if (!replaceEntry(old, next, diagnostics)) {
+            if (!replaceEntry(old, next, diagnostics, operation)) {
                 changes.add(ReconcileResult.Change.of(
                         ReconcileResult.ChangeType.BLOCKED,
                         path));
@@ -588,13 +648,14 @@ public final class KnotraLoader implements AutoCloseable {
     private boolean replaceEntry(
             ManagedEntry old,
             PreparedEntry next,
-            List<LoaderDiagnostic> diagnostics) {
-        if (!disposer.disposeHandle(old.path(), old.handle(), diagnostics)) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
+        if (!disposer.disposeHandle(old.path(), old.handle(), diagnostics, operation)) {
             return false;
         }
         state.remove(old.path());
 
-        MountResult mounted = mounter.mount(next, old.context(), diagnostics);
+        MountResult mounted = mounter.mount(next, old.context(), diagnostics, operation);
         if (mounted.mounted()) {
             state.register(mounted.attempt());
             if (mounted.attempt().handle().state() == ComponentState.FAILED) {
@@ -613,7 +674,7 @@ public final class KnotraLoader implements AutoCloseable {
 
         PreparedEntry fallback = PreparedEntry.fromManaged(old);
         List<LoaderDiagnostic> compensation = new ArrayList<>();
-        MountResult restored = mounter.mount(fallback, old.context(), compensation);
+        MountResult restored = mounter.mount(fallback, old.context(), compensation, operation);
         if (restored.mounted()) {
             state.register(restored.attempt());
             diagnostics.add(LoaderDiagnostic.of(
@@ -638,7 +699,8 @@ public final class KnotraLoader implements AutoCloseable {
     private boolean addMissing(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         List<String> missing = desired.paths().stream()
                 .filter(path -> !state.hasEntry(path))
                 .toList();
@@ -647,7 +709,7 @@ public final class KnotraLoader implements AutoCloseable {
         }
 
         Map<String, ContextHandle> created = new LinkedHashMap<>();
-        if (!createMissingContexts(missing, created, diagnostics)) {
+        if (!createMissingContexts(missing, created, diagnostics, operation)) {
             return false;
         }
 
@@ -656,7 +718,7 @@ public final class KnotraLoader implements AutoCloseable {
             for (String path : missing) {
                 PreparedEntry entry = desired.entry(path);
                 ContextHandle context = state.context(path);
-                MountResult attempt = mounter.mount(entry, context, diagnostics);
+                MountResult attempt = mounter.mount(entry, context, diagnostics, operation);
                 if (attempt.committedUnsettled()) {
                     // 本批存在已提交但未收敛的挂载：回滚可能无法完成，
                     // 保留全部记账，等待后续 reconcile/close 继续收敛。
@@ -666,7 +728,7 @@ public final class KnotraLoader implements AutoCloseable {
                     return false;
                 }
                 if (!attempt.mounted()) {
-                    mounter.rollbackAdd(mounted, created, diagnostics);
+                    mounter.rollbackAdd(mounted, created, diagnostics, operation);
                     return false;
                 }
                 ManagedEntry managed = state.register(attempt.attempt());
@@ -681,7 +743,7 @@ public final class KnotraLoader implements AutoCloseable {
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     "",
                     safeError(error)));
-            mounter.rollbackAdd(mounted, created, diagnostics);
+            mounter.rollbackAdd(mounted, created, diagnostics, operation);
             return false;
         } finally {
             state.republish();
@@ -695,7 +757,8 @@ public final class KnotraLoader implements AutoCloseable {
     private boolean createMissingContexts(
             List<String> missing,
             Map<String, ContextHandle> created,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         Map<String, ContextHandle> provisional = new LinkedHashMap<>();
         TransactionReceipt<ContextHandle> receipt;
         try {
@@ -729,13 +792,19 @@ public final class KnotraLoader implements AutoCloseable {
         }
         SettlementReport report;
         try {
+            operation.phase(
+                    LoaderOperationTracker.Phase.CONTEXT_SETTLEMENT,
+                    loaderId,
+                    missing.isEmpty() ? "" : missing.getFirst(),
+                    "",
+                    timeouts.settlement());
             report = receipt.awaitSettled(timeouts.settlement());
         } catch (Exception error) {
             diagnostics.add(LoaderDiagnostic.of(
                     LoaderDiagnosticCode.STRUCTURE_REJECTED,
                     missing.getFirst(),
                     "context settlement failed: " + safeError(error)));
-            mounter.rollbackCreatedContexts(created, diagnostics);
+            mounter.rollbackCreatedContexts(created, diagnostics, operation);
             return false;
         }
         if (settlementIndicatesFailure(report)) {
@@ -744,7 +813,7 @@ public final class KnotraLoader implements AutoCloseable {
                     missing.getFirst(),
                     diagnostics,
                     report);
-            mounter.rollbackCreatedContexts(created, diagnostics);
+            mounter.rollbackCreatedContexts(created, diagnostics, operation);
             return false;
         }
         state.putContexts(provisional);
@@ -778,7 +847,8 @@ public final class KnotraLoader implements AutoCloseable {
     private void updateConfigs(
             PreparedTree desired,
             List<ReconcileResult.Change> changes,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         for (String path : desired.paths()) {
             ManagedEntry managed = state.entry(path);
             PreparedEntry desiredEntry = desired.entry(path);
@@ -803,6 +873,13 @@ public final class KnotraLoader implements AutoCloseable {
                 continue;
             }
             try {
+                String handleId = managed.handle().handleId();
+                operation.phase(
+                        LoaderOperationTracker.Phase.RECONFIGURE,
+                        handleId,
+                        path,
+                        handleId,
+                        Duration.ZERO);
                 ComponentState state = desiredEntry.definition()
                         .reconfigureStrategy()
                         .reconfigureAsync(managed.handle(), desiredEntry.typedConfig())

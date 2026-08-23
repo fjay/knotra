@@ -1,5 +1,6 @@
 package io.knotra.loader;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -16,6 +17,9 @@ import io.knotra.MountHandle;
 /**
  * Loader 的释放协作类：负责单个句柄 / Context 的释放结算，以及运行时整体关闭
  * 接管释放时的有界等待。释放成功后同步 {@link LoaderStateStore} 记账并重发视图。
+ *
+ * <p>每个同步等待前后都会推进挂起操作令牌的阶段（dispose-handle / dispose-context /
+ * runtime-owned），令牌由调用方显式传入，不使用 ThreadLocal。</p>
  */
 final class LoaderDisposer {
 
@@ -57,11 +61,18 @@ final class LoaderDisposer {
     boolean disposeHandle(
             String path,
             MountHandle handle,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         if (handle.state() == ComponentState.DISPOSED) {
             return true;
         }
         try {
+            operation.phase(
+                    LoaderOperationTracker.Phase.DISPOSE_HANDLE,
+                    handle.handleId(),
+                    path,
+                    handle.handleId(),
+                    Duration.ZERO);
             ComponentState settled = bestEffortRelease(handle)
                     .toCompletableFuture()
                     .get();
@@ -75,7 +86,7 @@ final class LoaderDisposer {
             return false;
         } catch (Exception error) {
             if (runtimeOwnsDisposalNow()
-                    && awaitRuntimeOwnedHandleDisposal(handle)) {
+                    && awaitRuntimeOwnedHandleDisposal(path, handle, operation)) {
                 return true;
             }
             LoaderDiagnosticMapper.addAsyncDiagnostics(
@@ -87,11 +98,12 @@ final class LoaderDisposer {
     /** 释放路径对应的 Context；空路径表示 owned 模式的基础 Context。 */
     boolean disposeContext(
             String path,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         ContextHandle context = path.isEmpty()
                 ? baseContext
                 : state.context(path);
-        return disposeHandlelessContext(path, context, diagnostics);
+        return disposeHandlelessContext(path, context, diagnostics, operation);
     }
 
     /**
@@ -101,7 +113,8 @@ final class LoaderDisposer {
     boolean disposeHandlelessContext(
             String path,
             ContextHandle context,
-            List<LoaderDiagnostic> diagnostics) {
+            List<LoaderDiagnostic> diagnostics,
+            LoaderOperationTracker.Operation operation) {
         if (context == null) {
             return true;
         }
@@ -111,6 +124,12 @@ final class LoaderDisposer {
             return true;
         }
         try {
+            operation.phase(
+                    LoaderOperationTracker.Phase.DISPOSE_CONTEXT,
+                    context.contextId(),
+                    path,
+                    context.contextId(),
+                    Duration.ZERO);
             ContextState settled = context.disposeAsync().toCompletableFuture().get();
             if (settled != ContextState.DISPOSED) {
                 diagnostics.add(LoaderDiagnostic.of(
@@ -121,7 +140,7 @@ final class LoaderDisposer {
             }
         } catch (Exception error) {
             if (runtimeOwnsDisposalNow()
-                    && awaitRuntimeOwnedContextDisposal(context)) {
+                    && awaitRuntimeOwnedContextDisposal(path, context, operation)) {
                 state.prune(path);
                 state.republish();
                 return true;
@@ -163,8 +182,17 @@ final class LoaderDisposer {
     }
 
     /** 有界等待运行时接管的句柄释放完成；未在时限内到达 DISPOSED 视为失败。 */
-    private boolean awaitRuntimeOwnedHandleDisposal(MountHandle handle) {
+    private boolean awaitRuntimeOwnedHandleDisposal(
+            String path,
+            MountHandle handle,
+            LoaderOperationTracker.Operation operation) {
         try {
+            operation.phase(
+                    LoaderOperationTracker.Phase.RUNTIME_OWNED,
+                    handle.handleId(),
+                    path,
+                    handle.handleId(),
+                    timeouts.get().runtimeDisposal());
             ComponentState state = handle.whenSettled()
                     .toCompletableFuture()
                     .get(timeouts.get().runtimeDisposal().toMillis(), TimeUnit.MILLISECONDS);
@@ -175,10 +203,19 @@ final class LoaderDisposer {
     }
 
     /** 有界等待运行时接管的 Context 释放完成。 */
-    private boolean awaitRuntimeOwnedContextDisposal(ContextHandle context) {
+    private boolean awaitRuntimeOwnedContextDisposal(
+            String path,
+            ContextHandle context,
+            LoaderOperationTracker.Operation operation) {
         CompletableFuture<Void> settled = new CompletableFuture<>();
         pollContextDisposal(context, settled, timeouts.get().contextPollTicks());
         try {
+            operation.phase(
+                    LoaderOperationTracker.Phase.RUNTIME_OWNED,
+                    context.contextId(),
+                    path,
+                    context.contextId(),
+                    timeouts.get().runtimeDisposal());
             settled.get(timeouts.get().runtimeDisposal().toMillis(), TimeUnit.MILLISECONDS);
             return true;
         } catch (Exception error) {

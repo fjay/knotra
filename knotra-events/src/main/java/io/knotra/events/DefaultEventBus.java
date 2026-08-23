@@ -1,5 +1,8 @@
 package io.knotra.events;
 
+import io.knotra.PendingOperationsSnapshot;
+
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -10,6 +13,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /**
  * EventBus 的默认实现。注册、分发接受、取消订阅和关闭都在写锁下建立线性顺序；分发一旦被接受，
@@ -20,23 +24,34 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 final class DefaultEventBus implements EventBus {
     private static final AtomicLong BUS_IDS = new AtomicLong();
+    private static final AtomicLong DISPATCH_IDS = new AtomicLong();
 
     private final String busId = "event-bus-" + BUS_IDS.incrementAndGet();
     private final ClassLoader hostContextClassLoader;
+    private final LongSupplier ticker;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private final EventBusRegistry registry;
+    private final SubscriptionDrainTracker drainTracker = new SubscriptionDrainTracker();
     // 每个已接受分发对应一个收敛租约；whenIdle/closeAsync 只等待调用前已经进入该队列的租约。
-    private final ConcurrentLinkedQueue<CompletableFuture<Void>> acceptedDispatches =
+    private final ConcurrentLinkedQueue<AcceptedDispatch> acceptedDispatches =
             new ConcurrentLinkedQueue<>();
     private final ExecutorService executor;
     private final boolean ownsExecutor;
     private boolean closed;
     private CompletableFuture<Void> closeFuture;
+    private volatile long closeStartNanos;
+    private volatile boolean dispatchDrainComplete;
 
     /** 创建自带 daemon cached pool 的总线；组件 Activation 当前使用该独立执行器策略。 */
     DefaultEventBus() {
+        this(System::nanoTime);
+    }
+
+    /** 包内测试可注入单调时钟；生产路径始终使用 System.nanoTime()。 */
+    DefaultEventBus(LongSupplier ticker) {
         this.hostContextClassLoader = Thread.currentThread().getContextClassLoader();
-        this.registry = new EventBusRegistry(lock);
+        this.ticker = Objects.requireNonNull(ticker, "ticker");
+        this.registry = new EventBusRegistry(lock, drainTracker);
         this.executor = Executors.newCachedThreadPool(task -> {
             Thread thread = new Thread(task, busId + "-worker");
             thread.setDaemon(true);
@@ -48,8 +63,14 @@ final class DefaultEventBus implements EventBus {
 
     /** 复用宿主执行器；线程池尺寸、线程工厂和关闭策略均由宿主装配决定。 */
     DefaultEventBus(ExecutorService executor, boolean ownsExecutor) {
+        this(executor, ownsExecutor, System::nanoTime);
+    }
+
+    /** 包内测试可注入单调时钟；生产路径始终使用 System.nanoTime()。 */
+    DefaultEventBus(ExecutorService executor, boolean ownsExecutor, LongSupplier ticker) {
         this.hostContextClassLoader = Thread.currentThread().getContextClassLoader();
-        this.registry = new EventBusRegistry(lock);
+        this.ticker = Objects.requireNonNull(ticker, "ticker");
+        this.registry = new EventBusRegistry(lock, drainTracker);
         this.executor = Objects.requireNonNull(executor, "executor");
         this.ownsExecutor = ownsExecutor;
     }
@@ -224,6 +245,39 @@ final class DefaultEventBus implements EventBus {
     }
 
     @Override
+    public PendingOperationsSnapshot pendingOperations() {
+        long now = ticker.getAsLong();
+        boolean closeRequested;
+        CompletableFuture<Void> closeState;
+        // 短读锁只用于读取关闭观察边界；操作列表来自并发结构，调用者不需要全局原子性。
+        lock.readLock().lock();
+        try {
+            closeRequested = closed;
+            closeState = closeFuture;
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        List<PendingOperationsSnapshot.Operation> operations = new ArrayList<>();
+        for (AcceptedDispatch dispatch : acceptedDispatches) {
+            if (!dispatch.settled().isDone()) {
+                operations.add(dispatch.toOperation(now));
+            }
+        }
+        operations.addAll(drainTracker.operations(now));
+        if (closeState != null && !closeState.isDone()
+                && ownsExecutor && dispatchDrainComplete) {
+            operations.add(new PendingOperationsSnapshot.Operation(
+                    PendingOperationsSnapshot.Kind.EVENT_SUBSCRIPTION_DRAIN,
+                    busId,
+                    PendingOperationsSnapshot.WaitType.EXECUTOR_TERMINATION,
+                    Duration.ofNanos(Math.max(0L, now - closeStartNanos)),
+                    "waiting for owned executor termination"));
+        }
+        return new PendingOperationsSnapshot(closeRequested || closeState != null, operations, 0);
+    }
+
+    @Override
     public CompletionStage<Void> whenIdle() {
         // 使用写锁截取待等待租约，保证快照完成前不会有新的分发被接受；空快照可顺带清理空绑定。
         lock.writeLock().lock();
@@ -247,6 +301,7 @@ final class DefaultEventBus implements EventBus {
         try {
             if (closeFuture == null) {
                 closed = true;
+                closeStartNanos = ticker.getAsLong();
                 closeFuture = new CompletableFuture<>();
                 owner = true;
                 pending = snapshotAcceptedDispatches();
@@ -265,6 +320,7 @@ final class DefaultEventBus implements EventBus {
                         if (error != null) {
                             closeFuture.completeExceptionally(error);
                         } else {
+                            dispatchDrainComplete = true;
                             stopOwnedExecutor();
                         }
                     });
@@ -330,7 +386,16 @@ final class DefaultEventBus implements EventBus {
                 List<RegisteredSubscription> matching = registry.matching(
                         definition.name(), binding.eventType(), mode);
                 T typedEvent = definition.eventType().cast(event);
-                CompletableFuture<Void> dispatch = new CompletableFuture<>();
+                // 元数据在写锁内提前字符串化：队列只保存稳定文本与收敛 future，
+                // 不引用事件值、监听对象、事件 Class 或 ClassLoader。
+                AcceptedDispatch dispatch = new AcceptedDispatch(
+                        "event-dispatch-" + busId + "-" + DISPATCH_IDS.incrementAndGet(),
+                        definition.name(),
+                        binding.eventType().getName(),
+                        mode,
+                        subscriptionIds(matching),
+                        ticker.getAsLong(),
+                        new CompletableFuture<Void>());
                 for (RegisteredSubscription subscription : matching) {
                     subscription.accept(dispatch);
                 }
@@ -358,17 +423,25 @@ final class DefaultEventBus implements EventBus {
         for (RegisteredSubscription subscription : accepted.listeners()) {
             subscription.release(accepted.dispatch());
         }
-        accepted.dispatch().complete(null);
+        accepted.dispatch().settled().complete(null);
     }
 
     private List<CompletableFuture<Void>> snapshotAcceptedDispatches() {
         List<CompletableFuture<Void>> result = new ArrayList<>();
-        for (CompletableFuture<Void> dispatch : acceptedDispatches) {
-            if (!dispatch.isDone()) {
-                result.add(dispatch);
+        for (AcceptedDispatch dispatch : acceptedDispatches) {
+            if (!dispatch.settled().isDone()) {
+                result.add(dispatch.settled());
             }
         }
         return result;
+    }
+
+    private static List<String> subscriptionIds(List<RegisteredSubscription> subscriptions) {
+        List<String> ids = new ArrayList<>(subscriptions.size());
+        for (RegisteredSubscription subscription : subscriptions) {
+            ids.add(subscription.subscriptionId());
+        }
+        return ids;
     }
 
     private static <T> CompletionStage<EventDispatch<T>> failed(Throwable error) {
@@ -379,7 +452,7 @@ final class DefaultEventBus implements EventBus {
     private record Accepted<T>(
             T event,
             List<RegisteredSubscription> listeners,
-            CompletableFuture<Void> dispatch,
+            AcceptedDispatch dispatch,
             EventBinding binding) {
 
         Accepted {

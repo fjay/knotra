@@ -5,10 +5,10 @@ import java.util.Objects;
 /**
  * 类型化 Capability 的标识，由名称与合约 Java 类型组成。
  *
- * <p>Capability 是类型化的命名值：名称在 Runtime 生命周期内绑定唯一的合约类型，
- * 即使以相等的值重新注册，也会为消费方产生新的绑定代际。本记录不可变且具有值相等语义；
- * 自然顺序先按名称、再按类型二进制名排序，保证输出稳定。紧凑构造函数要求名称非空非空白，
- * 类型非空且不支持 primitive。
+ * <p>Capability 是类型化的命名值。名称与类型的身份只在仍有 live 注册或组件需求占用期间固定；
+ * 全部释放后，该名称可由新 ClassLoader 加载的同名合约类型重新绑定，从而避免已发布内核状态
+ * 永久持有旧插件类型。本记录不可变且具有值相等语义；自然顺序先按名称、再按类型二进制名排序，
+ * 保证输出稳定。紧凑构造函数要求名称非空非空白，类型非空且不支持 primitive。</p>
  */
 public final record CapabilityKey<T>(String name, Class<T> type) implements Comparable<CapabilityKey<T>> {
 

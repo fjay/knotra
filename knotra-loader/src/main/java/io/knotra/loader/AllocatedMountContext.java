@@ -50,6 +50,8 @@ final class AllocatedMountContext implements ControlledMountContext {
     private final AtomicBoolean used = new AtomicBoolean();
     private volatile SettlementReport lastReport;
     private volatile MountHandle committed;
+    /** 可选的挂起操作令牌；仅推进诊断阶段，不影响挂载行为。 */
+    private final LoaderOperationTracker.Operation operation;
 
     AllocatedMountContext(
             KnotraRuntime runtime,
@@ -64,11 +66,22 @@ final class AllocatedMountContext implements ControlledMountContext {
             String mountId,
             Duration settlementTimeout,
             Duration recoveryTimeout) {
+        this(runtime, context, mountId, settlementTimeout, recoveryTimeout, null);
+    }
+
+    AllocatedMountContext(
+            KnotraRuntime runtime,
+            ContextHandle context,
+            String mountId,
+            Duration settlementTimeout,
+            Duration recoveryTimeout,
+            LoaderOperationTracker.Operation operation) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.context = Objects.requireNonNull(context, "context");
         this.mountId = Objects.requireNonNull(mountId, "mountId");
         this.settlementTimeout = requirePositive(settlementTimeout, "settlementTimeout");
         this.recoveryTimeout = requirePositive(recoveryTimeout, "recoveryTimeout");
+        this.operation = operation;
     }
 
     private static Duration requirePositive(Duration value, String name) {
@@ -169,6 +182,16 @@ final class AllocatedMountContext implements ControlledMountContext {
     private <H extends MountHandle> H awaitMount(TransactionReceipt<H> receipt) {
         SettlementReport report;
         try {
+            if (operation != null) {
+                // Settlement 开始时句柄已由 receipt 携带：只即时抽取稳定文本，
+                // 追踪器与上下文都不保存句柄引用；mountId 即 normalized path。
+                operation.phase(
+                        LoaderOperationTracker.Phase.MOUNT_SETTLEMENT,
+                        receipt.value().handleId(),
+                        mountId,
+                        mountId,
+                        settlementTimeout);
+            }
             report = receipt.awaitSettled(settlementTimeout);
         } catch (RuntimeException error) {
             throw unsettled(receipt.value(), error);
@@ -204,6 +227,14 @@ final class AllocatedMountContext implements ControlledMountContext {
             ComponentState state = handle.state();
             if (state == ComponentState.DISPOSED) {
                 return true;
+            }
+            if (operation != null) {
+                operation.phase(
+                        LoaderOperationTracker.Phase.DISPOSE_HANDLE,
+                        handle.handleId(),
+                        mountId,
+                        handle.handleId(),
+                        recoveryTimeout);
             }
             CompletionStage<ComponentState> cleanup = state == ComponentState.FAILED
                     && handle.goal() == ComponentGoal.DISPOSED

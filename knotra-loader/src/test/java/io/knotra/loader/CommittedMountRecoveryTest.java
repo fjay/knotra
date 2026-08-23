@@ -28,6 +28,7 @@ import io.knotra.MountHandle;
 import io.knotra.MountOptions;
 import io.knotra.NoConfig;
 import io.knotra.PublicationChange;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.RuntimeTransaction;
 import io.knotra.Settlement;
@@ -285,6 +286,11 @@ final class CommittedMountRecoveryTest {
             @Override
             public ContextHandle childContext(ContextHandle parent, String name) {
                 throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public PendingOperationsSnapshot pendingOperations() {
+                return new PendingOperationsSnapshot(false, List.of(), 0);
             }
         };
         return new KnotraRuntime() {

@@ -197,7 +197,8 @@ final class P0ReviewRegressionTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
         runtime.executor.shutdown();
-        ComponentRuntime queuedRuntime = runtime.components.get(queued.handleId());
+        ComponentRuntime queuedRuntime = runtime.publishedState()
+                .index.components.get(queued.handleId());
         ComponentRuntime.Reservation queuedReservation = queuedRuntime.reserveTransition(
                 System.nanoTime(), "test transition");
         queuedRuntime.executeReserved(
@@ -208,7 +209,8 @@ final class P0ReviewRegressionTest {
         assertTrue(queuedFailure.getCause() instanceof TransitionRejectedStateException);
         assertTrue(queuedRuntime.noLongerOwnsTransition(queuedReservation.future()));
 
-        ComponentRuntime immediateRuntime = runtime.components.get(immediate.handleId());
+        ComponentRuntime immediateRuntime = runtime.publishedState()
+                .index.components.get(immediate.handleId());
         ComponentRuntime.Reservation immediateReservation =
                 immediateRuntime.reserveTransition(
                         System.nanoTime(), "test transition");
@@ -229,10 +231,11 @@ final class P0ReviewRegressionTest {
                 .value();
         assertEquals(ComponentState.ACTIVE, handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        ComponentRuntime component = runtime.components.get(handle.handleId());
+        ComponentRuntime component = runtime.publishedState()
+                .index.components.get(handle.handleId());
+        handle.disposeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         ComponentRuntime.Reservation reservation = component.reserveTransition(
                 System.nanoTime(), "test transition");
-        runtime.components.remove(handle.handleId());
         runtime.driveTransition(component, reservation.future());
         assertEquals(ComponentState.DISPOSED, reservation.future()
                 .get(10, TimeUnit.SECONDS));
@@ -240,7 +243,8 @@ final class P0ReviewRegressionTest {
     }
 
     private void assertNoOrphanedStopping(MountHandle handle) {
-        ComponentRuntime component = runtime.components.get(handle.handleId());
+        ComponentRuntime component = runtime.publishedState()
+                .index.components.get(handle.handleId());
         if (handle.state() == ComponentState.STOPPING) {
             assertTrue(component != null && component.transitionDiagnostic().contains("slot="),
                     () -> handle.handleId() + " is STOPPING without a transition slot");

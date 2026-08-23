@@ -139,7 +139,8 @@ final class TransitionRaceRegressionTest {
     }
 
     private String diagnostic(int round, MountHandle handle) {
-        ComponentRuntime component = runtime.components.get(handle.handleId());
+        ComponentRuntime component = runtime.publishedState()
+                .index.components.get(handle.handleId());
         return "round=" + round
                 + " state=" + handle.state()
                 + " transition=" + (component == null

@@ -16,11 +16,12 @@ final class DynamicCapabilityBroker {
 
     boolean isDynamicAvailable(ActivationRuntime activation, CapabilityKey<?> key) {
         synchronized (runtime.coordinator) {
+            PublishedKernelState state = runtime.publishedState();
             if (activation.dynamicCalls.isClosed()
-                    || !dynamicConsumerActiveLocked(activation)) {
+                    || !dynamicConsumerActiveLocked(activation, state)) {
                 return false;
             }
-            RuntimeView current = runtime.currentView();
+            RuntimeView current = state.view;
             return current.resolve(activation.owner.contextId, key).isPresent();
         }
     }
@@ -33,8 +34,10 @@ final class DynamicCapabilityBroker {
                         "dynamic capability activation is closed: " + key.name(),
                         key.name());
             }
-            boolean consumerActive = dynamicConsumerActiveLocked(activation);
-            RuntimeView current = runtime.currentView();
+            PublishedKernelState state = runtime.publishedState();
+            boolean consumerActive =
+                    dynamicConsumerActiveLocked(activation, state);
+            RuntimeView current = state.view;
             RuntimeView.RegistrationData registration =
                     consumerActive
                             ? current.resolve(activation.owner.contextId, key).orElse(null)
@@ -61,8 +64,10 @@ final class DynamicCapabilityBroker {
         }
     }
 
-    private boolean dynamicConsumerActiveLocked(ActivationRuntime activation) {
-        RuntimeView current = runtime.currentView();
+    private boolean dynamicConsumerActiveLocked(
+            ActivationRuntime activation,
+            PublishedKernelState state) {
+        RuntimeView current = state.view;
         RuntimeView.ComponentData component =
                 current.components.get(activation.owner.handleId);
         if (component == null || !activation.activationId.equals(component.currentActivationId())) {

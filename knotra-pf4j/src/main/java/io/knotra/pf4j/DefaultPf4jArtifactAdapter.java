@@ -10,6 +10,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 import io.knotra.ComponentFactory;
@@ -20,6 +22,7 @@ import io.knotra.KnotraRuntime;
 import io.knotra.MountHandle;
 import io.knotra.MountOptions;
 import io.knotra.NoConfig;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.RuntimeTransaction;
 import io.knotra.TransactionRejectedException;
 import io.knotra.pf4j.spi.ExportedComponentFactory;
@@ -39,11 +42,15 @@ import org.pf4j.PluginWrapper;
  */
 final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
 
+    private static final AtomicLong NEXT_ADAPTER_ID = new AtomicLong();
+
     private final PluginManager pluginManager;
     private final ArtifactCoordinator coordinator;
     private final KnotraRuntime runtime;
     private final KnotraClassLoaderPolicy classLoaderPolicy;
-    private final ManagedArtifactStore store = new ManagedArtifactStore();
+    private final String adapterId;
+    private final PendingOperationTracker pendingTracker;
+    private final ManagedArtifactStore store;
     private final Pf4jClosureResolver closureResolver;
     private final ArtifactDrainService drainService;
     private final CatalogFacade factoryCatalog =
@@ -56,18 +63,13 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             Path pluginsRoot,
             KnotraRuntime runtime,
             Set<String> sharedContractPackages) {
-        Objects.requireNonNull(pluginsRoot, "pluginsRoot");
-        this.runtime = Objects.requireNonNull(runtime, "runtime");
-        this.classLoaderPolicy = KnotraClassLoaderPolicy.forHost(sharedContractPackages);
-        this.pluginManager = new SharedContractPluginManager(pluginsRoot, classLoaderPolicy);
-        this.coordinator = new ArtifactCoordinator();
-        this.closureResolver = new Pf4jClosureResolver(pluginManager);
-        this.drainService = new ArtifactDrainService(
-                pluginManager,
-                coordinator,
-                runtime,
-                store,
-                closeStarted::get);
+        this(new SharedContractPluginManager(
+                Objects.requireNonNull(pluginsRoot, "pluginsRoot"),
+                KnotraClassLoaderPolicy.forHost(sharedContractPackages)),
+                new ArtifactCoordinator(),
+                requireRuntime(runtime),
+                KnotraClassLoaderPolicy.forHost(sharedContractPackages),
+                System::nanoTime);
     }
 
     DefaultPf4jArtifactAdapter(
@@ -75,16 +77,29 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             ArtifactCoordinator coordinator,
             KnotraRuntime runtime,
             KnotraClassLoaderPolicy policy) {
+        this(pluginManager, coordinator, runtime, policy, System::nanoTime);
+    }
+
+    DefaultPf4jArtifactAdapter(
+            PluginManager pluginManager,
+            ArtifactCoordinator coordinator,
+            KnotraRuntime runtime,
+            KnotraClassLoaderPolicy policy,
+            LongSupplier ticker) {
         this.pluginManager = Objects.requireNonNull(pluginManager, "pluginManager");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.classLoaderPolicy = Objects.requireNonNull(policy, "policy");
+        this.adapterId = "pf4j-adapter-" + NEXT_ADAPTER_ID.incrementAndGet();
+        this.pendingTracker = new PendingOperationTracker(ticker);
+        this.store = new ManagedArtifactStore(pendingTracker);
         this.closureResolver = new Pf4jClosureResolver(pluginManager);
         this.drainService = new ArtifactDrainService(
                 pluginManager,
                 coordinator,
                 runtime,
                 store,
+                pendingTracker,
                 closeStarted::get);
     }
 
@@ -171,6 +186,15 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
     }
 
     @Override
+    public PendingOperationsSnapshot pendingOperations() {
+        return pendingTracker.snapshot(
+                closeStarted.get(),
+                adapterId,
+                coordinator.pendingOperations(),
+                store::pendingMetadata);
+    }
+
+    @Override
     public Optional<ArtifactSnapshot> artifact(String artifactId) {
         Objects.requireNonNull(artifactId, "artifactId");
         if (coordinator.isStopped()) {
@@ -216,14 +240,23 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             attempt = new CompletableFuture<>();
             closeFuture = attempt;
         }
+        pendingTracker.beginDrain(
+                attempt,
+                adapterId,
+                "close-schedule-coordinator",
+                List.of(adapterId));
+        attempt.whenComplete((ignored, error) -> pendingTracker.endDrain(attempt));
 
         List<String> ids;
         try {
-            ids = coordinator.submit(store::activeArtifactIds).join();
+            ids = coordinator.submit(adapterId, store::activeArtifactIds).join();
+            pendingTracker.updateDrain(attempt, "coordinator", List.of(adapterId));
         } catch (Throwable failure) {
             clearFailedCloseAttempt(attempt);
             attempt.completeExceptionally(failure);
             return attempt;
+        } finally {
+            pendingTracker.endDrain(attempt);
         }
 
         if (ids.isEmpty()) {
@@ -578,6 +611,10 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         return store.ownershipCoordinated(
                 artifactId,
                 () -> runtime.advanced().snapshot());
+    }
+
+    private static KnotraRuntime requireRuntime(KnotraRuntime runtime) {
+        return Objects.requireNonNull(runtime, "runtime");
     }
 
     private String pf4jState(String artifactId) {

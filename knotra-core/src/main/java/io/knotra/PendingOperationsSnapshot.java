@@ -129,7 +129,8 @@ public record PendingOperationsSnapshot(
         MOUNTS_IN_FLIGHT,
         PF4J_STOP_UNLOAD,
         COORDINATOR,
-        EXECUTOR_TERMINATION
+        EXECUTOR_TERMINATION,
+        USER_CALLBACK
     }
 
     private static String requireText(String value, String name) {

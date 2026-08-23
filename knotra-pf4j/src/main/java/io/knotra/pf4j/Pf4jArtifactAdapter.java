@@ -8,6 +8,7 @@ import java.util.concurrent.CompletionStage;
 
 import io.knotra.AsyncCloseable;
 import io.knotra.KnotraRuntime;
+import io.knotra.PendingOperationsSnapshot;
 
 /**
  * PF4J artifact 边界的公开适配器合约。
@@ -50,12 +51,31 @@ public interface Pf4jArtifactAdapter extends AsyncCloseable {
 
     List<ArtifactSnapshot> artifactsInState(ArtifactState state);
 
+    /**
+     * 返回 adapter 当前挂起操作的 point-in-time 纯文本快照，包括仍在协调器上排队或
+     * 运行中的操作。实现必须返回自身真实状态，不得用空默认值掩盖卡死的排空。
+     *
+     * <p>该方法可在任意状态调用，不驱动协调器或 PF4J，也不改变 close 语义。</p>
+     */
+    PendingOperationsSnapshot pendingOperations();
+
     Optional<ArtifactSnapshot> artifact(String artifactId);
 
     Optional<ArtifactDiagnostic> diagnostic(String artifactId);
 
     List<ArtifactOwnership> ownership(String artifactId);
 
+    /**
+     * 异步排空全部 artifact 并关闭适配器。
+     *
+     * <p>与 {@code runtime.closeAsync()} 并发时，runtime 接管的组件清理由
+     * 适配器内部等待其收敛，接管拒绝不会泄漏成本方法的失败。</p>
+     *
+     * <p><strong>禁止</strong>在同一 runtime 的组件生命周期回调（start、清理、
+     * 事件监听）中阻塞等待本方法或 {@code unload/retryDrain} 完成：runtime.close 的
+     * 收敛依赖回调返回，回调又等待适配器排空，二者互等会形成无法收敛的环。
+     * 适配器的关闭必须由宿主线程在回调之外发起。</p>
+     */
     CompletionStage<Void> closeAsync();
 
     @Override

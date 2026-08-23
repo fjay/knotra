@@ -50,8 +50,9 @@ final class DiagnosticSupport {
 
     void refresh(RuntimeView.Draft draft) {
         java.util.List<RuntimeDiagnostic> diagnostics = new java.util.ArrayList<>();
+        ExecutionIndex index = runtime.publishedState().index;
         for (RuntimeView.ComponentData component : draft.components.values()) {
-            collectComponentDiagnostics(draft, component, diagnostics);
+            collectComponentDiagnostics(draft, component, diagnostics, index);
         }
         draft.diagnostics.clear();
         draft.diagnostics.addAll(diagnostics.stream().sorted().toList());
@@ -60,20 +61,22 @@ final class DiagnosticSupport {
     private void collectComponentDiagnostics(
             RuntimeView.Draft draft,
             RuntimeView.ComponentData component,
-            java.util.List<RuntimeDiagnostic> diagnostics) {
+            java.util.List<RuntimeDiagnostic> diagnostics,
+            ExecutionIndex index) {
         if (component.state() == io.knotra.ComponentState.WAITING
                 && component.goal() == io.knotra.ComponentGoal.RUNNING) {
-            collectWaitingDiagnostics(draft, component, diagnostics);
+            collectWaitingDiagnostics(draft, component, diagnostics, index);
         }
         if (component.state() == io.knotra.ComponentState.FAILED) {
-            collectFailureDiagnostics(component, diagnostics);
+            collectFailureDiagnostics(component, diagnostics, index);
         }
     }
 
     private void collectWaitingDiagnostics(
             RuntimeView.Draft draft,
             RuntimeView.ComponentData component,
-            java.util.List<RuntimeDiagnostic> diagnostics) {
+            java.util.List<RuntimeDiagnostic> diagnostics,
+            ExecutionIndex index) {
         for (io.knotra.CapabilityRequirement requirement
                 : component.descriptor().sortedRequirements()) {
             if (requirement.mode() != io.knotra.CapabilityRequirement.Mode.REQUIRED) {
@@ -90,7 +93,7 @@ final class DiagnosticSupport {
                                 + requirement.key().name()));
             }
         }
-        ComponentRuntime runtimeComponent = runtime.components.get(component.handleId());
+        ComponentRuntime runtimeComponent = index.components.get(component.handleId());
         if (runtimeComponent != null && runtimeComponent.blockedNonConvergent) {
             diagnostics.add(new RuntimeDiagnostic(
                     DiagnosticCode.NON_CONVERGENT_RECONCILE,
@@ -110,8 +113,9 @@ final class DiagnosticSupport {
 
     private void collectFailureDiagnostics(
             RuntimeView.ComponentData component,
-            java.util.List<RuntimeDiagnostic> diagnostics) {
-        ComponentRuntime runtimeComponent = runtime.components.get(component.handleId());
+            java.util.List<RuntimeDiagnostic> diagnostics,
+            ExecutionIndex index) {
+        ComponentRuntime runtimeComponent = index.components.get(component.handleId());
         String startError = runtimeComponent == null ? "" : runtimeComponent.lastStartError;
         String cleanupError = runtimeComponent == null ? "" : runtimeComponent.lastCleanupError;
         if (!startError.isBlank()) {

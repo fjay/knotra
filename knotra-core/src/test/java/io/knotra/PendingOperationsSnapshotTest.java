@@ -112,6 +112,18 @@ final class PendingOperationsSnapshotTest {
                                 Duration.ZERO,
                                 "detail"),
                         new PendingOperationsSnapshot.Operation(
+                                PendingOperationsSnapshot.Kind.LOADER_OPERATION,
+                                "execution",
+                                PendingOperationsSnapshot.WaitType.USER_CALLBACK,
+                                Duration.ZERO,
+                                "a"),
+                        new PendingOperationsSnapshot.Operation(
+                                PendingOperationsSnapshot.Kind.LOADER_OPERATION,
+                                "execution",
+                                PendingOperationsSnapshot.WaitType.RUNTIME_DRAIN,
+                                Duration.ZERO,
+                                "z"),
+                        new PendingOperationsSnapshot.Operation(
                                 PendingOperationsSnapshot.Kind.RUNTIME_CLOSE,
                                 "executor",
                                 PendingOperationsSnapshot.WaitType.EXECUTOR_TERMINATION,
@@ -150,6 +162,8 @@ final class PendingOperationsSnapshotTest {
                         + "ARTIFACT_MOUNT|mount|MOUNTS_IN_FLIGHT|PT0S|detail\n"
                         + "EVENT_DISPATCH|dispatch|DISPATCH|PT0S|detail\n"
                         + "EVENT_SUBSCRIPTION_DRAIN|subscription|LISTENER|PT0S|detail\n"
+                        + "LOADER_OPERATION|execution|RUNTIME_DRAIN|PT0S|z\n"
+                        + "LOADER_OPERATION|execution|USER_CALLBACK|PT0S|a\n"
                         + "LOADER_OPERATION|loader|COORDINATOR|PT0S|detail\n"
                         + "RUNTIME_CLOSE|executor|EXECUTOR_TERMINATION|PT0S|detail\n"
                         + "omitted=0",

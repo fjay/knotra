@@ -69,7 +69,8 @@ final class TransactionRecorder implements RuntimeTransaction {
         } else if (registration instanceof RegistrationHandleImpl internal) {
             handle = internal;
         } else {
-            handle = runtime.registrationHandles.get(registration.registrationId());
+            handle = runtime.publishedState().index.registrationHandles
+                    .get(registration.registrationId());
         }
 
         if (handle == null || handle.runtime != runtime) {
@@ -264,7 +265,8 @@ final class TransactionRecorder implements RuntimeTransaction {
                 return true;
             }
         }
-        return runtime.componentHandles.get(handle.handleId()) == handle;
+        return runtime.publishedState().index.componentHandles.get(handle.handleId())
+                == handle;
     }
 
     private PreparedComponent<?> preparedFor(MountHandleImpl handle) {
@@ -274,7 +276,8 @@ final class TransactionRecorder implements RuntimeTransaction {
                 return mount.prepared();
             }
         }
-        ComponentRuntime runtimeComponent = runtime.components.get(handle.handleId());
+        ComponentRuntime runtimeComponent =
+                runtime.publishedState().index.components.get(handle.handleId());
         if (runtimeComponent != null) {
             return runtimeComponent.prepared;
         }
@@ -289,10 +292,14 @@ final class TransactionRecorder implements RuntimeTransaction {
         if (provisional != null) {
             return provisional;
         }
-        ComponentRuntime runtimeComponent = runtime.components.get(handle.handleId());
+        ComponentRuntime runtimeComponent =
+                runtime.publishedState().index.components.get(handle.handleId());
         return runtimeComponent == null
                 ? new ProvisionalConfig(prepared.config(), 1)
-                : new ProvisionalConfig(runtimeComponent.desiredConfig, runtimeComponent.desiredRevision);
+                : toProvisionalConfig(runtimeComponent.desiredState());
+    }
+    private ProvisionalConfig toProvisionalConfig(DesiredComponentState desired) {
+        return new ProvisionalConfig(desired.config(), desired.revision());
     }
 
     private Object normalizeFor(PreparedComponent<?> prepared, Object rawConfig) {

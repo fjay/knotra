@@ -40,7 +40,6 @@ final class RuntimeView {
     final Map<String, RegistrationData> registrations;
     final Map<String, ComponentData> components;
     final Map<String, ActivationData> activations;
-    final Map<String, Class<?>> capabilityTypes;
     final List<RuntimeDiagnostic> diagnostics;
 
     private RuntimeView(
@@ -49,14 +48,12 @@ final class RuntimeView {
             Map<String, RegistrationData> registrations,
             Map<String, ComponentData> components,
             Map<String, ActivationData> activations,
-            Map<String, Class<?>> capabilityTypes,
             List<RuntimeDiagnostic> diagnostics) {
         this.generation = generation;
         this.contexts = Map.copyOf(contexts);
         this.registrations = Map.copyOf(registrations);
         this.components = Map.copyOf(components);
         this.activations = Map.copyOf(activations);
-        this.capabilityTypes = Map.copyOf(capabilityTypes);
         this.diagnostics = List.copyOf(diagnostics);
     }
 
@@ -68,7 +65,6 @@ final class RuntimeView {
         return new RuntimeView(
                 0,
                 contexts,
-                Map.of(),
                 Map.of(),
                 Map.of(),
                 Map.of(),
@@ -643,8 +639,25 @@ final class RuntimeView {
         final Map<String, RegistrationData> registrations;
         final Map<String, ComponentData> components;
         final Map<String, ActivationData> activations;
+        // 名称/类型身份只在仍有 live 注册或需求占用期间固定；全部释放后，允许由新
+        // ClassLoader 的同名类型重新绑定。草稿是协调器内短生命周期对象，可临时持有
+        // Class；发布后的 RuntimeView 不得保留任何 Class/ClassLoader 引用。
         final Map<String, Class<?>> capabilityTypes;
         final List<RuntimeDiagnostic> diagnostics;
+
+        private static Map<String, Class<?>> liveCapabilityTypes(RuntimeView view) {
+            Map<String, Class<?>> result = new HashMap<>();
+            view.registrations.values().forEach(registration ->
+                    result.putIfAbsent(
+                            registration.key().name(),
+                            registration.key().type()));
+            view.components.values().forEach(component ->
+                    component.descriptor().sortedRequirements().forEach(requirement ->
+                            result.putIfAbsent(
+                                    requirement.key().name(),
+                                    requirement.key().type())));
+            return result;
+        }
 
         Draft(RuntimeView view) {
             this.generation = view.generation;
@@ -652,9 +665,9 @@ final class RuntimeView {
             this.registrations = new HashMap<>(view.registrations);
             this.components = new HashMap<>(view.components);
             this.activations = new HashMap<>(view.activations);
-            this.capabilityTypes = new HashMap<>(view.capabilityTypes);
+            this.capabilityTypes = liveCapabilityTypes(view);
             this.diagnostics = new ArrayList<>(view.diagnostics);
-        }
+    }
 
         // 复用 RuntimeView 的不可变快照语义做图计算，保证草稿查询与最终发布使用同一解析规则。
         RuntimeView asView() {
@@ -664,7 +677,6 @@ final class RuntimeView {
                     registrations,
                     components,
                     activations,
-                    capabilityTypes,
                     diagnostics);
         }
 
@@ -725,7 +737,6 @@ final class RuntimeView {
                     registrations,
                     components,
                     activations,
-                    capabilityTypes,
                     diagnostics);
         }
     }

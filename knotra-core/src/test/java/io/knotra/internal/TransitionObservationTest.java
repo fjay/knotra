@@ -44,7 +44,8 @@ final class TransitionObservationTest {
         CountDownLatch release = new CountDownLatch(1);
         AtomicReference<CompletableFuture<ComponentState>> observed = new AtomicReference<>();
         runtime.transitionPublicationProbe = () -> {
-            MountHandleImpl handle = runtime.componentHandles.values().stream()
+            MountHandleImpl handle = runtime.publishedState()
+                    .index.componentHandles.values().stream()
                     .filter(candidate -> candidate.mountId().equals("observed"))
                     .findFirst()
                     .orElseThrow();
@@ -187,7 +188,8 @@ final class TransitionObservationTest {
                 .value();
         assertEquals(ComponentState.WAITING, suppressed.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        ComponentRuntime component = runtime.components.get(suppressed.handleId());
+        ComponentRuntime component = runtime.publishedState()
+                .index.components.get(suppressed.handleId());
         component.suppressAutoRestart = true;
 
         AtomicReference<io.knotra.RegistrationHandle> edge =
@@ -229,7 +231,8 @@ final class TransitionObservationTest {
                 .value();
         assertEquals(ComponentState.WAITING, suppressed.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
-        ComponentRuntime component = runtime.components.get(suppressed.handleId());
+        ComponentRuntime component = runtime.publishedState()
+                .index.components.get(suppressed.handleId());
         component.suppressAutoRestart = true;
 
         MountHandle consumer = publicRuntime.advanced().transact(transaction -> transaction.mount(
@@ -335,7 +338,8 @@ final class TransitionObservationTest {
         assertEquals(ComponentState.ACTIVE, handle.whenSettled()
                 .toCompletableFuture().get(10, TimeUnit.SECONDS));
 
-        ComponentRuntime component = runtime.components.get(handle.handleId());
+        ComponentRuntime component = runtime.publishedState()
+                .index.components.get(handle.handleId());
         ActivationRuntime activation = component.current;
         ComponentRuntime.Reservation reservation = component.replaceTransition(
                 System.nanoTime(), "test transition");
