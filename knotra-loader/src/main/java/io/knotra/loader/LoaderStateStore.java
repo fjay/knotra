@@ -12,9 +12,10 @@ import io.knotra.MountHandle;
  * Loader 的记账与发布存储：稳定路径到受管条目 / Context 的映射，以及发布给
  * {@code snapshot()} 的不可变视图。
  *
- * <p>记账映射只在协调器线程上变更；视图把条目、Context、关闭标记与最近诊断
- * 折叠为同一代不可变状态，通过一次 volatile 读发布，杜绝并发发布期间读到
- * “新条目 + 旧诊断”的撕裂组合。</p>
+ * <p>记账映射只在协调器线程上变更；视图把条目、Context 与最近诊断折叠为同一代
+ * 不可变状态，通过一次 volatile 读发布，杜绝并发发布期间读到“新条目 + 旧诊断”
+ * 的撕裂组合。关闭标记是独立的单调 volatile 状态：close 入口置位后立即对两类
+ * 观察接口可见，也不随后续视图发布回退。</p>
  */
 final class LoaderStateStore {
 
@@ -23,6 +24,7 @@ final class LoaderStateStore {
     /** 稳定路径 → Loader 创建的 Context 记账，仅在协调器线程上变更。 */
     private final TreeMap<String, ContextHandle> contexts = new TreeMap<>();
     private volatile List<LoaderDiagnostic> diagnostics = List.of();
+    /** 唯一关闭源：false → true 单调变化，不代表 close 已经完成。 */
     private volatile boolean closed;
     /** 发布给 snapshot() 的不可变视图；一次 volatile 读即可得到代际一致的状态。 */
     private volatile LoaderView view = LoaderView.EMPTY;
@@ -35,6 +37,7 @@ final class LoaderStateStore {
         return closed;
     }
 
+    /** 关闭请求已提出即置位；close 失败、重试或重复调用都不会把它置回 false。 */
     void markClosed() {
         closed = true;
     }
@@ -126,10 +129,9 @@ final class LoaderStateStore {
         republish();
     }
 
-    /** 用最近一次诊断与当前记账重发视图，供协调中途让快照跟上结构变化。 */
+    /** 用最近一次诊断与当前记账重发视图；关闭标记不参与代际发布。 */
     void republish() {
         view = new LoaderView(
-                closed,
                 Map.copyOf(current),
                 Map.copyOf(contexts),
                 diagnostics);
@@ -197,12 +199,11 @@ final class LoaderStateStore {
 
     /** 发布给 snapshot() 的不可变状态视图，条目与诊断来自同一代发布。 */
     record LoaderView(
-            boolean closed,
             Map<String, ManagedEntry> entries,
             Map<String, ContextHandle> contexts,
             List<LoaderDiagnostic> diagnostics) {
 
         private static final LoaderView EMPTY =
-                new LoaderView(false, Map.of(), Map.of(), List.of());
+                new LoaderView(Map.of(), Map.of(), List.of());
     }
 }

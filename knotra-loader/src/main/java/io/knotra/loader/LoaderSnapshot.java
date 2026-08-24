@@ -16,7 +16,7 @@ import io.knotra.ComponentState;
  * @param loaderId Loader 实例 ID
  * @param owned 是否为 owned 模式
  * @param baseContextId 基础 Context ID
- * @param closed 是否已进入关闭状态（关闭清理失败也保持 true，可重试）
+ * @param closed 是否已提出关闭请求；请求后单调保持 true，close 排队、失败或重试期间均不回退
  * @param entries 受管条目快照，按路径排序
  * @param diagnostics 最近一次操作发布的诊断，已排序
  */

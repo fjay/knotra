@@ -253,7 +253,9 @@ public final class KnotraLoader implements AutoCloseable {
      *
      * <p>快照只包含数据：条目路径、Context 与挂载标识、实现身份、配置代际、
      * 组件状态与最近诊断，不暴露存活组件实例或内部记账结构。可在协调器
-     * 之外随时调用，单次读取最近一次发布的代际一致视图。
+     * 之外随时调用，单次读取最近一次发布的代际一致视图。closed 是独立的
+     * 单调关闭观察值：closeAsync 入口提出请求后立即为 true，即使 close 仍在
+     * 队列中、被前序 reconcile 阻塞、失败后等待重试或已经完成，也不会回退。
      */
     public LoaderSnapshot snapshot() {
         LoaderStateStore.LoaderView local = state.view();
@@ -274,7 +276,7 @@ public final class KnotraLoader implements AutoCloseable {
                 loaderId,
                 owned,
                 baseContext.contextId(),
-                local.closed(),
+                state.isClosed(),
                 entries,
                 local.diagnostics());
     }
@@ -287,10 +289,10 @@ public final class KnotraLoader implements AutoCloseable {
      * close 的当前阶段、稳定目标标识与有界 detail，不引用组件、句柄、Context、
      * 工厂、配置、期望树或 ClassLoader。
      *
-     * <p>closeRequested 一旦 closeAsync 已请求即为 true 并保持粘性：close 尝试
-     * 失败后处于可重试状态时仍视为“已请求关闭”，与 {@link #snapshot()} 的
-     * closed 语义一致。各操作来自叶子锁的独立采样，不承诺全局原子性；排序
-     * 与截断由公共 DTO 构造器统一完成。
+     * <p>closeRequested 与 {@link #snapshot()} 的 closed 读取同一个单调关闭源：
+     * closeAsync 入口提出请求后立即为 true，即使 close 仍在队列中、被前序
+     * reconcile 阻塞、失败后等待重试或已经完成，也不会回退。各操作来自叶子锁
+     * 的独立采样，不承诺全局原子性；排序与截断由公共 DTO 构造器统一完成。
      */
     public PendingOperationsSnapshot pendingOperations() {
         return operationTracker.snapshot(ticker.getAsLong(), state.isClosed());
@@ -300,10 +302,11 @@ public final class KnotraLoader implements AutoCloseable {
      * 异步关闭 Loader 并释放其管理的结构。
      *
      * <p>owned 模式整体释放基础 Context；over 模式只释放自己创建的顶层子树。
-     * 清理失败不会伪造成功：close future 异常完成，closed 状态与诊断保留，
-     * 可再次调用 close 重试。与运行时 close 的竞态会收敛：若运行时已在释放
-     * 根 Context，Loader 只同步记账，不把该竞态报告为失败。重复调用返回
-     * 同一个未完成（或已成功）的 close future。
+     * 请求一旦进入本方法，closed 与 closeRequested 立即变为 true；close 排队
+     * 或被前序 reconcile 阻塞期间同样如此。清理失败不会伪造成功：close future
+     * 异常完成，关闭观察值与诊断保留，可再次调用 close 重试。与运行时 close
+     * 的竞态会收敛：若运行时已在释放根 Context，Loader 只同步记账，不把该竞态
+     * 报告为失败。重复调用返回同一个未完成（或已成功）的 close future。
      */
     public CompletionStage<Void> closeAsync() {
         rejectReentrant("close");

@@ -54,13 +54,35 @@ final class LoaderPendingOperationsTest {
                 "blocked", (context, config) -> gate.join());
         KnotraLoader loader = KnotraLoader.over(runtime, runtime.root(),
                 LoaderTestKit.resolver(ref, factory));
+        ExecutorService readers = Executors.newFixedThreadPool(16);
         try {
             var reconcile = loader.reconcileAsync(ComponentTree.of(
                     LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE)));
             awaitOperation(loader, "type=reconcile phase=mount-settlement");
 
             var close = loader.closeAsync();
+            assertTrue(loader.snapshot().closed());
             PendingOperationsSnapshot snapshot = loader.pendingOperations();
+            assertTrue(snapshot.closeRequested());
+
+            AtomicReference<String> divergence = new AtomicReference<>();
+            List<CompletableFuture<?>> reads = new ArrayList<>();
+            for (int index = 0; index < 100; index++) {
+                reads.add(CompletableFuture.runAsync(() -> {
+                    for (int attempt = 0; attempt < 100; attempt++) {
+                        boolean snapshotClosed = loader.snapshot().closed();
+                        boolean pendingClosed = loader.pendingOperations().closeRequested();
+                        if (snapshotClosed != pendingClosed) {
+                            divergence.compareAndSet(null, "snapshot=" + snapshotClosed
+                                    + " pending=" + pendingClosed);
+                            return;
+                        }
+                    }
+                }, readers));
+            }
+            CompletableFuture.allOf(reads.toArray(CompletableFuture[]::new))
+                    .get(10, TimeUnit.SECONDS);
+            assertNull(divergence.get(), divergence::get);
 
             var queuedClose = requireOperation(snapshot, "type=close phase=queued");
             assertEquals(Kind.LOADER_OPERATION, queuedClose.kind());
@@ -80,8 +102,11 @@ final class LoaderPendingOperationsTest {
             PendingOperationsSnapshot drained = loader.pendingOperations();
             assertTrue(drained.operations().isEmpty(), drained::render);
             assertTrue(drained.closeRequested());
+            assertTrue(loader.snapshot().closed());
         } finally {
             gate.complete(null);
+            readers.shutdown();
+            assertTrue(readers.awaitTermination(10, TimeUnit.SECONDS));
             loader.close();
         }
     }
@@ -371,6 +396,7 @@ final class LoaderPendingOperationsTest {
             LoaderTestKit.assertAccepted(loader.reconcile(ComponentTree.of(
                     LoaderTestKit.entry("alpha", ref, NoConfig.INSTANCE))));
             assertFalse(loader.pendingOperations().closeRequested());
+            assertFalse(loader.snapshot().closed());
 
             assertInstanceOf(IllegalStateException.class, assertThrows(
                             java.util.concurrent.CompletionException.class, loader::close)
@@ -379,6 +405,7 @@ final class LoaderPendingOperationsTest {
             PendingOperationsSnapshot failed = loader.pendingOperations();
             assertTrue(failed.operations().isEmpty(), failed::render);
             assertTrue(failed.closeRequested());
+            assertTrue(loader.snapshot().closed());
             assertTrue(loader.snapshot().diagnostics().stream()
                             .anyMatch(diagnostic -> diagnostic.code() == LoaderDiagnosticCode.TEARDOWN_FAILED),
                     () -> loader.snapshot().diagnostics().toString());
@@ -386,6 +413,7 @@ final class LoaderPendingOperationsTest {
             loader.close();
             assertTrue(loader.pendingOperations().operations().isEmpty());
             assertTrue(loader.pendingOperations().closeRequested());
+            assertTrue(loader.snapshot().closed());
         } finally {
             loader.close();
         }
