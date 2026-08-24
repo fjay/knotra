@@ -75,7 +75,9 @@ final class EventBusQuiescenceTest {
         gate.complete(null);
         dispatch.get(10, TimeUnit.SECONDS);
         closing.get(10, TimeUnit.SECONDS);
-        assertSame(closing, subscription.closeAsync().toCompletableFuture());
+        CompletableFuture<Void> repeatedClose = subscription.closeAsync().toCompletableFuture();
+        assertNotSame(closing, repeatedClose);
+        repeatedClose.get(10, TimeUnit.SECONDS);
     }
 
     @Test
@@ -141,7 +143,9 @@ final class EventBusQuiescenceTest {
         dispatch.get(10, TimeUnit.SECONDS);
         idle.get(10, TimeUnit.SECONDS);
         closing.get(10, TimeUnit.SECONDS);
-        assertSame(closing, bus.closeAsync().toCompletableFuture());
+        CompletableFuture<Void> repeatedClose = bus.closeAsync().toCompletableFuture();
+        assertNotSame(closing, repeatedClose);
+        repeatedClose.get(10, TimeUnit.SECONDS);
     }
 
     @Test

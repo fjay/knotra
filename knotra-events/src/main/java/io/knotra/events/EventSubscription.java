@@ -6,6 +6,9 @@ import io.knotra.AsyncCloseable;
  * 已注册事件监听的受控句柄。句柄暴露稳定订阅元数据，以及取消未来分发和等待已接受分发收敛的关闭操作。
  *
  * <p>回调可以取消自身订阅；但回调不能阻塞等待自己的关闭完成，因为关闭必须先等待该回调返回。</p>
+ *
+ * <p>{@code closeAsync()} 每次调用返回独立观察：取消返回的 stage 只放弃该次观察，
+ * 不会中断订阅 drain，也不影响其他调用者或 {@code close()} 的真实收敛。</p>
  */
 public interface EventSubscription extends AsyncCloseable {
 

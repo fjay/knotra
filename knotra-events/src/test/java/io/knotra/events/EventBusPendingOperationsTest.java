@@ -211,8 +211,9 @@ final class EventBusPendingOperationsTest {
 
         CompletableFuture<Void> first = bus.closeAsync().toCompletableFuture();
         CompletableFuture<Void> second = bus.closeAsync().toCompletableFuture();
-        assertSame(first, second);
+        assertNotSame(first, second);
         first.get(10, TimeUnit.SECONDS);
+        second.get(10, TimeUnit.SECONDS);
 
         assertThrows(IllegalStateException.class,
                 () -> bus.dispatch(EventDefinition.sync(TextEvent.class), new TextEvent("x")));

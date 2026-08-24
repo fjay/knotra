@@ -100,7 +100,9 @@ final class RegisteredSubscription implements EventSubscription {
                     .map(AcceptedDispatch::settled)
                     .toArray(CompletableFuture[]::new));
         }
-        return closeFuture;
+        // closeFuture 是私有 drain future：每个调用者获得独立观察，取消一个观察
+        // 不影响真实 drain、close() 或其他调用者。
+        return CompletionMirrors.of(closeFuture);
     }
 
     void accept(AcceptedDispatch dispatch) {

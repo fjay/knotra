@@ -10,6 +10,10 @@ import java.util.concurrent.CompletionStage;
  *
  * <p>关闭会等待“关闭请求被观察到之前”已接受的分发收敛；关闭之后的新订阅和分发会被拒绝。
  * 订阅应由消费方的 LifecycleScope 管理，使组件 teardown 遵循同一收敛规则。</p>
+ *
+ * <p>异步 dispatch、{@link #whenIdle()} 与 {@code closeAsync()} 返回的 stage 都是独立观察句柄：
+ * 调用方 {@code cancel} 只放弃该次观察，不会取消或中断内部驱动、已接受的分发、租约清理或
+ * 总线收敛；同一内部工作的其他观察者不受影响。同步 dispatch 返回纯结果值，不涉及该契约。</p>
  */
 public interface EventBus extends AsyncCloseable {
 
@@ -110,6 +114,9 @@ public interface EventBus extends AsyncCloseable {
      */
     PendingOperationsSnapshot pendingOperations();
 
-    /** 返回在本次调用被观察到之前已接受分发的收敛 stage。 */
+    /**
+     * 返回在本次调用被观察到之前已接受分发的收敛 stage。每次调用获得独立观察：
+     * 取消返回的 stage 只放弃该次观察，不会取消任何已接受的分发或影响其他观察者。
+     */
     CompletionStage<Void> whenIdle();
 }

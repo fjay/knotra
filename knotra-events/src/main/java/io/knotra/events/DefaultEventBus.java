@@ -162,7 +162,8 @@ final class DefaultEventBus implements EventBus {
             CompletableFuture<Void> all = CompletableFuture.allOf(
                     futures.toArray(CompletableFuture[]::new));
             // 所有监听结束后再聚合结果，保证 completedCount 与 failures 描述同一个收敛时刻。
-            return all.thenApply(ignored -> {
+            // finish 挂在内部驱动链上：公开观察被取消不影响租约清理与 whenIdle/close 收敛。
+            CompletableFuture<EventDispatch<T>> internal = all.thenApply(ignored -> {
                 int completed = 0;
                 List<EventFailure> failures = new ArrayList<>();
                 for (CompletableFuture<ListenerOutcome<T>> future : futures) {
@@ -176,6 +177,7 @@ final class DefaultEventBus implements EventBus {
                 return new EventDispatch<>(accepted.event(), accepted.event(), EventMode.PARALLEL,
                         accepted.listeners().size(), completed, false, failures);
             }).whenComplete((ignored, error) -> finish(accepted));
+            return CompletionMirrors.of(internal);
         } catch (Throwable error) {
             finish(accepted);
             return failed(error);
@@ -225,8 +227,10 @@ final class DefaultEventBus implements EventBus {
                         ? CompletableFuture.completedFuture(next)
                         : invoker.invoke(subscription, next));
             }
-            return chain.thenApply(DispatchState::toDispatch)
+            // finish 挂在内部驱动链上：公开观察被取消不影响租约清理与 whenIdle/close 收敛。
+            CompletableFuture<EventDispatch<T>> internal = chain.thenApply(DispatchState::toDispatch)
                     .whenComplete((ignored, error) -> finish(accepted));
+            return CompletionMirrors.of(internal);
         } catch (Throwable error) {
             finish(accepted);
             return failed(error);
@@ -286,7 +290,9 @@ final class DefaultEventBus implements EventBus {
             if (pending.isEmpty()) {
                 registry.pruneIdleBindings();
             }
-            return CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new));
+            // allOf 本身每次新建；再套一层 mirror 统一“公开 stage 不暴露内部 future”的边界。
+            return CompletionMirrors.of(
+                    CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new)));
         } finally {
             lock.writeLock().unlock();
         }
@@ -313,7 +319,7 @@ final class DefaultEventBus implements EventBus {
             lock.writeLock().unlock();
         }
 
-        // 只有第一个关闭者负责收敛和停止执行器；后续调用直接复用同一个 closeFuture。
+        // 只有第一个关闭者负责收敛和停止执行器；后续调用共享内部 closeFuture，但各自获得独立观察。
         if (owner) {
             CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new))
                     .whenComplete((ignored, error) -> {
@@ -325,7 +331,9 @@ final class DefaultEventBus implements EventBus {
                         }
                     });
         }
-        return closeFuture;
+        // closeFuture 是私有收敛 future：每个调用者获得独立观察，取消一个观察不影响其他调用者，
+        // 也不影响 close() 或真实执行器终止结果。
+        return CompletionMirrors.of(closeFuture);
     }
 
     private void stopOwnedExecutor() {
