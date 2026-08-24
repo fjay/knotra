@@ -133,17 +133,21 @@ final class Pf4jPendingOperationsTest {
             try {
                 PendingOperationsSnapshot snapshot = awaitOperation(adapter, item ->
                         item.kind() == PendingOperationsSnapshot.Kind.ARTIFACT_DRAIN
-                                && item.waitsFor() == PendingOperationsSnapshot.WaitType.COMPONENT);
+                                && item.targetId().equals(ARTIFACT_ID)
+                                && item.waitsFor() == PendingOperationsSnapshot.WaitType.COMPONENT
+                                && item.detail().contains("phase=dispose-roots"));
                 PendingOperationsSnapshot.Operation drain = require(snapshot, item ->
                         item.kind() == PendingOperationsSnapshot.Kind.ARTIFACT_DRAIN
-                                && item.waitsFor() == PendingOperationsSnapshot.WaitType.COMPONENT);
+                                && item.targetId().equals(ARTIFACT_ID)
+                                && item.waitsFor() == PendingOperationsSnapshot.WaitType.COMPONENT
+                                && item.detail().contains("phase=dispose-roots"));
                 assertTrue(snapshot.closeRequested());
-                assertTrue(drain.detail().contains("phase=dispose-roots"), drain.detail());
                 assertTrue(drain.detail().contains(handle.handleId()), drain.detail());
             } finally {
                 gate.release();
             }
             close.get(20, TimeUnit.SECONDS);
+            awaitNoOperations(adapter, operation -> true);
             PendingOperationsSnapshot settled = adapter.pendingOperations();
             assertTrue(settled.closeRequested());
             assertTrue(settled.operations().isEmpty(), settled::render);

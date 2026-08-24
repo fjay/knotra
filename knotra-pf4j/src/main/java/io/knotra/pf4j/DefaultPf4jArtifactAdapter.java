@@ -109,7 +109,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         if (closeStarted.get() || coordinator.isStopped()) {
             return CompletableFuture.failedFuture(new IllegalStateException("adapter is closed"));
         }
-        return coordinator.submit(() -> {
+        CompletableFuture<ArtifactSnapshot> internal = coordinator.submit(() -> {
             // 只记录本次新加载的插件；复用 artifact 不能被目标加载失败回滚掉。
             LoadJournal journal = new LoadJournal();
             String targetId = null;
@@ -141,6 +141,8 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
                         "failed to load PF4J artifact " + target + ": " + detail);
             }
         });
+        // 协调器 future 是驱动 future；调用方只持有可独立取消的镜像。
+        return FutureMirrors.mirror(internal);
     }
 
     @Override
@@ -234,7 +236,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         CompletableFuture<Void> attempt;
         synchronized (closeLock) {
             if (closeFuture != null) {
-                return closeFuture;
+                return FutureMirrors.mirror(closeFuture);
             }
             closeStarted.set(true);
             attempt = new CompletableFuture<>();
@@ -254,7 +256,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         } catch (Throwable failure) {
             clearFailedCloseAttempt(attempt);
             attempt.completeExceptionally(failure);
-            return attempt;
+            return FutureMirrors.mirror(attempt);
         } finally {
             pendingTracker.endDrain(attempt);
         }
@@ -262,7 +264,7 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
         if (ids.isEmpty()) {
             coordinator.stop();
             attempt.complete(null);
-            return attempt;
+            return FutureMirrors.mirror(attempt);
         }
         List<CompletableFuture<Void>> drains = ids.stream()
                 .map(id -> drainService.drain(id, "close-drain"))
@@ -277,7 +279,8 @@ final class DefaultPf4jArtifactAdapter implements Pf4jArtifactAdapter {
             coordinator.stop();
             attempt.complete(null);
         });
-        return attempt;
+        // attempt 是内部 close 尝试；失败时由 clearFailedCloseAttempt 清槽，重试另起。
+        return FutureMirrors.mirror(attempt);
     }
 
     private void clearFailedCloseAttempt(CompletableFuture<Void> attempt) {

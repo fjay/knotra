@@ -16,7 +16,10 @@ import io.knotra.PendingOperationsSnapshot;
  * <p>适配器负责 artifact 加载/启动、类型化受控挂载、只读工厂目录、drain、卸载与
  * ClassLoader 防护；它不暴露可变 PF4J 插件管理器，也不会在加载时隐式挂载组件。
  * 所有等待 artifact 生命周期的入口都以 {@code *Async} 命名并返回
- * {@link CompletionStage}；同名阻塞方法只是小工具入口。</p>
+ * {@link CompletionStage}；同名阻塞方法只是小工具入口。返回的 future 是内部
+ * 驱动 future 的观察镜像：调用方 {@code cancel} 只让自己的等待以
+ * {@link java.util.concurrent.CancellationException} 结束，不会取消内部的
+ * 加载、排空或 close 驱动，也不影响其他调用方获得的观察 future。</p>
  */
 public interface Pf4jArtifactAdapter extends AsyncCloseable {
 

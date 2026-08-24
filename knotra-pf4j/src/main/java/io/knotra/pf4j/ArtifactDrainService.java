@@ -89,7 +89,8 @@ final class ArtifactDrainService {
                 result.completeExceptionally(error);
             }
         });
-        return result;
+        // result 是驱动 future（drainFuture/PendingTracker identity），只外发镜像。
+        return FutureMirrors.mirror(result);
     }
 
     private void waitAndDispose(DrainRequest request) {

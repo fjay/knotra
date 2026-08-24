@@ -14,6 +14,7 @@ import io.knotra.ComponentOrigin;
 import io.knotra.ComponentState;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountOptions;
+import io.knotra.PendingOperationsSnapshot;
 import io.knotra.RuntimeSnapshot;
 import io.knotra.NoConfig;
 import org.junit.jupiter.api.MethodOrderer;
@@ -21,6 +22,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.ref.Reference;
+import java.lang.ref.WeakReference;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -786,6 +789,38 @@ final class Pf4jArtifactAdapterTest {
     }
 
     @Test
+    void asyncCleanupLoaderIsCollectableAfterSuccessfulUnload(
+            @TempDir Path pluginsRoot) throws Exception {
+        ReferenceVault.clear();
+        try (KnotraRuntime runtime = KnotraRuntime.create();
+             Pf4jArtifactAdapter adapter = newAdapter(pluginsRoot, runtime)) {
+            RetainedAsyncCleanupGraph retained =
+                    loadMountAndUnloadAsyncCleanup(adapter, runtime);
+
+            assertNotNull(retained.loaderReference().get(),
+                    "plugin loader must stay reachable before collection");
+            assertTrue(retained.completedUnload().isDone());
+            assertFalse(retained.completedUnload().isCompletedExceptionally());
+            assertEquals(ComponentState.DISPOSED, retained.disposedHandle().state());
+            assertEquals(ArtifactState.UNLOADED,
+                    adapter.artifact(ARTIFACT_ID).orElseThrow().state());
+            assertTrue(adapter.pendingOperations().operations().isEmpty(),
+                    adapter.pendingOperations()::render);
+            assertTrue(runtime.advanced().snapshot().mounts().isEmpty());
+            assertTrue(awaitLoaderCleared(retained.loaderReference()),
+                    () -> asyncCleanupGcDiagnostic(retained, adapter, runtime));
+
+            Reference.reachabilityFence(retained);
+            Reference.reachabilityFence(retained.loadSnapshot());
+            Reference.reachabilityFence(retained.drainSnapshot());
+            Reference.reachabilityFence(retained.disposedHandle());
+            Reference.reachabilityFence(retained.completedUnload());
+        } finally {
+            ReferenceVault.clear();
+        }
+    }
+
+    @Test
     void partialStartFailureReleasesPluginClassLoader(@TempDir Path pluginsRoot) throws Exception {
         ReferenceVault.clear();
         Files.copy(fixture, pluginsRoot.resolve("dependency.jar"));
@@ -891,6 +926,89 @@ final class Pf4jArtifactAdapterTest {
             assertEquals(ArtifactState.UNLOADED,
                     adapter.artifact(ARTIFACT_ID).orElseThrow().state());
         }
+    }
+
+    private RetainedAsyncCleanupGraph loadMountAndUnloadAsyncCleanup(
+            Pf4jArtifactAdapter adapter, KnotraRuntime runtime) throws Exception {
+        ArtifactSnapshot loadSnapshot =
+                adapter.loadArtifactAsync(fixture).toCompletableFuture().join();
+        ArtifactFactoryHandle.NoConfig factory =
+                adapter.factories().resolveNoConfig("async-cleanup").orElseThrow();
+        MountHandle handle = factory.mount(runtime.root(), "async-cleanup-gc");
+        assertEquals(ComponentState.ACTIVE, settle(handle));
+
+        ControlledGate gate = runtime.root().view().require(GATE);
+        assertFalse(gate.disposed());
+        CompletableFuture<Void> unload =
+                adapter.unloadArtifactAsync(ARTIFACT_ID).toCompletableFuture();
+        PendingOperationsSnapshot drainSnapshot =
+                awaitAsyncCleanupDrain(adapter, unload);
+        gate.release();
+        unload.get(20, TimeUnit.SECONDS);
+
+        assertTrue(gate.disposed());
+        assertEquals(ComponentState.DISPOSED, handle.state());
+        WeakReference<ClassLoader> loaderReference = ReferenceVault.latest();
+        assertNotNull(loaderReference);
+        return new RetainedAsyncCleanupGraph(
+                loaderReference, loadSnapshot, drainSnapshot, handle, unload);
+    }
+
+    private static PendingOperationsSnapshot awaitAsyncCleanupDrain(
+            Pf4jArtifactAdapter adapter, CompletableFuture<Void> unload) throws Exception {
+        for (int attempt = 0; attempt < 1_000; attempt++) {
+            PendingOperationsSnapshot snapshot = adapter.pendingOperations();
+            boolean blockedOnComponent = snapshot.operations().stream()
+                    .anyMatch(operation -> operation.kind() ==
+                            PendingOperationsSnapshot.Kind.ARTIFACT_DRAIN
+                            && operation.targetId().equals(ARTIFACT_ID)
+                            && operation.waitsFor() ==
+                            PendingOperationsSnapshot.WaitType.COMPONENT);
+            if (blockedOnComponent) {
+                return snapshot;
+            }
+            if (unload.isDone()) {
+                throw new AssertionError(
+                        "unload completed before its blocked component was observed: "
+                                + snapshot.render());
+            }
+            tick();
+        }
+        throw new AssertionError(adapter.pendingOperations().render());
+    }
+
+    private static boolean awaitLoaderCleared(WeakReference<ClassLoader> reference)
+            throws Exception {
+        for (int attempt = 0; attempt < 200; attempt++) {
+            System.gc();
+            if (reference.get() == null && ReferenceVault.liveLoaders() == 0) {
+                return true;
+            }
+            tick();
+        }
+        return false;
+    }
+
+    private static String asyncCleanupGcDiagnostic(
+            RetainedAsyncCleanupGraph retained,
+            Pf4jArtifactAdapter adapter,
+            KnotraRuntime runtime) {
+        return "plugin loader was not collected; loaderPresent="
+                + (retained.loaderReference().get() != null)
+                + ", vaultLoaders=" + ReferenceVault.liveLoaders()
+                + ", artifact=" + adapter.artifact(ARTIFACT_ID)
+                + ", finalPending=" + adapter.pendingOperations().render()
+                + ", runtimeMounts=" + runtime.advanced().snapshot().mounts()
+                + ", retainedDrain=" + retained.drainSnapshot().render()
+                + ", unloadDone=" + retained.completedUnload().isDone();
+    }
+
+    private record RetainedAsyncCleanupGraph(
+            WeakReference<ClassLoader> loaderReference,
+            ArtifactSnapshot loadSnapshot,
+            PendingOperationsSnapshot drainSnapshot,
+            MountHandle disposedHandle,
+            CompletableFuture<Void> completedUnload) {
     }
 
     private static ComponentFactory<NoConfig> hostFactory() {
