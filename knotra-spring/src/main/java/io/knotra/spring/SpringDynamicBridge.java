@@ -13,11 +13,16 @@ import io.knotra.DynamicCapability;
 import io.knotra.DynamicOperation;
 import io.knotra.KnotraRuntime;
 import io.knotra.MountHandle;
+import io.knotra.MountNotActiveException;
 import io.knotra.NoConfig;
 
+import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,6 +37,8 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class SpringDynamicBridge<T> implements AutoCloseable {
 
+    /** 旧便利重载使用的默认启动与清理等待预算。 */
+    public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
     private final MountHandle handle;
     private final DynamicCapability<T> capability;
     private final T proxy;
@@ -39,34 +46,78 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
     private final AtomicReference<CompletableFuture<Void>> closeFuture =
             new AtomicReference<>();
 
+    private final Duration closeTimeout;
+
     private SpringDynamicBridge(
             MountHandle handle,
             DynamicCapability<T> capability,
-            T proxy) {
+            T proxy,
+            Duration closeTimeout) {
         this.handle = handle;
         this.capability = capability;
         this.proxy = proxy;
+        this.closeTimeout = closeTimeout;
     }
 
+    /**
+     * 使用 {@link #DEFAULT_TIMEOUT} 挂载动态桥接器。
+     *
+     * <p>该便利重载保留既有调用形态；生产环境如需收紧停机或启动预算，
+     * 请显式调用带 {@code timeout} 的重载。</p>
+     */
     public static <T> SpringDynamicBridge<T> mount(
             KnotraRuntime runtime,
             String mountId,
             CapabilityKey<T> sourceKey,
             CapabilityKey<T> bridgeKey) {
-        return mount(runtime, runtime.root(), mountId, sourceKey, bridgeKey);
+        return mount(runtime, runtime.root(), mountId, sourceKey, bridgeKey, DEFAULT_TIMEOUT);
     }
 
+    /** 使用自定义等待预算在根上下文挂载动态桥接器。 */
+    public static <T> SpringDynamicBridge<T> mount(
+            KnotraRuntime runtime,
+            String mountId,
+            CapabilityKey<T> sourceKey,
+            CapabilityKey<T> bridgeKey,
+            Duration timeout) {
+        return mount(runtime, runtime.root(), mountId, sourceKey, bridgeKey, timeout);
+    }
+
+    /**
+     * 使用 {@link #DEFAULT_TIMEOUT} 在指定上下文挂载动态桥接器。
+     *
+     * <p>该便利重载保留既有调用形态；生产环境如需收紧停机或启动预算，
+     * 请显式调用带 {@code timeout} 的重载。</p>
+     */
     public static <T> SpringDynamicBridge<T> mount(
             KnotraRuntime runtime,
             ContextHandle context,
             String mountId,
             CapabilityKey<T> sourceKey,
             CapabilityKey<T> bridgeKey) {
+        return mount(runtime, context, mountId, sourceKey, bridgeKey, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * 使用自定义正等待预算在指定上下文挂载动态桥接器。
+     *
+     * <p>{@code timeout} 同时约束启动等待与启动失败后的同步清理等待。
+     * 启动等待委托 {@link MountHandle#requireActive(Duration)}，因此超时、中断
+     * 与非 ACTIVE 结算统一抛出 {@code MountNotActiveException}。</p>
+     */
+    public static <T> SpringDynamicBridge<T> mount(
+            KnotraRuntime runtime,
+            ContextHandle context,
+            String mountId,
+            CapabilityKey<T> sourceKey,
+            CapabilityKey<T> bridgeKey,
+            Duration timeout) {
         Objects.requireNonNull(runtime, "runtime");
         Objects.requireNonNull(context, "context");
         String safeMountId = requireMountId(mountId);
         Objects.requireNonNull(sourceKey, "sourceKey");
         Objects.requireNonNull(bridgeKey, "bridgeKey");
+        requireTimeout(timeout);
         requireInterface(sourceKey);
         requireInterface(bridgeKey);
         if (!sourceKey.type().equals(bridgeKey.type())) {
@@ -84,40 +135,46 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
                 transaction.mount(context, safeMountId, factory)).value();
 
         try {
-            ComponentState state = handle.whenSettled()
-                    .toCompletableFuture()
-                    .get(30, TimeUnit.SECONDS);
-            if (state != ComponentState.ACTIVE) {
-                throw new IllegalStateException(
-                        "dynamic bridge did not become ACTIVE: " + state);
-            }
+            awaitStartup(handle, timeout);
             BridgeAccess access = context.view().require(accessKey);
             DynamicCapability<T> capability = cast(access.dynamicCapability());
             return new SpringDynamicBridge<>(
                     handle, capability,
-                    capability.proxy(sourceKey.type()));
-        } catch (Exception error) {
-            throw startupFailed(handle, error);
+                    capability.proxy(sourceKey.type()),
+                    timeout);
+        } catch (RuntimeException error) {
+            throw startupFailed(handle, error, timeout);
         }
+    }
+
+    static void awaitStartup(MountHandle handle, Duration timeout) {
+        handle.requireActive(timeout);
     }
 
     private static RuntimeException startupFailed(
             MountHandle handle,
-            Exception error) {
+            RuntimeException error,
+            Duration timeout) {
+        ComponentState state;
         try {
-            ComponentState state = handle.disposeAsync()
-                    .toCompletableFuture()
-                    .get(30, TimeUnit.SECONDS);
+            state = awaitStage(handle.disposeAsync(), timeout,
+                    "dynamic bridge startup cleanup",
+                    "startup cleanup remains pending on the mount handle");
+        } catch (RuntimeException cleanupError) {
             return new IllegalStateException(
-                    "dynamic bridge startup failed; disposed as " + state, error);
-        } catch (Exception disposeError) {
-            disposeError.addSuppressed(error);
-            if (disposeError instanceof RuntimeException runtimeError) {
-                return runtimeError;
-            }
-            return new IllegalStateException(
-                    "dynamic bridge startup cleanup failed", disposeError);
+                    "dynamic bridge startup failed: " + stableError(error)
+                            + "; " + cleanupError.getMessage(), null);
         }
+        if (state != ComponentState.DISPOSED) {
+            return new IllegalStateException(
+                    "dynamic bridge startup failed: " + stableError(error)
+                            + "; cleanup observed " + state, null);
+        }
+        if (error instanceof MountNotActiveException) {
+            return error;
+        }
+        return new IllegalStateException(
+                "dynamic bridge startup failed: " + stableError(error), null);
     }
 
     /**
@@ -164,6 +221,12 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
         return capability;
     }
 
+    /**
+     * 请求关闭桥接器，并返回物理清理收敛阶段。
+     *
+     * <p>调用后访问方法立即进入 closed 状态；这不表示物理清理已完成。清理仍在等待时，
+     * 重复调用会复用同一个 pending future；清理失败后再次调用则发起重试。</p>
+     */
     public CompletionStage<Void> closeAsync() {
         closed.set(true);
         CompletableFuture<Void> created = new CompletableFuture<>();
@@ -178,7 +241,8 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
                         : handle.disposeAsync();
         transition.whenComplete((state, error) -> {
             if (error != null) {
-                created.completeExceptionally(error);
+                created.completeExceptionally(new IllegalStateException(
+                        "dynamic bridge cleanup failed: " + stableError(error), null));
                 return;
             }
             if (state == ComponentState.DISPOSED) {
@@ -196,9 +260,28 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
         return created;
     }
 
+    /**
+     * 使用 {@link #DEFAULT_TIMEOUT} 等待清理完成。
+     *
+     * <p>该便利方法保留既有调用形态；生产环境应显式传入停机预算。</p>
+     */
     @Override
     public void close() {
-        closeAsync().toCompletableFuture().join();
+        close(closeTimeout);
+    }
+
+    /**
+     * 使用自定义正预算同步等待清理完成。
+     *
+     * <p>超时或中断不会取消清理，也不会把已请求关闭的桥接器伪装成已物理关闭；
+     * 后续 {@link #closeAsync()} 会继续返回同一个 pending future。等待异常只携带
+     * 稳定错误文本，不保留底层 Throwable 引用。</p>
+     */
+    public void close(Duration timeout) {
+        requireTimeout(timeout);
+        awaitStage(closeAsync(), timeout,
+                "dynamic bridge cleanup",
+                "cleanup remains pending; retry closeAsync after inspecting pending operations");
     }
 
     private void rejectClosed() {
@@ -220,6 +303,55 @@ public final class SpringDynamicBridge<T> implements AutoCloseable {
         if (!key.type().isInterface()) {
             throw new IllegalArgumentException(
                     "dynamic bridge capability must be an interface: " + key.typeName());
+        }
+    }
+
+    private static void requireTimeout(Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
+    }
+
+    private static <R> R awaitStage(
+            CompletionStage<R> stage,
+            Duration timeout,
+            String operation,
+            String pendingMessage) {
+        CompletableFuture<R> future = stage.toCompletableFuture();
+        R result;
+        try {
+            result = future.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(
+                    operation + " wait was interrupted; " + pendingMessage, null);
+        } catch (TimeoutException error) {
+            throw new IllegalStateException(
+                    operation + " timed out after " + timeout + "; " + pendingMessage, null);
+        } catch (ExecutionException | CompletionException error) {
+            throw new IllegalStateException(
+                    operation + " failed: " + stableError(error), null);
+        }
+        return result;
+    }
+
+    private static String stableError(Throwable error) {
+        try {
+            Throwable cause = error instanceof CompletionException || error instanceof ExecutionException
+                    ? error.getCause()
+                    : error;
+            if (cause == null) {
+                cause = error;
+            }
+            String type = cause.getClass().getName();
+            String message = cause.getMessage();
+            String text = message == null || message.isBlank()
+                    ? type
+                    : type + ": " + message;
+            return text.length() <= 500 ? text : text.substring(0, 500);
+        } catch (Throwable ignored) {
+            return "<invalid settlement failure>";
         }
     }
 
