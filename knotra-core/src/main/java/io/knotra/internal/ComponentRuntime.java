@@ -398,7 +398,9 @@ final class ComponentRuntime {
         } catch (RejectedExecutionException error) {
             Runnable completion = failTransition(
                     future, new TransitionRejectedStateException(error));
-            completion.run();
+            if (completion != null) {
+                completion.run();
+            }
             return true;
         }
     }
@@ -413,10 +415,15 @@ final class ComponentRuntime {
                 + " ownsDriver=" + (current == driver);
     }
 
-    boolean noLongerOwnsTransition(CompletableFuture<ComponentState> future) {
+    /** 只读所有权判定：过渡槽当前是否仍由该 future 占据（identity 比较）。 */
+    boolean ownsTransition(CompletableFuture<ComponentState> future) {
         synchronized (chainLock) {
-            return transition.get() != future;
+            return transition.get() == future;
         }
+    }
+
+    boolean noLongerOwnsTransition(CompletableFuture<ComponentState> future) {
+        return !ownsTransition(future);
     }
 
     boolean cancelTransition(CompletableFuture<ComponentState> future) {
@@ -434,21 +441,47 @@ final class ComponentRuntime {
             CompletableFuture<io.knotra.ComponentState> future,
             Throwable error) {
         synchronized (chainLock) {
-            if (transition.compareAndSet(future, null)) {
-                clearPending();
-                requestedDriver.compareAndSet(future, null);
+            // slot ownership = completion ownership：只有仍持有该 future 的调用方
+            // 才能异常完成它；primary 失败清槽后，后续 cleanup 不得再竞争同一 future。
+            if (!transition.compareAndSet(future, null)) {
+                return null;
             }
+            clearPending();
+            requestedDriver.compareAndSet(future, null);
             return () -> future.completeExceptionally(error);
         }
     }
 
-    Reservation replaceTransition(long startNanos, String detail) {
+    /**
+     * cleanup 后 restart 分支的原子预约：在 chainLock 内一次区分三种所有权结果。
+     *
+     * <p>仍拥有旧 future 时替换槽位并返回 {@link RestartOwnership#LINKED}，调用方望远镜
+     * 链接旧 future；旧 future 已被 primary 失败清槽且槽位为空时返回
+     * {@link RestartOwnership#INDEPENDENT}，restart 独立推进，不得链接或完成旧 future；
+     * 槽位已被其他未完成所有者占用时返回 {@link RestartOwnership#FOREIGN}，本次不预约、
+     * 不驱动，但结果携带该外部 future，调用方可在其完成后复核是否需要恢复自动收敛。
+     * 判定与预约在同一临界区内完成，不存在先 check 后 reserve 的竞态窗口。</p>
+     */
+    RestartReservation reserveRestart(
+            CompletableFuture<ComponentState> oldFuture,
+            long startNanos,
+            String detail) {
         synchronized (chainLock) {
-            CompletableFuture<io.knotra.ComponentState> created = new CompletableFuture<>();
+            CompletableFuture<ComponentState> current = transition.get();
+            if (current != null && current != oldFuture && !current.isDone()) {
+                return RestartReservation.foreign(current, this);
+            }
+            CompletableFuture<ComponentState> created = new CompletableFuture<>();
             publishPending(pendingSample(startNanos, detail));
             transition.set(created);
             requestedDriver.set(null);
-            return new Reservation(this, created, true);
+            return new RestartReservation(
+                    new Reservation(this, created, true),
+                    current == oldFuture
+                            ? RestartOwnership.LINKED
+                            : RestartOwnership.INDEPENDENT,
+                    null,
+                    handleId);
         }
     }
 
@@ -469,10 +502,13 @@ final class ComponentRuntime {
             CompletableFuture<io.knotra.ComponentState> future,
             io.knotra.ComponentState state) {
         synchronized (chainLock) {
-            if (transition.compareAndSet(future, null)) {
-                clearPending();
-                requestedDriver.compareAndSet(future, null);
+            // 与 failTransition 同一所有权纪律：不再持有该 future 时不产生完成动作，
+            // 避免 cleanup 的正常完成覆盖 primary 失败的异常完成。
+            if (!transition.compareAndSet(future, null)) {
+                return null;
             }
+            clearPending();
+            requestedDriver.compareAndSet(future, null);
             return () -> future.complete(state);
         }
     }
@@ -518,6 +554,40 @@ final class ComponentRuntime {
             ComponentRuntime component,
             CompletableFuture<io.knotra.ComponentState> future,
             boolean created) {
+    }
+
+    /** restart 预约相对旧 future 的所有权判定；FOREIGN 时不产生任何预约。 */
+    enum RestartOwnership {
+        /** 仍拥有旧 future：restart future 望远镜链接旧 future。 */
+        LINKED,
+        /** 旧 future 已被 primary 失败清槽：独立 restart，不链接/完成旧 future。 */
+        INDEPENDENT,
+        /** 槽位已有其他未完成所有者；预约结果携带该 future 供完成后的收敛复核。 */
+        FOREIGN
+    }
+
+    record RestartReservation(
+            Reservation reservation,
+            RestartOwnership ownership,
+            CompletableFuture<ComponentState> foreignFuture,
+            String restartExpectedHandleId) {
+        static RestartReservation foreign(
+                CompletableFuture<ComponentState> foreignFuture,
+                ComponentRuntime component) {
+            return new RestartReservation(
+                    null,
+                    RestartOwnership.FOREIGN,
+                    foreignFuture,
+                    component.handleId());
+        }
+
+        boolean created() {
+            return ownership != RestartOwnership.FOREIGN;
+        }
+
+        boolean linksOriginalFuture() {
+            return ownership == RestartOwnership.LINKED;
+        }
     }
 
     enum RetryIntent {

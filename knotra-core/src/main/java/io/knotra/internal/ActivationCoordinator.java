@@ -20,7 +20,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.function.BiConsumer;
 import java.util.function.IntConsumer;
 import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
@@ -54,6 +56,10 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
     volatile IntConsumer providerLeaseRetireFaultProbe;
     volatile Runnable activationRollbackCommitProbe;
     volatile Runnable cleanupFinalCommitProbe;
+    // 包内测试探针：拦截 postcommit 失败路径对原始 future 的异常完成派发。
+    // 测试可先持有 completion、稍后运行，但必须最终运行，否则原始 future 永久 pending。
+    volatile BiConsumer<CompletableFuture<ComponentState>, Runnable>
+            activationFailureCompletionGate;
 
     ActivationCoordinator(
             Object coordinator,
@@ -665,9 +671,12 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
         }
         if (postCommitFailure != null) {
             // 已提交结构保持不变；原始过渡 future 异常完成，不得永久 pending。
-            dispatchCompletion(runtime.failTransition(
+            // failTransition 已在此清槽，后续 cleanup 不得再竞争完成该 future。
+            dispatchPrimaryFailureCompletion(
                     future,
-                    new IllegalStateException(postCommitFailure)));
+                    runtime.failTransition(
+                            future,
+                            new IllegalStateException(postCommitFailure)));
             if (cleanupRequired) {
                 finishCleanupAfterDependents(runtime, activation, future);
             }
@@ -983,7 +992,7 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
         activation.scope.teardown().whenComplete((ignored, cleanupError) -> {
             ComponentState state;
             boolean restart;
-            ComponentRuntime.Reservation restartReservation = null;
+            ComponentRuntime.RestartReservation restartReservation = null;
             Runnable transitionCompletion = null;
             // 失败详情在协调器外捕获；协调器内只做同代字段应用，不在锁下格式化堆栈。
             boolean cleanupFailed = cleanupError != null
@@ -1096,10 +1105,13 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
                             runtime, future, failure);
                 }
                 if (transitionCompletion == null) {
-                    // 仍在协调器内替换过渡链，随后到锁外提交新 Activation，保证旧请求先有结果。
                     if (restart) {
-                        restartReservation = runtime.replaceTransition(
-                                ticker.getAsLong(), "component restart");
+                        // 原子区分三种所有权：仍拥有旧 future 则望远镜替换；
+                        // primary 失败已清槽则独立 restart；已有新所有者则不重复预约。
+                        restartReservation = runtime.reserveRestart(
+                                future,
+                                ticker.getAsLong(),
+                                "component restart");
                     } else {
                         transitionCompletion = prepareTransitionCompletion(runtime, future, state);
                     }
@@ -1107,18 +1119,119 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
             }
 
             dispatchCompletion(transitionCompletion);
-            if (restartReservation != null) {
-                runtime.finishTransition(future);
-                transitionScheduler.driveReservation(restartReservation);
-                restartReservation.future().whenComplete((next, error) -> {
-                    if (error != null) {
-                        future.completeExceptionally(error);
-                    } else {
-                        future.complete(next);
-                    }
-                });
+            if (restartReservation != null && restartReservation.created()) {
+                transitionScheduler.driveReservation(restartReservation.reservation());
+                // INDEPENDENT 分支绝不链接/完成旧 future：旧 F 的异常完成由 primary
+                // 失败路径独占；这里只推进新 restart future 自身收敛。
+                if (restartReservation.linksOriginalFuture()) {
+                    restartReservation.reservation().future().whenComplete((next, error) -> {
+                        if (error != null) {
+                            future.completeExceptionally(error);
+                        } else {
+                            future.complete(next);
+                        }
+                    });
+                }
+            } else if (restartReservation != null) {
+                attachForeignRestartHandoff(runtime, future, restartReservation);
             }
         });
+    }
+
+    // cleanup 将重启责任交给外部预约时，必须由该预约的完成事件重新驱动收敛。
+    // whenCompleteAsync 保证即使 future 已完成，回调也不会在当前 coordinator 调用栈中执行。
+    private void attachForeignRestartHandoff(
+            ComponentRuntime runtime,
+            CompletableFuture<ComponentState> completedFuture,
+            ComponentRuntime.RestartReservation reservation) {
+        CompletableFuture<ComponentState> foreignFuture =
+                reservation.foreignFuture();
+        if (foreignFuture == null) {
+            return;
+        }
+        // reserveRestart 已保证 FOREIGN 与旧 future 不同；这里保留显式防护，
+        // 避免异常自环在完成回调中无限续接。
+        assert foreignFuture != completedFuture;
+        if (foreignFuture == completedFuture) {
+            return;
+        }
+        foreignFuture.whenCompleteAsync(
+                (ignored, error) -> reconcileAfterForeignOwner(
+                        runtime,
+                        reservation.restartExpectedHandleId(),
+                        foreignFuture),
+                this::dispatchForeignHandoffTask);
+    }
+
+    private void dispatchForeignHandoffTask(Runnable task) {
+        try {
+            executor.execute(task);
+        } catch (RejectedExecutionException rejection) {
+            // 关闭竞态下宁可丢失自动 restart，也不能向公共池注入关闭后副作用。
+            if (host.isClosing()) {
+                return;
+            }
+            ForkJoinPool.commonPool().execute(() -> {
+                if (!host.isClosing()) {
+                    task.run();
+                }
+            });
+        }
+    }
+
+    private void reconcileAfterForeignOwner(
+            ComponentRuntime expected,
+            String expectedHandleId,
+            CompletableFuture<ComponentState> completedForeignFuture) {
+        if (host.isClosing()) {
+            return;
+        }
+        ComponentRuntime.RestartReservation restartReservation = null;
+        synchronized (coordinator) {
+            if (host.isClosing()) {
+                return;
+            }
+            PublishedKernelState state = kernelState.read();
+            ComponentRuntime current =
+                    state.index.components.get(expectedHandleId);
+            RuntimeView.ComponentData data =
+                    state.view.components.get(expectedHandleId);
+            if (current != expected || data == null) {
+                return;
+            }
+            boolean autoConvergent =
+                    (data.state() == ComponentState.WAITING
+                            || data.state() == ComponentState.FAILED)
+                    && data.currentActivationId() == null
+                    && data.goal() == ComponentGoal.RUNNING
+                    && !current.suppressAutoRestart()
+                    && !current.blockedNonConvergent()
+                    && !explicitRetryGateBlocks(current);
+            if (autoConvergent) {
+                restartReservation = current.reserveRestart(
+                        null,
+                        ticker.getAsLong(),
+                        "component restart after foreign owner");
+            }
+        }
+        if (restartReservation == null) {
+            return;
+        }
+        if (restartReservation.created()) {
+            transitionScheduler.driveReservation(restartReservation.reservation());
+        } else {
+            // 链式 FOREIGN 同样离开临界区后挂下一层完成事件；回调只捕获下一层
+            // future 与组件 token，已完成的上一层不进入新回调闭包。
+            attachForeignRestartHandoff(
+                    expected,
+                    completedForeignFuture,
+                    restartReservation);
+        }
+    }
+
+    private boolean explicitRetryGateBlocks(ComponentRuntime runtime) {
+        // handoff 只恢复 cleanup 原本计划的自动收敛；显式 retry 仍由 retryAsync 驱动。
+        return runtime.pendingStartFailure() || runtime.failedCleanup() != null;
     }
 
     // stale 回滚后的自动收敛：拓扑指纹变化才重置计数，避免同一无效图反复启动。
@@ -1184,6 +1297,20 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
         }
     }
 
+    // postcommit 失败是原始 future 的 primary completion owner；测试探针可持有
+    // completion 以构造确定性窗口，但生产行为仍是锁外派发异常完成。
+    private void dispatchPrimaryFailureCompletion(
+            CompletableFuture<ComponentState> future,
+            Runnable completion) {
+        BiConsumer<CompletableFuture<ComponentState>, Runnable> gate =
+                activationFailureCompletionGate;
+        if (gate != null) {
+            gate.accept(future, completion);
+            return;
+        }
+        dispatchCompletion(completion);
+    }
+
     private void dispatchCompletion(Runnable completion) {
         if (completion == null) {
             return;
@@ -1234,6 +1361,10 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
         ActivationContext activationContext(
                 ActivationRuntime activation,
                 List<ChildMountPlan> plans);
+
+        default boolean isClosing() {
+            return false;
+        }
     }
 
     record CommittedLeaseRetirement(

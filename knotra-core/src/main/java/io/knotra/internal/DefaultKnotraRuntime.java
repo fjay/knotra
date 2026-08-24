@@ -461,6 +461,10 @@ final class DefaultKnotraRuntime implements KnotraRuntime {
         return new TransactionReceipt<>(callbackValue, committedSettlement);
     }
 
+    boolean isClosing() {
+        return closing.get();
+    }
+
     @Override
     public CompletionStage<Void> closeAsync() {
         CompletableFuture<Void> previous = closeFuture.get();

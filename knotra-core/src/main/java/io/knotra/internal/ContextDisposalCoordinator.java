@@ -159,6 +159,9 @@ final class ContextDisposalCoordinator {
                         new IllegalStateException(message)));
             }
         }
+        if (future != null && !committed) {
+            return future;
+        }
 
         List<CompletableFuture<?>> settlements =
                 new ArrayList<>(registrationDrains);

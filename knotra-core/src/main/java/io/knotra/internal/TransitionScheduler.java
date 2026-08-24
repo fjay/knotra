@@ -164,9 +164,12 @@ final class TransitionScheduler {
             String message = "postcommit transition drive failed at reservation execute: "
                     + LifecycleScopeImpl.safeError(driveError);
             try {
-                reservation.component().failTransition(
+                Runnable completion = reservation.component().failTransition(
                         reservation.future(),
-                        new IllegalStateException(message)).run();
+                        new IllegalStateException(message));
+                if (completion != null) {
+                    completion.run();
+                }
             } catch (Throwable completeError) {
                 message += "; reservation failure completion failed: "
                         + LifecycleScopeImpl.safeError(completeError);

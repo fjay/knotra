@@ -19,4 +19,9 @@ final class RuntimeActivationHost
             List<ChildMountPlan> plans) {
         return new ActivationContextImpl(runtime, activation, plans);
     }
+
+    @Override
+    public boolean isClosing() {
+        return runtime.isClosing();
+    }
 }

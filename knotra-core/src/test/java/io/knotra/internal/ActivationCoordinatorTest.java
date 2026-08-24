@@ -28,14 +28,18 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -204,6 +208,231 @@ final class ActivationCoordinatorTest {
         assertEquals(ComponentState.DISPOSED, retried.get(10, TimeUnit.SECONDS));
         assertFalse(harness.store.read().view.components.containsKey("owner"));
         assertFalse(harness.store.read().index.components.containsKey("owner"));
+    }
+
+    @Test
+    void foreignRestartHandoffSurvivesHandoffExecutorRejection() throws Exception {
+        AtomicInteger starts = new AtomicInteger();
+        harness.addComponent("owner", ignored -> starts.incrementAndGet());
+        assertEquals(ComponentState.ACTIVE, harness.drive("owner")
+                .get(10, TimeUnit.SECONDS));
+
+        AtomicReference<ComponentRuntime.Reservation> cleanupReservation =
+                new AtomicReference<>();
+        AtomicInteger rejectedHandoffs = new AtomicInteger();
+        ActivationCoordinator rejecting = new ActivationCoordinator(
+                harness.lock,
+                harness.store,
+                KnotraConfig.defaults(),
+                task -> {
+                    if (rejectedHandoffs.compareAndSet(0, 1)) {
+                        throw new RejectedExecutionException("handoff executor closed");
+                    }
+                    harness.executor.execute(task);
+                },
+                harness.nanos::incrementAndGet,
+                (activation, plans) -> new EmptyActivationContext(
+                        activation,
+                        harness.startActions.get(activation.owner.handleId())));
+        AtomicReference<ComponentRuntime.Reservation> foreign =
+                new AtomicReference<>();
+        rejecting.cleanupFinalCommitProbe = () -> {
+            if (foreign.get() == null) {
+                ComponentRuntime component = harness.component("owner");
+                // 模拟 primary failure 已清掉旧槽，cleanup 只剩外部 owner 可交接。
+                assertTrue(component.cancelTransition(
+                        cleanupReservation.get().future()));
+                foreign.set(component.reserveTransition(
+                        rejecting.scheduler().pendingTime(),
+                        "foreign restart owner"));
+            }
+        };
+
+        harness.markStopping("owner", ComponentGoal.RUNNING);
+        cleanupReservation.set(harness.component("owner").reserveTransition(
+                harness.nanos.incrementAndGet(), "cleanup"));
+        rejecting.driveTransition(
+                harness.component("owner"),
+                cleanupReservation.get().future());
+        awaitState("owner", ComponentState.WAITING);
+        assertNotNull(foreign.get());
+        assertTrue(harness.component("owner").cancelTransition(foreign.get().future()));
+        rejecting.scheduler().completeCancelled(List.of(foreign.get().future()));
+
+        awaitState("owner", ComponentState.ACTIVE);
+        assertEquals(2, starts.get());
+        assertEquals(1, rejectedHandoffs.get());
+    }
+
+    @Test
+    void chainedForeignRestartOwnersContinueHandoffUntilIndependentRestart() throws Exception {
+        chainedForeignRestartOwnersConverge(false);
+    }
+
+    @Test
+    void normalSecondForeignOwnerDoesNotStartTwice() throws Exception {
+        chainedForeignRestartOwnersConverge(true);
+    }
+
+    @Test
+    void closingHostSuppressesForeignHandoffFallbackAfterExecutorRejection() throws Exception {
+        AtomicInteger starts = new AtomicInteger();
+        harness.addComponent("owner", ignored -> starts.incrementAndGet());
+        assertEquals(ComponentState.ACTIVE, harness.drive("owner")
+                .get(10, TimeUnit.SECONDS));
+
+        AtomicInteger executorRejections = new AtomicInteger();
+        AtomicInteger closingChecks = new AtomicInteger();
+        ActivationCoordinator.ActivationHost closingHost =
+                new ActivationCoordinator.ActivationHost() {
+                    @Override
+                    public ActivationContext activationContext(
+                            ActivationRuntime activation,
+                            List<ChildMountPlan> plans) {
+                        return new EmptyActivationContext(
+                                activation,
+                                harness.startActions.get(activation.owner.handleId()));
+                    }
+
+                    @Override
+                    public boolean isClosing() {
+                        closingChecks.incrementAndGet();
+                        return true;
+                    }
+                };
+        ActivationCoordinator closing = new ActivationCoordinator(
+                harness.lock,
+                harness.store,
+                KnotraConfig.defaults(),
+                task -> {
+                    executorRejections.incrementAndGet();
+                    throw new RejectedExecutionException("runtime closing");
+                },
+                harness.nanos::incrementAndGet,
+                closingHost);
+        AtomicReference<ComponentRuntime.Reservation> cleanupReservation =
+                new AtomicReference<>();
+        AtomicReference<ComponentRuntime.Reservation> foreign =
+                new AtomicReference<>();
+        closing.cleanupFinalCommitProbe = () -> {
+            if (foreign.get() == null) {
+                ComponentRuntime component = harness.component("owner");
+                assertTrue(component.cancelTransition(
+                        cleanupReservation.get().future()));
+                foreign.set(component.reserveTransition(
+                        closing.scheduler().pendingTime(),
+                        "foreign restart owner while closing"));
+            }
+        };
+
+        harness.markStopping("owner", ComponentGoal.RUNNING);
+        cleanupReservation.set(harness.component("owner").reserveTransition(
+                harness.nanos.incrementAndGet(), "cleanup"));
+        closing.driveTransition(
+                harness.component("owner"),
+                cleanupReservation.get().future());
+        awaitState("owner", ComponentState.WAITING);
+        assertNotNull(foreign.get());
+
+        assertTrue(harness.component("owner").cancelTransition(foreign.get().future()));
+        closing.scheduler().completeCancelled(List.of(foreign.get().future()));
+
+        assertEquals(1, executorRejections.get());
+        assertTrue(closingChecks.get() > 0, "fallback must consult the closing host");
+        assertEquals(ComponentState.WAITING, harness.data("owner").state());
+        assertEquals(1, starts.get(), "closing handoff must not restart the component");
+        assertNull(harness.component("owner").pendingSnapshot());
+    }
+
+    private void chainedForeignRestartOwnersConverge(boolean driveSecondOwner) throws Exception {
+        AtomicInteger starts = new AtomicInteger();
+        harness.addComponent("owner", ignored -> starts.incrementAndGet());
+        assertEquals(ComponentState.ACTIVE, harness.drive("owner")
+                .get(10, TimeUnit.SECONDS));
+
+        List<Runnable> handoffTasks = new ArrayList<>();
+        ActivationCoordinator chained = new ActivationCoordinator(
+                harness.lock,
+                harness.store,
+                KnotraConfig.defaults(),
+                handoffTasks::add,
+                harness.nanos::incrementAndGet,
+                (activation, plans) -> new EmptyActivationContext(
+                        activation,
+                        harness.startActions.get(activation.owner.handleId())));
+        AtomicReference<ComponentRuntime.Reservation> cleanupReservation =
+                new AtomicReference<>();
+        AtomicReference<ComponentRuntime.Reservation> firstForeign =
+                new AtomicReference<>();
+        chained.cleanupFinalCommitProbe = () -> {
+            if (firstForeign.get() == null) {
+                ComponentRuntime component = harness.component("owner");
+                assertTrue(component.cancelTransition(
+                        cleanupReservation.get().future()));
+                firstForeign.set(component.reserveTransition(
+                        chained.scheduler().pendingTime(),
+                        "foreign restart owner 1"));
+            }
+        };
+
+        harness.markStopping("owner", ComponentGoal.RUNNING);
+        cleanupReservation.set(harness.component("owner").reserveTransition(
+                harness.nanos.incrementAndGet(), "cleanup"));
+        chained.driveTransition(
+                harness.component("owner"),
+                cleanupReservation.get().future());
+        awaitState("owner", ComponentState.WAITING);
+        assertNotNull(firstForeign.get());
+
+        // F1 完成后，回调看到槽位已被 F2 占用，必须继续挂 F2 的完成事件。
+        ComponentRuntime component = harness.component("owner");
+        assertTrue(component.cancelTransition(firstForeign.get().future()));
+        ComponentRuntime.Reservation secondForeign = component.reserveTransition(
+                chained.scheduler().pendingTime(), "foreign restart owner 2");
+        chained.scheduler().completeCancelled(List.of(firstForeign.get().future()));
+        assertEquals(1, handoffTasks.size(), "F1 completion must schedule one handoff callback");
+        handoffTasks.remove(0).run();
+
+        if (driveSecondOwner) {
+            assertTrue(component.ownsTransition(secondForeign.future()));
+            chained.scheduler().driveReservation(secondForeign);
+            assertEquals(1, handoffTasks.size(), "F2 driver must be submitted once");
+            handoffTasks.remove(0).run();
+
+            awaitState("owner", ComponentState.ACTIVE);
+            assertEquals(2, starts.get(), "normal F2 owner must start exactly once");
+            for (int drain = 0; drain < 4 && !handoffTasks.isEmpty(); drain++) {
+                handoffTasks.remove(0).run();
+            }
+            assertTrue(handoffTasks.isEmpty());
+            assertEquals(2, starts.get(), "F2 completion callback must not duplicate restart");
+            assertNull(component.pendingSnapshot());
+            return;
+        }
+        // F2 完成后同样必须交接到 F3，而不是只处理一层 FOREIGN。
+        assertTrue(component.cancelTransition(secondForeign.future()));
+        ComponentRuntime.Reservation thirdForeign = component.reserveTransition(
+                chained.scheduler().pendingTime(), "foreign restart owner 3");
+        chained.scheduler().completeCancelled(List.of(secondForeign.future()));
+        assertEquals(1, handoffTasks.size(), "F2 completion must schedule the next handoff");
+        handoffTasks.remove(0).run();
+
+        assertTrue(component.cancelTransition(thirdForeign.future()));
+        chained.scheduler().completeCancelled(List.of(thirdForeign.future()));
+        assertEquals(1, handoffTasks.size(), "F3 completion must schedule reconciliation");
+        handoffTasks.remove(0).run();
+        assertEquals(1, handoffTasks.size(), "independent restart must be driven once");
+        handoffTasks.remove(0).run();
+
+        awaitState("owner", ComponentState.ACTIVE);
+        assertEquals(2, starts.get(), "three foreign owners must produce one restart");
+        assertNull(component.pendingSnapshot());
+        // restart 的正常 completion 也走同一 executor；
+        // 排空少量合法任务后必须静止。
+        for (int drain = 0; drain < 4 && !handoffTasks.isEmpty(); drain++) {
+            handoffTasks.remove(0).run();
+        }
+        assertTrue(handoffTasks.isEmpty(), "converged handoff must not leave callbacks");
     }
 
     @Test

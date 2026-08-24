@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -156,8 +157,11 @@ final class KernelStateStoreTest {
 
     @Test
     void staleActivationFinalPublishConvergesOriginalFuture() throws Exception {
+        CountDownLatch activationPaused = new CountDownLatch(1);
+        CountDownLatch releaseActivation = new CountDownLatch(1);
         internal.activationCoordinator().activationFinalPublishProbe = () ->
                 commitUnrelatedGeneration(internal);
+        pauseActivationAtDecision(activationPaused, releaseActivation);
         try {
             MountHandle handle = runtime.advanced().transact(transaction -> transaction.mount(
                     runtime.root(),
@@ -168,17 +172,23 @@ final class KernelStateStoreTest {
                             context -> {
                             }))).value();
 
-            java.util.concurrent.ExecutionException settled =
+            // 在 primary 失败清槽前捕获真实过渡 future；事后 whenSettled 只能拿到
+            // 新的已完成观察 future，会造成观察窗口假失败。
+            CompletableFuture<ComponentState> settled =
+                    captureOriginalFuture(handle, activationPaused, releaseActivation);
+
+            java.util.concurrent.ExecutionException settledFailure =
                     assertThrows(
                             java.util.concurrent.ExecutionException.class,
-                            () -> handle.whenSettled().toCompletableFuture()
-                                    .get(10, TimeUnit.SECONDS));
-            assertTrue(settled.getCause() instanceof IllegalStateException);
-            assertTrue(settled.getCause().getMessage().contains(
+                            () -> settled.get(10, TimeUnit.SECONDS));
+            assertTrue(settledFailure.getCause() instanceof IllegalStateException);
+            assertTrue(settledFailure.getCause().getMessage().contains(
                     "stale kernel state expected"));
             PublishedKernelState state = internal.publishedState();
             state.validateInvariants();
         } finally {
+            releaseActivation.countDown();
+            internal.activationCoordinator().activationDecisionProbe = null;
             internal.activationCoordinator().activationFinalPublishProbe = null;
         }
     }
@@ -186,12 +196,15 @@ final class KernelStateStoreTest {
     @Test
     void staleActivationFinalPublishRecoversThroughCleanupAndRetry() throws Exception {
         CountDownLatch scopeCleanup = new CountDownLatch(1);
+        CountDownLatch activationPaused = new CountDownLatch(1);
+        CountDownLatch releaseActivation = new CountDownLatch(1);
         AtomicBoolean injected = new AtomicBoolean();
         internal.activationCoordinator().activationFinalPublishProbe = () -> {
             if (!injected.getAndSet(true)) {
                 commitUnrelatedGeneration(internal);
             }
         };
+        pauseActivationAtDecision(activationPaused, releaseActivation);
         try {
             MountHandle handle = runtime.advanced().transact(transaction -> transaction.mount(
                     runtime.root(),
@@ -203,7 +216,7 @@ final class KernelStateStoreTest {
                                     "stale-final-recovery-cleanup",
                                     scopeCleanup::countDown)))).value();
             CompletableFuture<ComponentState> settled =
-                    handle.whenSettled().toCompletableFuture();
+                    captureOriginalFuture(handle, activationPaused, releaseActivation);
 
             java.util.concurrent.ExecutionException failure =
                     assertThrows(
@@ -228,6 +241,8 @@ final class KernelStateStoreTest {
             assertEquals(ComponentState.ACTIVE, handle.retryAsync()
                     .toCompletableFuture().get(10, TimeUnit.SECONDS));
         } finally {
+            releaseActivation.countDown();
+            internal.activationCoordinator().activationDecisionProbe = null;
             internal.activationCoordinator().activationFinalPublishProbe = null;
         }
     }
@@ -235,6 +250,8 @@ final class KernelStateStoreTest {
     @Test
     void staleFinalPublishRecoveryFailureFallsBackToEmergency() throws Exception {
         CountDownLatch scopeCleanup = new CountDownLatch(1);
+        CountDownLatch activationPaused = new CountDownLatch(1);
+        CountDownLatch releaseActivation = new CountDownLatch(1);
         AtomicBoolean staleInjected = new AtomicBoolean();
         AtomicBoolean recoveryFaulted = new AtomicBoolean();
         internal.activationCoordinator().activationFinalPublishProbe = () -> {
@@ -242,6 +259,7 @@ final class KernelStateStoreTest {
                 commitUnrelatedGeneration(internal);
             }
         };
+        pauseActivationAtDecision(activationPaused, releaseActivation);
         internal.activationCoordinator().scheduler().transitionReservationProbe = () -> {
             // 只在恢复候选构造期间注入故障，避免影响挂载事务与首候选。
             if (staleInjected.get() && !recoveryFaulted.getAndSet(true)) {
@@ -259,7 +277,7 @@ final class KernelStateStoreTest {
                                     "emergency-final-publish-cleanup",
                                     scopeCleanup::countDown)))).value();
             CompletableFuture<ComponentState> settled =
-                    handle.whenSettled().toCompletableFuture();
+                    captureOriginalFuture(handle, activationPaused, releaseActivation);
 
             java.util.concurrent.ExecutionException failure =
                     assertThrows(
@@ -283,8 +301,70 @@ final class KernelStateStoreTest {
             assertTrue(runtime.advanced().pendingOperations().operations().stream()
                     .noneMatch(operation -> operation.targetId().equals(handle.handleId())));
         } finally {
+            releaseActivation.countDown();
+            internal.activationCoordinator().activationDecisionProbe = null;
             internal.activationCoordinator().activationFinalPublishProbe = null;
             internal.activationCoordinator().scheduler().transitionReservationProbe = null;
+        }
+    }
+
+    @Test
+    void primaryFailureCompletionGateBlocksCleanupFromCompletingOriginalFuture() throws Exception {
+        CountDownLatch activationPaused = new CountDownLatch(1);
+        CountDownLatch releaseActivation = new CountDownLatch(1);
+        CountDownLatch completionCaptured = new CountDownLatch(1);
+        CountDownLatch scopeCleanup = new CountDownLatch(1);
+        AtomicBoolean staleInjected = new AtomicBoolean();
+        AtomicReference<CompletableFuture<ComponentState>> gatedFuture = new AtomicReference<>();
+        AtomicReference<Runnable> gatedCompletion = new AtomicReference<>();
+        internal.activationCoordinator().activationFinalPublishProbe = () -> {
+            if (!staleInjected.getAndSet(true)) {
+                commitUnrelatedGeneration(internal);
+            }
+        };
+        pauseActivationAtDecision(activationPaused, releaseActivation);
+        internal.activationCoordinator().activationFailureCompletionGate = (future, completion) -> {
+            gatedFuture.set(future);
+            gatedCompletion.set(completion);
+            completionCaptured.countDown();
+        };
+        try {
+            MountHandle handle = runtime.advanced().transact(transaction -> transaction.mount(
+                    runtime.root(),
+                    "primary-failure-ownership",
+                    MountFactory.of(
+                            "primary-failure-ownership",
+                            ComponentDescriptor.named("primary-failure-ownership"),
+                            context -> context.lifecycle().onClose(
+                                    "primary-failure-ownership-cleanup",
+                                    scopeCleanup::countDown)))).value();
+
+            CompletableFuture<ComponentState> observed =
+                    captureOriginalFuture(handle, activationPaused, releaseActivation);
+            assertTrue(completionCaptured.await(10, TimeUnit.SECONDS));
+            CompletableFuture<ComponentState> original = gatedFuture.get();
+            assertSame(original, observed);
+
+            // cleanup 先提交状态与 scope 清理；原始 future 仍由 primary 失败持有，保持 pending。
+            assertTrue(scopeCleanup.await(10, TimeUnit.SECONDS));
+            assertEquals(ComponentState.FAILED, awaitTerminalState(handle.handleId()));
+            assertFalse(original.isDone(),
+                    "cleanup must not normally complete a future owned by primary failure");
+
+            // 释放 gate 后原始 future 收到异常 stale 完成，而不是正常 FAILED。
+            gatedCompletion.get().run();
+            java.util.concurrent.ExecutionException failure =
+                    assertThrows(
+                            java.util.concurrent.ExecutionException.class,
+                            () -> original.get(10, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof IllegalStateException);
+            assertTrue(failure.getCause().getMessage().contains(
+                    "stale kernel state expected"));
+        } finally {
+            releaseActivation.countDown();
+            internal.activationCoordinator().activationDecisionProbe = null;
+            internal.activationCoordinator().activationFinalPublishProbe = null;
+            internal.activationCoordinator().activationFailureCompletionGate = null;
         }
     }
 
@@ -437,6 +517,32 @@ final class KernelStateStoreTest {
                 context -> context.name().startsWith("linear-context-")));
     }
 
+    private void pauseActivationAtDecision(
+            CountDownLatch activationPaused,
+            CountDownLatch releaseActivation) {
+        internal.activationCoordinator().activationDecisionProbe = () -> {
+            internal.activationCoordinator().activationDecisionProbe = null;
+            activationPaused.countDown();
+            try {
+                assertTrue(releaseActivation.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        };
+    }
+
+    private CompletableFuture<ComponentState> captureOriginalFuture(
+            MountHandle handle,
+            CountDownLatch activationPaused,
+            CountDownLatch releaseActivation) throws InterruptedException {
+        assertTrue(activationPaused.await(10, TimeUnit.SECONDS),
+                "activation did not reach decision probe");
+        // 此刻 primary 失败尚未清槽，whenSettled 返回的就是原始过渡 future。
+        CompletableFuture<ComponentState> settled =
+                handle.whenSettled().toCompletableFuture();
+        releaseActivation.countDown();
+        return settled;
+    }
     private static PublishedKernelState uncheckedGet(
             Future<PublishedKernelState> future) {
         try {

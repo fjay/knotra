@@ -17,14 +17,17 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.ref.WeakReference;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -219,6 +222,92 @@ final class ContextDisposalCoordinatorTest {
     }
 
     @Test
+    void preparationFailureDoesNotContinueIntoFinalization() {
+        Queue<Runnable> completions = new ArrayDeque<>();
+        try (Harness queued = new Harness(completions::add)) {
+            ContextHandleImpl context = queued.seedContext("queued-prepare-failure", "ctx-root");
+            queued.seedComponent(
+                    "queued-prepare-component", "queued-prepare-failure", ComponentState.ACTIVE);
+            queued.port.failPreparation = true;
+
+            CompletableFuture<Void> future = queued.coordinator
+                    .dispose(context, false)
+                    .toCompletableFuture();
+
+            assertEquals(1, completions.size());
+            completions.poll().run();
+            CompletionFailure failure = awaitFailure(future);
+            assertTrue(failure.message().contains("context disposal commit failed"),
+                    failure.message());
+            RuntimeView view = queued.store.read().view;
+            assertEquals(ContextState.ACTIVE, view.contexts
+                    .get("queued-prepare-failure").state());
+            assertTrue(view.components.containsKey("queued-prepare-component"));
+            assertTrue(queued.store.read().index.contextHandles
+                    .containsKey("queued-prepare-failure"));
+            assertTrue(queued.coordinator.pending().isEmpty());
+            assertEquals(1, queued.port.cancelled);
+        }
+    }
+
+    @Test
+    void rootClosePreparationFailureCannotBecomeSuccessfulDisposal() {
+        Queue<Runnable> completions = new ArrayDeque<>();
+        try (Harness queued = new Harness(completions::add)) {
+            queued.seedContext("queued-root-child", "ctx-root");
+            queued.seedComponent(
+                    "queued-root-component", "queued-root-child", ComponentState.ACTIVE);
+            queued.port.failPreparation = true;
+
+            CompletableFuture<Void> future = queued.coordinator
+                    .dispose(queued.rootHandle(), true)
+                    .toCompletableFuture();
+
+            assertEquals(1, completions.size());
+            completions.poll().run();
+            CompletionFailure failure = awaitFailure(future);
+            assertTrue(failure.message().contains("context disposal commit failed"),
+                    failure.message());
+            RuntimeView view = queued.store.read().view;
+            assertEquals(ContextState.ACTIVE, view.contexts.get("ctx-root").state());
+            assertEquals(ContextState.ACTIVE, view.contexts
+                    .get("queued-root-child").state());
+            assertTrue(view.components.containsKey("queued-root-component"));
+            assertTrue(queued.coordinator.pending().isEmpty());
+            assertEquals(1, queued.port.cancelled);
+        }
+    }
+
+    @Test
+    void initialCommitFailureDoesNotContinueIntoFinalization() {
+        Queue<Runnable> completions = new ArrayDeque<>();
+        try (Harness queued = new Harness(completions::add)) {
+            ContextHandleImpl context = queued.seedContext("queued-commit-failure", "ctx-root");
+            queued.seedComponent(
+                    "queued-commit-component", "queued-commit-failure", ComponentState.ACTIVE);
+            queued.port.beforeReturn = queued::commitUnrelatedGeneration;
+
+            CompletableFuture<Void> future = queued.coordinator
+                    .dispose(context, false)
+                    .toCompletableFuture();
+
+            assertEquals(1, completions.size());
+            completions.poll().run();
+            CompletionFailure failure = awaitFailure(future);
+            assertTrue(failure.message().contains("context disposal commit failed"),
+                    failure.message());
+            RuntimeView view = queued.store.read().view;
+            assertEquals(ContextState.ACTIVE, view.contexts
+                    .get("queued-commit-failure").state());
+            assertTrue(view.components.containsKey("queued-commit-component"));
+            assertTrue(queued.store.read().index.contextHandles
+                    .containsKey("queued-commit-failure"));
+            assertTrue(queued.coordinator.pending().isEmpty());
+            assertEquals(1, queued.port.cancelled);
+        }
+    }
+
+    @Test
     void staleFinalizationCommitFailsFutureAndClearsDeduplication() throws Exception {
         ContextHandleImpl context = harness.seedContext("stale-finalization", "ctx-root");
         AtomicBoolean injected = new AtomicBoolean();
@@ -328,18 +417,22 @@ final class ContextDisposalCoordinatorTest {
         final FakeStructuralPort port = new FakeStructuralPort();
         final ContextDisposalCoordinator coordinator;
         final AtomicLong nanos = new AtomicLong();
-        private final ExecutorService executor =
-                Executors.newVirtualThreadPerTaskExecutor();
+        private final ExecutorService executor;
         private final ExecutorService callbackExecutor =
                 Executors.newFixedThreadPool(2);
 
         private Harness() {
+            this(Executors.newVirtualThreadPerTaskExecutor());
+        }
+
+        private Harness(Executor coordinatorExecutor) {
+            executor = Executors.newVirtualThreadPerTaskExecutor();
             ContextHandleImpl root = new ContextHandleImpl(null, "ctx-root");
             store = KernelStateStore.initial(lock, root);
             coordinator = new ContextDisposalCoordinator(
                     lock,
                     store,
-                    executor,
+                    coordinatorExecutor,
                     nanos::incrementAndGet,
                     KnotraConfig.defaults(),
                     port);
@@ -569,6 +662,7 @@ final class ContextDisposalCoordinatorTest {
         boolean failPreparation;
         boolean blockTransitions;
         boolean markCleanupFailed;
+        Runnable beforeReturn;
         final List<String> appliedCleanupIntents = new ArrayList<>();
         final List<String> retiredRegistrations = new ArrayList<>();
         final List<ComponentRuntime.Reservation> blockedReservations = new ArrayList<>();
@@ -583,6 +677,9 @@ final class ContextDisposalCoordinatorTest {
             prepared++;
             if (failPreparation) {
                 throw new IllegalStateException("injected preparation failure");
+            }
+            if (beforeReturn != null) {
+                beforeReturn.run();
             }
             if (!blockTransitions) {
                 return new PreparedTransitions(TransitionPlan.EMPTY, List.of());
