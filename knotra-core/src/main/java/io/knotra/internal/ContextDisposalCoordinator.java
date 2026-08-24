@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Executor;
@@ -175,7 +176,12 @@ final class ContextDisposalCoordinator {
         String forcedFailure = postCommitFailure;
         Set<String> disposedSubtree = subtree;
         settlement.whenComplete((ignored, error) ->
-                finalizeContext(disposedSubtree, contextFuture, forcedFailure));
+                finalizeContext(
+                        disposedSubtree,
+                        contextFuture,
+                        PostCommitFaults.append(
+                                forcedFailure,
+                                transitionSettlementFailure(error))));
         return future;
     }
 
@@ -282,24 +288,36 @@ final class ContextDisposalCoordinator {
                 ? subtreeSettlement
                 : CompletableFuture.allOf(prerequisite, subtreeSettlement);
         settlement.whenComplete((ignored, error) ->
-                finalizeContext(subtree, future, null));
+                finalizeContext(
+                        subtree,
+                        future,
+                        transitionSettlementFailure(error)));
         return future;
     }
 
     private void finalizeContext(
             Set<String> subtree,
             CompletableFuture<Void> future,
-            String postCommitFailure) {
+            String settlementFailure) {
         Runnable contextCompletion = null;
         synchronized (coordinatorLock) {
             PublishedKernelState state = kernelState.read();
             RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
             KernelStateDraft indexDraft = new KernelStateDraft(state);
-            boolean failed = postCommitFailure != null
-                    || draft.components.values().stream()
+            List<RuntimeView.ComponentData> liveComponents =
+                    draft.components.values().stream()
                             .filter(component -> subtree.contains(component.contextId()))
-                            .anyMatch(component -> component.state()
-                                    == ComponentState.FAILED);
+                            .toList();
+            boolean hasUnsettledComponent =
+                    liveComponents.stream().anyMatch(component ->
+                            component.state() == ComponentState.FAILED
+                                    || component.state() == ComponentState.STOPPING);
+            boolean failed = settlementFailure != null
+                    || !liveComponents.isEmpty()
+                    || hasUnsettledComponent;
+            String failureMessage = settlementFailure != null
+                    ? settlementFailure
+                    : "context cleanup failed: subtree still contains components";
             for (String contextId : subtree) {
                 RuntimeView.ContextData data = draft.contexts.get(contextId);
                 if (data != null) {
@@ -337,9 +355,7 @@ final class ContextDisposalCoordinator {
                     }
                     if (finalFailed) {
                         future.completeExceptionally(new IllegalStateException(
-                                postCommitFailure == null
-                                        ? "context cleanup failed"
-                                        : postCommitFailure));
+                                failureMessage));
                     } else {
                         future.complete(null);
                     }
@@ -403,6 +419,22 @@ final class ContextDisposalCoordinator {
                     + LifecycleScopeImpl.safeError(cancelError);
         }
     }
+
+    private static String transitionSettlementFailure(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        Throwable current = error;
+        while (current instanceof CompletionException
+                && current.getCause() != null
+                && current.getCause() != current) {
+            current = current.getCause();
+        }
+        // Context state and request registries retain text only, never Throwable stacks.
+        return "context transition settlement failed: "
+                + LifecycleScopeImpl.safeError(current);
+    }
+
 
     private void runContextFinalCommitProbe() {
         Runnable probe = contextFinalCommitProbe;

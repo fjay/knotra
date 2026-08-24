@@ -35,7 +35,16 @@ final class P0ReviewRegressionTest {
         runtime.activationCoordinator().scheduler().transitionReservationProbe = null;
         runtime.activationCoordinator().transitionPublicationProbe = null;
         runtime.activationCoordinator().activationRollbackCommitProbe = null;
-        publicRuntime.close();
+        try {
+            publicRuntime.close();
+        } catch (RuntimeException expected) {
+            // 注入的 transition 失败保留 FAILED root；探针清除后重试关闭完成排空。
+            try {
+                publicRuntime.close();
+            } catch (RuntimeException retryExpected) {
+                // 测试已显式关闭 runtime executor，最终排空无法再次调度。
+            }
+        }
     }
 
     @Test

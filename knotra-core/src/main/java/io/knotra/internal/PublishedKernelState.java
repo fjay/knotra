@@ -84,12 +84,22 @@ final class PublishedKernelState {
                 view.registrations.keySet(),
                 index.providerLeases.keySet());
         view.registrations.forEach((registrationId, registration) -> {
-            if (index.providerLeases.get(registrationId) != registration.leases()) {
+            if (!view.contexts.containsKey(registration.contextId())) {
+                throw new IllegalStateException(
+                        "registration references an unpublished context: "
+                                + registrationId);
+            }
+            if (index.providerLeases.get(registrationId)
+                    != registration.leases()) {
                 throw new IllegalStateException(
                         "provider lease identity mismatch: " + registrationId);
             }
         });
         view.components.forEach((handleId, data) -> {
+            if (!view.contexts.containsKey(data.contextId())) {
+                throw new IllegalStateException(
+                        "component references an unpublished context: " + handleId);
+            }
             ComponentRuntime runtime = index.components.get(handleId);
             if (runtime == null
                     || !handleId.equals(runtime.handleId())
@@ -105,16 +115,31 @@ final class PublishedKernelState {
                 throw new IllegalStateException(
                         "component handle identity mismatch: " + handleId);
             }
+            if (data.currentActivationId() != null) {
+                RuntimeView.ActivationData activation =
+                        view.activations.get(data.currentActivationId());
+                if (activation == null
+                        || !handleId.equals(activation.handleId())) {
+                    throw new IllegalStateException(
+                            "component references an invalid current activation: "
+                                    + handleId);
+                }
+            }
         });
 
         view.activations.forEach((activationId, data) -> {
             ActivationRuntime runtime = index.activations.get(activationId);
+            RuntimeView.ComponentData component =
+                    view.components.get(data.handleId());
+            ComponentRuntime componentRuntime =
+                    component == null ? null : index.components.get(data.handleId());
             if (runtime == null
                     || !activationId.equals(runtime.activationId)
-                    || !data.handleId().equals(runtime.owner.handleId())
-                    || index.components.get(data.handleId()) != runtime.owner) {
+                    || component == null
+                    || componentRuntime != runtime.owner
+                    || !component.contextId().equals(runtime.owner.contextId())) {
                 throw new IllegalStateException(
-                        "activation runtime identity mismatch: " + activationId);
+                        "activation owner identity mismatch: " + activationId);
             }
         });
 
@@ -145,6 +170,11 @@ final class PublishedKernelState {
             RuntimeView view, ExecutionIndex index) {
         Set<RuntimeView.PublicationSlotKey> activeKeys = new HashSet<>();
         for (RuntimeView.PublicationSlotData slot : view.publicationSlots.values()) {
+            if (!view.contexts.containsKey(slot.contextId())) {
+                throw new IllegalStateException(
+                        "publication slot references an unpublished context: "
+                                + slot.slotId());
+            }
             activeKeys.add(new RuntimeView.PublicationSlotKey(
                     slot.contextId(), slot.capabilityName()));
             RuntimeView.RegistrationData current =

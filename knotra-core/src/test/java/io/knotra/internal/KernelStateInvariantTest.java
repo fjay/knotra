@@ -29,12 +29,62 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class KernelStateInvariantTest {
     private final KnotraRuntime runtime = KnotraRuntime.create();
     private final DefaultKnotraRuntime internal =
             (DefaultKnotraRuntime) runtime;
+
+    @Test
+    void referentialInvariantsRejectOrphanStructures() {
+        assertInvalidState("component context", (draft, index) -> {
+            String contextId = onlyChildContext(draft);
+            draft.contexts.remove(contextId);
+            index.contextHandles().remove(contextId);
+        });
+        assertInvalidState("publication slot context", (draft, index) -> {
+            RuntimeView.PublicationSlotData slot =
+                    draft.publicationSlots.values().iterator().next();
+            draft.publicationSlots.put(slot.slotId(),
+                    new RuntimeView.PublicationSlotData(
+                            slot.slotId(),
+                            "missing-context",
+                            slot.capabilityName(),
+                            slot.typeName(),
+                            slot.currentRegistrationId(),
+                            slot.lastRegistrationId(),
+                            slot.epoch(),
+                            slot.lastChangedGeneration()));
+        });
+        assertInvalidState("registration context", (draft, index) -> {
+            RuntimeView.RegistrationData registration =
+                    draft.registrations.values().iterator().next();
+            draft.registrations.put(registration.registrationId(),
+                    new RuntimeView.RegistrationData(
+                            registration.registrationId(),
+                            registration.key(),
+                            "missing-context",
+                            registration.owner(),
+                            registration.value(),
+                            registration.leases(),
+                            registration.publicationSlotId()));
+        });
+        assertInvalidState("activation owner", (draft, index) -> {
+            RuntimeView.ActivationData activation =
+                    draft.activations.values().iterator().next();
+            draft.activations.put(activation.activationId(),
+                    new RuntimeView.ActivationData(
+                            activation.activationId(),
+                            "missing-owner",
+                            activation.state(),
+                            activation.configRevision(),
+                            activation.bindings(),
+                            activation.descriptor(),
+                            activation.scopeId()));
+        });
+    }
 
     @AfterEach
     void tearDown() throws Exception {
@@ -508,6 +558,60 @@ final class KernelStateInvariantTest {
         };
     }
 
+    private interface StateCorruption {
+        void apply(RuntimeView.Draft draft, KernelStateDraft index);
+    }
+
+    private void assertInvalidState(String label, StateCorruption corruption) {
+        try (KnotraRuntime invalidRuntime = KnotraRuntime.create()) {
+            DefaultKnotraRuntime invalidInternal =
+                    (DefaultKnotraRuntime) invalidRuntime;
+            ContextHandle context = invalidRuntime.advanced().childContext(
+                    invalidRuntime.root(), label);
+            invalidRuntime.publish(
+                    context,
+                    CapabilityKey.of(label + "-publication", String.class),
+                    "value").publication();
+            invalidRuntime.advanced().transact(transaction -> transaction.provide(
+                    context,
+                    CapabilityKey.of(label + "-capability", String.class),
+                    "value"));
+            MountHandle handle = invalidRuntime.advanced().transact(
+                    transaction -> transaction.mount(
+                            context,
+                            label,
+                            factoryProviding(
+                                    CapabilityKey.of(label + "-owned", String.class),
+                                    "value")))
+                    .value();
+            assertEquals(ComponentState.ACTIVE, handle.whenSettled()
+                    .toCompletableFuture().join());
+
+            synchronized (invalidInternal.coordinator) {
+                PublishedKernelState state = invalidInternal.publishedState();
+                RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
+                KernelStateDraft index = new KernelStateDraft(state);
+                corruption.apply(draft, index);
+                PublishedKernelState invalid;
+                try {
+                    invalid = index.publish(draft.publishOnce());
+                } catch (IllegalStateException expectedWhenAssertionsAreEnabled) {
+                    // Publication-time validation is intentionally strict under -ea.
+                    return;
+                }
+                assertThrows(IllegalStateException.class,
+                        invalid::validateInvariants,
+                        label);
+            }
+        }
+    }
+
+    private static String onlyChildContext(RuntimeView.Draft draft) {
+        return draft.contexts.keySet().stream()
+                .filter(contextId -> !"ctx-root".equals(contextId))
+                .findFirst()
+                .orElseThrow();
+    }
 
     private static String stateDiagnostic(PublishedKernelState state) {
         return "generation=" + state.view.generation

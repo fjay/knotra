@@ -1,8 +1,12 @@
 package io.knotra.internal;
 
+import io.knotra.ActivationContext;
 import io.knotra.CapabilityKey;
 import io.knotra.CapabilityRequirement;
+import io.knotra.Component;
 import io.knotra.ComponentDescriptor;
+import io.knotra.ComponentFactory;
+import io.knotra.ConfiguredMountHandle;
 import io.knotra.ComponentState;
 import io.knotra.ContextHandle;
 import io.knotra.KnotraRuntime;
@@ -511,6 +515,105 @@ final class ActivationCommitPipelineTest {
                 "emergency rollback must not reset cycle suppression");
         assertEquals(ComponentState.FAILED, handle.state());
     }
+
+    @Test
+    void postCommitFailureRechecksLatestStateBeforeFailingMergedTransition()
+            throws Exception {
+        CountDownLatch failureHandlingPaused = new CountDownLatch(1);
+        CountDownLatch releaseFailureHandling = new CountDownLatch(1);
+        CountDownLatch scopeCleanup = new CountDownLatch(1);
+        AtomicBoolean effectFaulted = new AtomicBoolean();
+        AtomicReference<CompletableFuture<ComponentState>> merged = new AtomicReference<>();
+
+        runtime.activationCoordinator().activationPostPublishEffectProbe = () -> {
+            if (!effectFaulted.getAndSet(true)) {
+                throw new IllegalStateException("injected postcommit effect fault");
+            }
+        };
+        runtime.activationCoordinator().activationDecisionProbe = () -> {
+            PublishedKernelState state = runtime.publishedState();
+            boolean targetActive = state.view.components.values().stream()
+                    .anyMatch(component -> "postcommit-race".equals(component.mountId())
+                            && component.state() == ComponentState.ACTIVE);
+            if (!targetActive) {
+                return;
+            }
+            failureHandlingPaused.countDown();
+            try {
+                assertTrue(releaseFailureHandling.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        try {
+            ComponentFactory<String> configuredFactory = new ComponentFactory<>() {
+                @Override
+                public String factoryId() {
+                    return "postcommit-race";
+                }
+
+                @Override
+                public Component<String> create() {
+                    return new Component<>() {
+                        @Override
+                        public ComponentDescriptor descriptor() {
+                            return ComponentDescriptor.named("postcommit-race");
+                        }
+
+                        @Override
+                        public void start(
+                                ActivationContext context, String config) {
+                            context.lifecycle().onClose(
+                                    "postcommit-race-cleanup",
+                                    scopeCleanup::countDown);
+                        }
+                    };
+                }
+            };
+            ConfiguredMountHandle<String> handle = publicRuntime.advanced().transact(
+                    transaction -> transaction.mount(
+                            publicRuntime.root(),
+                            "postcommit-race",
+                            configuredFactory,
+                            "v1")).value();
+            assertTrue(failureHandlingPaused.await(10, TimeUnit.SECONDS),
+                    () -> "decision gate not reached; state="
+                            + runtime.publishedState().view.components
+                            .get(handle.handleId()));
+            handle.reconfigureAsync("v2");
+            merged.set(handle.whenSettled().toCompletableFuture());
+            assertEquals(ComponentState.STOPPING, handle.state());
+            releaseFailureHandling.countDown();
+
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> merged.get().get(10, TimeUnit.SECONDS));
+            assertTrue(rootCause(failure).getMessage()
+                    .contains("injected postcommit effect fault"));
+            assertTrue(scopeCleanup.await(10, TimeUnit.SECONDS),
+                    () -> "component stuck " + handle.state()
+                            + ", pending=" + publicRuntime.advanced().pendingOperations());
+            awaitState(handle.handleId(), ComponentState.ACTIVE);
+            deadlineSpin(10_000, () ->
+                    publicRuntime.advanced().pendingOperations().operations().stream()
+                            .noneMatch(operation ->
+                                    operation.targetId().equals(handle.handleId())),
+                    () -> "pending operation for handle " + handle.handleId()
+                            + " never drained: "
+                            + publicRuntime.advanced().pendingOperations());
+            assertTrue(publicRuntime.advanced().pendingOperations().operations()
+                    .stream().noneMatch(operation ->
+                            operation.targetId().equals(handle.handleId())),
+                    () -> "handle " + handle.handleId() + " still has pending operations: "
+                            + publicRuntime.advanced().pendingOperations());
+        } finally {
+            releaseFailureHandling.countDown();
+            runtime.activationCoordinator().activationDecisionProbe = null;
+            runtime.activationCoordinator().activationPostPublishEffectProbe = null;
+        }
+    }
+
     private static MountFactory parentProviding(
             CapabilityKey<String> key,
             String childMountId,

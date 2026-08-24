@@ -442,7 +442,6 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
 
         ActivationCommitCandidate candidate = null;
         boolean emergencyRollback = false;
-        boolean cleanupRequired = false;
         List<CompletableFuture<ComponentState>> cancelledTransitions = List.of();
         String postCommitFailure = null;
         String emergencyFailure = null;
@@ -609,7 +608,6 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
                     try {
                         candidate.applyEffects(activation);
                         runActivationPostPublishEffectProbe();
-                        cleanupRequired = decisionCleanupRequired(runtime);
                         if (candidate.abortedCandidate()) {
                             runActivationRollbackCommitProbe();
                         }
@@ -669,37 +667,34 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
                     : postCommitFailure + "; additional scheduling failed: "
                             + LifecycleScopeImpl.safeError(scheduleError);
         }
+        Runnable transitionCompletion = null;
+        Runnable primaryFailureCompletion = null;
+        boolean cleanupRequired;
+        synchronized (coordinator) {
+            // 清槽/完成旧 future 前必须按最新代际重算责任：并发 reconfigure、
+            // dispose 或 context close 可能已把该 future 合并为 STOPPING transition。
+            cleanupRequired = latestPostCommitCleanupRequired(runtime, activation);
+            if (postCommitFailure != null) {
+                primaryFailureCompletion = runtime.failTransition(
+                        future,
+                        new IllegalStateException(postCommitFailure));
+            } else if (!cleanupRequired) {
+                ComponentState currentState = currentState(runtime.handleId());
+                transitionCompletion = prepareTransitionCompletion(
+                        runtime,
+                        future,
+                        currentState);
+            }
+        }
+
         if (postCommitFailure != null) {
             // 已提交结构保持不变；原始过渡 future 异常完成，不得永久 pending。
-            // failTransition 已在此清槽，后续 cleanup 不得再竞争完成该 future。
-            dispatchPrimaryFailureCompletion(
-                    future,
-                    runtime.failTransition(
-                            future,
-                            new IllegalStateException(postCommitFailure)));
+            // failTransition 已在协调器内清槽，后续 cleanup 不得再竞争完成该 future。
+            dispatchPrimaryFailureCompletion(future, primaryFailureCompletion);
             if (cleanupRequired) {
                 finishCleanupAfterDependents(runtime, activation, future);
             }
             return;
-        }
-
-        Runnable transitionCompletion = null;
-        if (!cleanupRequired) {
-            synchronized (coordinator) {
-                // 结构事务可能在 Activation 裁决释放锁后把同一 future 改成 STOPPING。
-                PublishedKernelState state = kernelState.read();
-                RuntimeView.ComponentData data =
-                        state.view.components.get(runtime.handleId());
-                ComponentState currentState =
-                        data == null ? ComponentState.DISPOSED : data.state();
-                cleanupRequired = currentState == ComponentState.STOPPING;
-                if (!cleanupRequired) {
-                    transitionCompletion = prepareTransitionCompletion(
-                            runtime,
-                            future,
-                            currentState);
-                }
-            }
         }
         dispatchCompletion(transitionCompletion);
         if (cleanupRequired) {
@@ -902,10 +897,29 @@ final class ActivationCoordinator implements StructuralPostCommitPort {
         }
     }
 
-    private boolean decisionCleanupRequired(ComponentRuntime runtime) {
-        RuntimeView.ComponentData data =
-                kernelState.read().view.components.get(runtime.handleId());
-        return data != null && data.state() == ComponentState.STOPPING;
+    private boolean latestPostCommitCleanupRequired(
+            ComponentRuntime runtime,
+            ActivationRuntime activation) {
+        assert Thread.holdsLock(coordinator);
+        PublishedKernelState state = kernelState.read();
+        if (activation.stale.get()) {
+            return true;
+        }
+        ComponentRuntime current = state.index.components.get(runtime.handleId());
+        if (current != runtime || current.current() != activation) {
+            return true;
+        }
+        RuntimeView.ComponentData data = state.view.components.get(runtime.handleId());
+        if (data == null
+                || data.state() == ComponentState.STOPPING
+                || data.goal() == ComponentGoal.DISPOSED) {
+            return true;
+        }
+        RuntimeView.ActivationData activationData =
+                state.view.activations.get(activation.activationId);
+        return activationData == null
+                || activationData.state() == ActivationState.STOPPING
+                || activationData.state() == ActivationState.FAILED;
     }
 
     // 提供方自身 teardown 前，先等待直接和间接依赖方完成旧 Activation 清理。

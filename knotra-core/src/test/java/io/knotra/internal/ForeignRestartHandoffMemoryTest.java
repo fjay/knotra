@@ -8,6 +8,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -154,8 +155,10 @@ final class ForeignRestartHandoffMemoryTest {
 
     private static boolean gcCleared(WeakReference<?> reference) {
         for (int attempt = 0; attempt < 100 && reference.get() != null; attempt++) {
+            byte[] allocationPressure = new byte[1024 * 1024];
+            allocationPressure[0] = 1;
+            Reference.reachabilityFence(allocationPressure);
             System.gc();
-            System.runFinalization();
             try {
                 Thread.sleep(10);
             } catch (InterruptedException error) {

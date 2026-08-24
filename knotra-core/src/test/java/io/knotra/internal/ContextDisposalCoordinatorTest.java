@@ -143,6 +143,31 @@ final class ContextDisposalCoordinatorTest {
     }
 
     @Test
+    void repeatedParentChildCombinationRemainsRetrySafe() throws Exception {
+        for (int round = 0; round < 500; round++) {
+            String parent = "stress-parent-" + round;
+            String child = "stress-child-" + round;
+            ContextHandleImpl parentHandle = harness.seedContext(parent, "ctx-root");
+            ContextHandleImpl childHandle = harness.seedContext(child, parent);
+            harness.seedComponent(parent + "-component", parent,
+                    ComponentState.ACTIVE);
+            harness.seedComponent(child + "-component", child,
+                    ComponentState.ACTIVE);
+
+            CompletableFuture<Void> childDisposal = CompletableFuture.runAsync(
+                    () -> harness.coordinator.dispose(childHandle, false),
+                    harness.callbackExecutor);
+            CompletableFuture<Void> parentDisposal = CompletableFuture.runAsync(
+                    () -> harness.coordinator.dispose(parentHandle, false),
+                    harness.callbackExecutor);
+            parentDisposal.get(10, TimeUnit.SECONDS);
+            childDisposal.get(10, TimeUnit.SECONDS);
+        }
+        assertTrue(harness.coordinator.pending().isEmpty());
+        harness.store.read().validateInvariants();
+    }
+
+    @Test
     void failedCleanupRetryIntentIsAppliedOnlyAfterDisposalCommit() throws Exception {
         ContextHandleImpl context = harness.seedContext("failed-cleanup", "ctx-root");
         harness.port.markCleanupFailed = true;
@@ -159,6 +184,42 @@ final class ContextDisposalCoordinatorTest {
         assertSame(ComponentRuntime.RetryIntent.CLEANUP, component.peekRetryIntent());
         assertEquals(ContextState.FAILED, harness.store.read().view.contexts
                 .get("failed-cleanup").state());
+    }
+
+    @Test
+    void transitionSettlementFailureKeepsFailedContextRetryable() throws Exception {
+        ContextHandleImpl context = harness.seedContext("transition-failure", "ctx-root");
+        harness.seedStoppingComponent(
+                "transition-failure-component", "transition-failure");
+        harness.port.failTransitions = true;
+
+        CompletableFuture<Void> disposed = harness.coordinator
+                .dispose(context, false)
+                .toCompletableFuture();
+        CompletionFailure failure = awaitFailure(disposed);
+        assertTrue(failure.message().contains("injected transition settlement fault"),
+                failure.message());
+
+        PublishedKernelState state = harness.store.read();
+        assertEquals(ContextState.FAILED, state.view.contexts
+                .get("transition-failure").state());
+        assertTrue(state.view.components.containsKey("transition-failure-component"));
+        assertTrue(state.index.contextHandles.containsKey("transition-failure"));
+        assertTrue(harness.coordinator.pending().isEmpty(),
+                "failed context remains retryable without a false pending success");
+        state.validateInvariants();
+
+        harness.port.failTransitions = false;
+        harness.port.finishTransitionsOnRetry = true;
+        harness.coordinator.dispose(context, false)
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+        PublishedKernelState retried = harness.store.read();
+        assertFalse(retried.view.contexts.containsKey("transition-failure"));
+        assertFalse(retried.view.components.containsKey("transition-failure-component"));
+        assertFalse(retried.index.contextHandles.containsKey("transition-failure"));
+        assertTrue(harness.coordinator.pending().isEmpty());
+        retried.validateInvariants();
     }
 
     @Test
@@ -359,8 +420,10 @@ final class ContextDisposalCoordinatorTest {
             RuntimeView.Draft draft = new RuntimeView.Draft(state.view);
             KernelStateDraft index = new KernelStateDraft(state);
             draft.components.remove("pending-component");
+            draft.activations.remove("activation-pending-component");
             index.components().remove("pending-component");
             index.componentHandles().remove("pending-component");
+            index.activations().remove("activation-pending-component");
             harness.store.commitLocked(state, index.publish(draft.publishOnce()));
         }
         for (ComponentRuntime.Reservation reservation : harness.port.blockedReservations) {
@@ -553,6 +616,16 @@ final class ContextDisposalCoordinatorTest {
                 KernelStateDraft index = new KernelStateDraft(current);
                 ComponentRuntime runtime = new ComponentRuntime(
                         handleId, contextId, handleId, prepared, lock);
+                ActivationRuntime activation = new ActivationRuntime(
+                        "activation-" + handleId,
+                        runtime,
+                        NoConfig.INSTANCE,
+                        1,
+                        Map.of(),
+                        List.of(),
+                        nanos::incrementAndGet);
+                runtime.claimCurrentLocked(activation);
+                String activationId = activation.activationId;
                 PlainMountHandleImpl handle = new PlainMountHandleImpl(
                         null,
                         handleId,
@@ -560,9 +633,18 @@ final class ContextDisposalCoordinatorTest {
                                 handleId, handleId, handleId, contextId));
                 draft.components.put(handleId, componentData(
                         handleId, contextId, prepared, ComponentState.STOPPING)
-                        .withActivation("activation-" + handleId));
+                        .withActivation(activationId));
+                draft.activations.put(activationId, new RuntimeView.ActivationData(
+                        activationId,
+                        handleId,
+                        ActivationState.STARTING,
+                        1,
+                        Map.of(),
+                        prepared.descriptor(),
+                        activation.scope.scopeId()));
                 index.components().put(handleId, runtime);
                 index.componentHandles().put(handleId, handle);
+                index.activations().put(activationId, activation);
                 store.commitLocked(current, index.publish(draft.publishOnce()));
             }
         }
@@ -662,6 +744,8 @@ final class ContextDisposalCoordinatorTest {
         boolean failPreparation;
         boolean blockTransitions;
         boolean markCleanupFailed;
+        boolean failTransitions;
+        boolean finishTransitionsOnRetry;
         Runnable beforeReturn;
         final List<String> appliedCleanupIntents = new ArrayList<>();
         final List<String> retiredRegistrations = new ArrayList<>();
@@ -681,7 +765,11 @@ final class ContextDisposalCoordinatorTest {
             if (beforeReturn != null) {
                 beforeReturn.run();
             }
-            if (!blockTransitions) {
+            if (finishTransitionsOnRetry) {
+                finishPreparedTransitions(draft, dirty, index);
+                return new PreparedTransitions(TransitionPlan.EMPTY, List.of());
+            }
+            if (!blockTransitions && !failTransitions) {
                 return new PreparedTransitions(TransitionPlan.EMPTY, List.of());
             }
             List<ComponentRuntime.Reservation> reservations = new ArrayList<>();
@@ -696,6 +784,22 @@ final class ContextDisposalCoordinatorTest {
             return new PreparedTransitions(
                     TransitionPlan.of(reservations, List.of(), List.copyOf(dirty)),
                     reservations);
+        }
+
+        private void finishPreparedTransitions(
+                RuntimeView.Draft draft,
+                Set<String> dirty,
+                KernelStateDraft index) {
+            for (String handleId : dirty) {
+                RuntimeView.ComponentData component =
+                        draft.components.remove(handleId);
+                if (component != null && component.currentActivationId() != null) {
+                    draft.activations.remove(component.currentActivationId());
+                    index.activations().remove(component.currentActivationId());
+                }
+                index.components().remove(handleId);
+                index.componentHandles().remove(handleId);
+            }
         }
 
         @Override
@@ -720,6 +824,13 @@ final class ContextDisposalCoordinatorTest {
                 ExecutableCommitPlan executable) {
             finished++;
             retiredRegistrations.addAll(executable.retiredRegistrations.keySet());
+            if (failTransitions) {
+                for (CompletableFuture<ComponentState> transition
+                        : transitions.reservationFutures()) {
+                    transition.completeExceptionally(
+                            new IllegalStateException("injected transition settlement fault"));
+                }
+            }
             String failure = markCleanupFailed
                     ? "context cleanup failed"
                     : null;

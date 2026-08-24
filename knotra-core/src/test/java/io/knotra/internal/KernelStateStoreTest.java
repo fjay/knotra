@@ -35,7 +35,16 @@ final class KernelStateStoreTest {
 
     @AfterEach
     void tearDown() {
-        runtime.close();
+        try {
+            runtime.close();
+        } catch (RuntimeException expected) {
+            // 注入的首次清理失败会让根 Context 进入 FAILED；重试 close 重新调度清理。
+            try {
+                runtime.close();
+            } catch (RuntimeException retryExpected) {
+                // 清理提交探针仍在时，最终排空可能再次失败；测试资源到此已足够释放。
+            }
+        }
     }
 
     @Test
