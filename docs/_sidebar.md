@@ -1,4 +1,3 @@
-* [简介](README.md)
 * [快速开始](quick-start.md)
 * [Beans 装配](beans-guide.md)
 * [Spring 集成](spring-guide.md)
