@@ -9,6 +9,8 @@ import io.knotra.MountHandle;
 import io.knotra.MountOptions;
 import io.knotra.NoConfig;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -41,28 +43,8 @@ public final class Beans {
     }
 
     @FunctionalInterface
-    public interface Creator1<D1, T> {
-        T create(D1 d1) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface Creator2<D1, D2, T> {
-        T create(D1 d1, D2 d2) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface Creator3<D1, D2, D3, T> {
-        T create(D1 d1, D2 d2, D3 d3) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface Creator4<D1, D2, D3, D4, T> {
-        T create(D1 d1, D2 d2, D3 d3, D4 d4) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface Creator5<D1, D2, D3, D4, D5, T> {
-        T create(D1 d1, D2 d2, D3 d3, D4 d4, D5 d5) throws Exception;
+    public interface Creator<T> {
+        T create(BeanDependencies dependencies) throws Exception;
     }
 
     @FunctionalInterface
@@ -71,28 +53,8 @@ public final class Beans {
     }
 
     @FunctionalInterface
-    public interface ConfigCreator1<C, D1, T> {
-        T create(C config, D1 d1) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface ConfigCreator2<C, D1, D2, T> {
-        T create(C config, D1 d1, D2 d2) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface ConfigCreator3<C, D1, D2, D3, T> {
-        T create(C config, D1 d1, D2 d2, D3 d3) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface ConfigCreator4<C, D1, D2, D3, D4, T> {
-        T create(C config, D1 d1, D2 d2, D3 d3, D4 d4) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface ConfigCreator5<C, D1, D2, D3, D4, D5, T> {
-        T create(C config, D1 d1, D2 d2, D3 d3, D4 d4, D5 d5) throws Exception;
+    public interface ConfigCreator<C, T> {
+        T create(C config, BeanDependencies dependencies) throws Exception;
     }
 
     @FunctionalInterface
@@ -130,395 +92,128 @@ public final class Beans {
         P map(T bean) throws Exception;
     }
 
-    public static final class Builder0 {
+    public static final class Builder {
         private final String componentId;
+        private final List<BeanDependency<?>> dependencies;
 
-        Builder0(String componentId) {
-            this.componentId = componentId;
+        Builder(String componentId) {
+            this(componentId, List.of());
         }
 
-        public <D1> Builder1<D1> with(BeanDependency<D1> dependency) {
-            return new Builder1<>(componentId, dependency);
+        private Builder(String componentId, List<BeanDependency<?>> dependencies) {
+            this.componentId = componentId;
+            this.dependencies = dependencies;
+        }
+
+        public Builder with(BeanDependency<?> dependency) {
+            Objects.requireNonNull(dependency, "dependency");
+            List<BeanDependency<?>> next = new ArrayList<>(this.dependencies.size() + 1);
+            next.addAll(this.dependencies);
+            next.add(dependency);
+            return new Builder(componentId, List.copyOf(next));
+        }
+
+        public Builder with(BeanDependency<?>... dependencies) {
+            Objects.requireNonNull(dependencies, "dependencies");
+            List<BeanDependency<?>> next = new ArrayList<>(this.dependencies.size() + dependencies.length);
+            next.addAll(this.dependencies);
+            for (BeanDependency<?> dependency : dependencies) {
+                next.add(Objects.requireNonNull(dependency, "dependency"));
+            }
+            return new Builder(componentId, List.copyOf(next));
+        }
+
+        public Builder with(Collection<? extends BeanDependency<?>> dependencies) {
+            Objects.requireNonNull(dependencies, "dependencies");
+            List<BeanDependency<?>> next = new ArrayList<>(this.dependencies.size() + dependencies.size());
+            next.addAll(this.dependencies);
+            for (BeanDependency<?> dependency : dependencies) {
+                next.add(Objects.requireNonNull(dependency, "dependency"));
+            }
+            return new Builder(componentId, List.copyOf(next));
         }
 
         public <T> OutputStage<T> create(Creator0<T> creator) {
             Objects.requireNonNull(creator, "creator");
-            return new OutputStage<>(new BeanStage<NoConfig, T>(
+            return new OutputStage<>(new BeanStage<>(
                     componentId,
                     NoConfig.class,
-                    List.of(),
+                    dependencies,
                     (context, config) -> creator.create()));
         }
-    }
 
-    public static final class Builder1<D1> {
-        private final String componentId;
-        private final BeanDependency<D1> first;
-
-        Builder1(String componentId, BeanDependency<D1> first) {
-            this.componentId = componentId;
-            this.first = Objects.requireNonNull(first, "first");
-        }
-
-        public <D2> Builder2<D1, D2> with(BeanDependency<D2> second) {
-            return new Builder2<>(componentId, first, second);
-        }
-
-        public <T> OutputStage<T> create(Creator1<D1, T> creator) {
+        public <T> OutputStage<T> create(Creator<T> creator) {
             Objects.requireNonNull(creator, "creator");
-            return new OutputStage<>(new BeanStage<NoConfig, T>(
+            return new OutputStage<>(new BeanStage<>(
                     componentId,
                     NoConfig.class,
-                    List.of(first),
-                    (context, config) -> creator.create(first.resolve(context))));
-        }
-    }
-
-    public static final class Builder2<D1, D2> {
-        private final String componentId;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-
-        Builder2(
-                String componentId,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second) {
-            this.componentId = componentId;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-        }
-
-        public <D3> Builder3<D1, D2, D3> with(BeanDependency<D3> third) {
-            return new Builder3<>(componentId, first, second, third);
-        }
-
-        public <T> OutputStage<T> create(Creator2<D1, D2, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new OutputStage<>(new BeanStage<NoConfig, T>(
-                    componentId,
-                    NoConfig.class,
-                    List.of(first, second),
+                    dependencies,
                     (context, config) -> creator.create(
-                            first.resolve(context),
-                            second.resolve(context))));
+                            new DefaultBeanDependencies(componentId, context, dependencies))));
         }
     }
 
-    public static final class Builder3<D1, D2, D3> {
-        private final String componentId;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-        private final BeanDependency<D3> third;
-
-        Builder3(
-                String componentId,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third) {
-            this.componentId = componentId;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-            this.third = Objects.requireNonNull(third, "third");
-        }
-
-        public <D4> Builder4<D1, D2, D3, D4> with(BeanDependency<D4> fourth) {
-            return new Builder4<>(componentId, first, second, third, fourth);
-        }
-
-        public <T> OutputStage<T> create(Creator3<D1, D2, D3, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new OutputStage<>(new BeanStage<NoConfig, T>(
-                    componentId,
-                    NoConfig.class,
-                    List.of(first, second, third),
-                    (context, config) -> creator.create(
-                            first.resolve(context),
-                            second.resolve(context),
-                            third.resolve(context))));
-        }
-    }
-
-    public static final class Builder4<D1, D2, D3, D4> {
-        private final String componentId;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-        private final BeanDependency<D3> third;
-        private final BeanDependency<D4> fourth;
-
-        Builder4(
-                String componentId,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            this.componentId = componentId;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-            this.third = Objects.requireNonNull(third, "third");
-            this.fourth = Objects.requireNonNull(fourth, "fourth");
-        }
-
-        public <D5> Builder5<D1, D2, D3, D4, D5> with(BeanDependency<D5> fifth) {
-            return new Builder5<>(componentId, first, second, third, fourth, fifth);
-        }
-
-        public <T> OutputStage<T> create(Creator4<D1, D2, D3, D4, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new OutputStage<>(new BeanStage<NoConfig, T>(
-                    componentId,
-                    NoConfig.class,
-                    List.of(first, second, third, fourth),
-                    (context, config) -> creator.create(
-                            first.resolve(context),
-                            second.resolve(context),
-                            third.resolve(context),
-                            fourth.resolve(context))));
-        }
-    }
-
-    public static final class Builder5<D1, D2, D3, D4, D5> {
-        private final String componentId;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-        private final BeanDependency<D3> third;
-        private final BeanDependency<D4> fourth;
-        private final BeanDependency<D5> fifth;
-
-        Builder5(
-                String componentId,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            this.componentId = componentId;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-            this.third = Objects.requireNonNull(third, "third");
-            this.fourth = Objects.requireNonNull(fourth, "fourth");
-            this.fifth = Objects.requireNonNull(fifth, "fifth");
-        }
-
-        public <T> OutputStage<T> create(Creator5<D1, D2, D3, D4, D5, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new OutputStage<>(new BeanStage<NoConfig, T>(
-                    componentId,
-                    NoConfig.class,
-                    List.of(first, second, third, fourth, fifth),
-                    (context, config) -> creator.create(
-                            first.resolve(context),
-                            second.resolve(context),
-                            third.resolve(context),
-                            fourth.resolve(context),
-                            fifth.resolve(context))));
-        }
-    }
-
-    public static final class ConfigBuilder0<C> {
+    public static final class ConfigBuilder<C> {
         private final String componentId;
         private final Class<C> configType;
+        private final List<BeanDependency<?>> dependencies;
 
-        ConfigBuilder0(String componentId, Class<C> configType) {
-            this.componentId = componentId;
-            this.configType = Objects.requireNonNull(configType, "configType");
+        ConfigBuilder(String componentId, Class<C> configType) {
+            this(componentId, configType, List.of());
         }
 
-        public <D1> ConfigBuilder1<C, D1> with(BeanDependency<D1> dependency) {
-            return new ConfigBuilder1<>(componentId, configType, dependency);
+        private ConfigBuilder(String componentId, Class<C> configType, List<BeanDependency<?>> dependencies) {
+            this.componentId = componentId;
+            this.configType = Objects.requireNonNull(configType, "configType");
+            this.dependencies = dependencies;
+        }
+
+        public ConfigBuilder<C> with(BeanDependency<?> dependency) {
+            Objects.requireNonNull(dependency, "dependency");
+            List<BeanDependency<?>> next = new ArrayList<>(this.dependencies.size() + 1);
+            next.addAll(this.dependencies);
+            next.add(dependency);
+            return new ConfigBuilder<>(componentId, configType, List.copyOf(next));
+        }
+
+        public ConfigBuilder<C> with(BeanDependency<?>... dependencies) {
+            Objects.requireNonNull(dependencies, "dependencies");
+            List<BeanDependency<?>> next = new ArrayList<>(this.dependencies.size() + dependencies.length);
+            next.addAll(this.dependencies);
+            for (BeanDependency<?> dependency : dependencies) {
+                next.add(Objects.requireNonNull(dependency, "dependency"));
+            }
+            return new ConfigBuilder<>(componentId, configType, List.copyOf(next));
+        }
+
+        public ConfigBuilder<C> with(Collection<? extends BeanDependency<?>> dependencies) {
+            Objects.requireNonNull(dependencies, "dependencies");
+            List<BeanDependency<?>> next = new ArrayList<>(this.dependencies.size() + dependencies.size());
+            next.addAll(this.dependencies);
+            for (BeanDependency<?> dependency : dependencies) {
+                next.add(Objects.requireNonNull(dependency, "dependency"));
+            }
+            return new ConfigBuilder<>(componentId, configType, List.copyOf(next));
         }
 
         public <T> ConfigOutputStage<C, T> create(ConfigCreator0<C, T> creator) {
             Objects.requireNonNull(creator, "creator");
-            return new ConfigOutputStage<>(new BeanStage<C, T>(
+            return new ConfigOutputStage<>(new BeanStage<>(
                     componentId,
                     configType,
-                    List.of(),
+                    dependencies,
                     (context, config) -> creator.create(config)));
         }
-    }
 
-    public static final class ConfigBuilder1<C, D1> {
-        private final String componentId;
-        private final Class<C> configType;
-        private final BeanDependency<D1> first;
-
-        ConfigBuilder1(
-                String componentId,
-                Class<C> configType,
-                BeanDependency<D1> first) {
-            this.componentId = componentId;
-            this.configType = configType;
-            this.first = Objects.requireNonNull(first, "first");
-        }
-
-        public <D2> ConfigBuilder2<C, D1, D2> with(BeanDependency<D2> second) {
-            return new ConfigBuilder2<>(componentId, configType, first, second);
-        }
-
-        public <T> ConfigOutputStage<C, T> create(ConfigCreator1<C, D1, T> creator) {
+        public <T> ConfigOutputStage<C, T> create(ConfigCreator<C, T> creator) {
             Objects.requireNonNull(creator, "creator");
-            return new ConfigOutputStage<>(new BeanStage<C, T>(
+            return new ConfigOutputStage<>(new BeanStage<>(
                     componentId,
                     configType,
-                    List.of(first),
-                    (context, config) -> creator.create(config, first.resolve(context))));
-        }
-    }
-
-    public static final class ConfigBuilder2<C, D1, D2> {
-        private final String componentId;
-        private final Class<C> configType;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-
-        ConfigBuilder2(
-                String componentId,
-                Class<C> configType,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second) {
-            this.componentId = componentId;
-            this.configType = configType;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-        }
-
-        public <D3> ConfigBuilder3<C, D1, D2, D3> with(BeanDependency<D3> third) {
-            return new ConfigBuilder3<>(componentId, configType, first, second, third);
-        }
-
-        public <T> ConfigOutputStage<C, T> create(ConfigCreator2<C, D1, D2, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new ConfigOutputStage<>(new BeanStage<C, T>(
-                    componentId,
-                    configType,
-                    List.of(first, second),
+                    dependencies,
                     (context, config) -> creator.create(
                             config,
-                            first.resolve(context),
-                            second.resolve(context))));
-        }
-    }
-
-    public static final class ConfigBuilder3<C, D1, D2, D3> {
-        private final String componentId;
-        private final Class<C> configType;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-        private final BeanDependency<D3> third;
-
-        ConfigBuilder3(
-                String componentId,
-                Class<C> configType,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third) {
-            this.componentId = componentId;
-            this.configType = configType;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-            this.third = Objects.requireNonNull(third, "third");
-        }
-
-        public <D4> ConfigBuilder4<C, D1, D2, D3, D4> with(BeanDependency<D4> fourth) {
-            return new ConfigBuilder4<>(componentId, configType, first, second, third, fourth);
-        }
-
-        public <T> ConfigOutputStage<C, T> create(ConfigCreator3<C, D1, D2, D3, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new ConfigOutputStage<>(new BeanStage<C, T>(
-                    componentId,
-                    configType,
-                    List.of(first, second, third),
-                    (context, config) -> creator.create(
-                            config,
-                            first.resolve(context),
-                            second.resolve(context),
-                            third.resolve(context))));
-        }
-    }
-
-    public static final class ConfigBuilder4<C, D1, D2, D3, D4> {
-        private final String componentId;
-        private final Class<C> configType;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-        private final BeanDependency<D3> third;
-        private final BeanDependency<D4> fourth;
-
-        ConfigBuilder4(
-                String componentId,
-                Class<C> configType,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth) {
-            this.componentId = componentId;
-            this.configType = configType;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-            this.third = Objects.requireNonNull(third, "third");
-            this.fourth = Objects.requireNonNull(fourth, "fourth");
-        }
-
-        public <D5> ConfigBuilder5<C, D1, D2, D3, D4, D5> with(BeanDependency<D5> fifth) {
-            return new ConfigBuilder5<>(componentId, configType, first, second, third, fourth, fifth);
-        }
-
-        public <T> ConfigOutputStage<C, T> create(ConfigCreator4<C, D1, D2, D3, D4, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new ConfigOutputStage<>(new BeanStage<C, T>(
-                    componentId,
-                    configType,
-                    List.of(first, second, third, fourth),
-                    (context, config) -> creator.create(
-                            config,
-                            first.resolve(context),
-                            second.resolve(context),
-                            third.resolve(context),
-                            fourth.resolve(context))));
-        }
-    }
-
-    public static final class ConfigBuilder5<C, D1, D2, D3, D4, D5> {
-        private final String componentId;
-        private final Class<C> configType;
-        private final BeanDependency<D1> first;
-        private final BeanDependency<D2> second;
-        private final BeanDependency<D3> third;
-        private final BeanDependency<D4> fourth;
-        private final BeanDependency<D5> fifth;
-
-        ConfigBuilder5(
-                String componentId,
-                Class<C> configType,
-                BeanDependency<D1> first,
-                BeanDependency<D2> second,
-                BeanDependency<D3> third,
-                BeanDependency<D4> fourth,
-                BeanDependency<D5> fifth) {
-            this.componentId = componentId;
-            this.configType = configType;
-            this.first = Objects.requireNonNull(first, "first");
-            this.second = Objects.requireNonNull(second, "second");
-            this.third = Objects.requireNonNull(third, "third");
-            this.fourth = Objects.requireNonNull(fourth, "fourth");
-            this.fifth = Objects.requireNonNull(fifth, "fifth");
-        }
-
-        public <T> ConfigOutputStage<C, T> create(
-                ConfigCreator5<C, D1, D2, D3, D4, D5, T> creator) {
-            Objects.requireNonNull(creator, "creator");
-            return new ConfigOutputStage<>(new BeanStage<C, T>(
-                    componentId,
-                    configType,
-                    List.of(first, second, third, fourth, fifth),
-                    (context, config) -> creator.create(
-                            config,
-                            first.resolve(context),
-                            second.resolve(context),
-                            third.resolve(context),
-                            fourth.resolve(context),
-                            fifth.resolve(context))));
+                            new DefaultBeanDependencies(componentId, context, dependencies))));
         }
     }
 
@@ -761,13 +456,13 @@ public final class Beans {
     }
 
     /** 创建无配置 Bean 定义的流式构建器。 */
-    public static Builder0 component(String componentId) {
-        return new Builder0(requireComponentId(componentId));
+    public static Builder component(String componentId) {
+        return new Builder(requireComponentId(componentId));
     }
 
     /** 创建带类型化配置的 Bean 定义流式构建器。 */
-    public static <C> ConfigBuilder0<C> component(String componentId, Class<C> configType) {
-        return new ConfigBuilder0<>(requireComponentId(componentId), configType);
+    public static <C> ConfigBuilder<C> component(String componentId, Class<C> configType) {
+        return new ConfigBuilder<>(requireComponentId(componentId), configType);
     }
 
     public static <T> OutputStage<T> expert(

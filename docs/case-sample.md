@@ -1,19 +1,20 @@
-# 实战案例：动态营销折扣引擎
+# 实战案例
 
-本案例展示如何在实际业务中运用 Knotra 构建一个**零停机、支持秒级策略热替换、在途订单一致性保障**的营销折扣引擎。
+本章通过完整的生产级业务案例，展示如何在真实业务场景中运用 Knotra 构建**零停机、秒级热替换、在途一致性保障与灰度隔离**的动态系统。
 
 ---
 
-## 业务背景与架构痛点
+# 动态营销折扣引擎
+
+## 业务场景与架构痛点
 
 电商大促期间，营销策略需要根据实时的库存、大促阶段（预热、开门红、狂欢）快速调整规则：
-* **不能重启应用**：大促期间流量巨大，重启服务会导致网关抖动、连接重连与在途流量丢失。
-* **不能跨规则撕裂**：正在计算中的订单必须在一套完整的规则下算完，不能前半段执行满减规则 A，后半段执行分层规则 B。
-* **概念澄清**：
-  * **业务订单计算（Checkout）**：指用户提交购物车并计算最终实付金额的过程。
-  * **运行时状态收敛（Settlement）**：指 Knotra 运行时完成新策略发布、在途调用排空与下游依赖同步的状态收敛。
 
----
+- **不能重启应用**：大促期间并发流量巨大，重启应用会导致网关抖动、连接重连与在途请求丢失。
+- **不能跨规则撕裂**：正在计算中的订单必须在一套完整的规则下算完，不能前半段执行满减规则 A，后半段执行分层规则 B。
+- **概念澄清**：
+  - **业务订单计算（Checkout）**：用户提交购物车并计算最终实付金额。
+  - **运行时状态收敛（Settlement）**：Knotra 运行时完成新策略发布、在途调用排空与下游依赖同步的状态收敛。
 
 ## 1. 契约设计
 
@@ -33,7 +34,7 @@ public record Discount(String ruleId, int amount, String description) {}
 public record Receipt(String orderId, int payable, String discountRule) {}
 ```
 
-由于大促期间可能会有多种类型的折扣策略（如平台大促折扣、会员积分抵扣等），使用显式命名的 `CapabilityKey`：
+定义显式命名的能力标识：
 
 ```java
 public interface PromotionContracts {
@@ -44,11 +45,10 @@ public interface PromotionContracts {
 }
 ```
 
----
-
 ## 2. 策略实现
 
 ### 基础满减策略（v1）
+
 ```java
 public record ThresholdDiscount(int threshold, int amount) implements DiscountStrategy {
     @Override
@@ -61,6 +61,7 @@ public record ThresholdDiscount(int threshold, int amount) implements DiscountSt
 ```
 
 ### 会员分层折扣策略（v2）
+
 ```java
 public record TieredCampaignDiscount(Map<String, Integer> rates) implements DiscountStrategy {
     @Override
@@ -72,11 +73,9 @@ public record TieredCampaignDiscount(Map<String, Integer> rates) implements Disc
 }
 ```
 
-策略实现遵循纯函数设计原则：无状态、无阻塞 I/O、不持久化订单上下文。
+策略实现遵循纯函数设计原则：无内部可变状态、无阻塞 I/O。
 
----
-
-## 3. 动态结算服务
+## 3. 动态结算服务与装配
 
 结算服务依赖 `DiscountStrategy`。通过 Knotra 的动态代理，当底层策略升级时，结算服务实例无需重启：
 
@@ -97,18 +96,18 @@ public final class DynamicCheckoutService implements CheckoutService {
 }
 ```
 
-使用 Beans DSL 定义并挂载结算服务：
+使用 Beans DSL 定义并声明装配规则：
 
 ```java
+var campaign = Beans.dynamic(PromotionContracts.CAMPAIGN); // 注入动态代理
+
 BeanDefinition<DynamicCheckoutService> definition = Beans
         .component("dynamic-checkout")
-        .with(Beans.dynamic(PromotionContracts.CAMPAIGN)) // 注入动态代理
-        .create(DynamicCheckoutService::new)
+        .with(campaign)
+        .create(deps -> new DynamicCheckoutService(deps.get(campaign)))
         .provideAs(CheckoutService.class)
         .build();
 ```
-
----
 
 ## 4. 运行时发布与秒级热替换
 
@@ -145,11 +144,10 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
 }
 ```
 
----
-
-## 5. 进阶场景
+## 5. 进阶场景演进
 
 ### 场景一：多步骤计算一致性（锁定租约）
+
 如果结算链路包含多个步骤（如先算折扣，再算赠品资格），要求整个请求期间策略不可变：
 
 ```java
@@ -161,7 +159,7 @@ public final class ConsistentCheckoutService {
     }
 
     public OrderResult checkout(Order order) {
-        // 在 call 回调执行期间，策略版本严格固定，即使外部发生 update 也不会在此次请求中漂移
+        // 在 call 回调执行期间，策略版本严格锁定，即使外部发生 update 也不会在此次请求中漂移
         return campaignCapability.call(strategy -> {
             Discount discount = strategy.apply(order);
             boolean giftEligible = checkGift(strategy, order);
@@ -172,27 +170,33 @@ public final class ConsistentCheckoutService {
 ```
 
 ### 场景二：批量结算 Job 绑定固定代际
-对于离线跑批或批量账单结算 Job，整批处理必须使用同一代策略，若策略更新则触发任务重载：
+
+对于离线跑批或批量账单结算 Job，整批处理必须使用同一代策略；若策略更新则触发任务重载：
 
 ```java
+var campaign = Beans.fixed(PromotionContracts.CAMPAIGN); // 使用固定代际绑定
+
 BeanDefinition<BatchSettlementJob> definition = Beans
         .component("batch-settlement")
-        .with(Beans.fixed(PromotionContracts.CAMPAIGN)) // 使用固定代际绑定
-        .create(BatchSettlementJob::new)
+        .with(campaign)
+        .create(deps -> new BatchSettlementJob(deps.get(campaign)))
         .build();
 ```
 
-提供方发生替换时，`BatchSettlementJob` 挂载点会自动进行安全重建。
+提供方发生升级时，`BatchSettlementJob` 挂载点会自动进行安全销毁与重建。
 
 ### 场景三：双策略并行与独立升级
+
 同时挂载大促折扣与积分抵扣：
 
 ```java
+var campaign = Beans.dynamic(PromotionContracts.CAMPAIGN);
+var loyalty = Beans.dynamic(PromotionContracts.LOYALTY);
+
 BeanDefinition<CompositeCheckoutService> definition = Beans
         .component("composite-checkout")
-        .with(Beans.dynamic(PromotionContracts.CAMPAIGN))
-        .with(Beans.dynamic(PromotionContracts.LOYALTY))
-        .create(CompositeCheckoutService::new)
+        .with(campaign, loyalty)
+        .create(deps -> new CompositeCheckoutService(deps.get(campaign), deps.get(loyalty)))
         .provideAs(CheckoutService.class)
         .build();
 ```
@@ -205,7 +209,7 @@ BeanDefinition<CompositeCheckoutService> definition = Beans
 DiscountStrategy currentStrategy = new ThresholdDiscount(300, 30);
 DiscountStrategy newStrategy = new BrokenStrategy();
 
-// 升级
+// 升级新版本
 PublicationChange<DiscountStrategy> change = campaign.update(newStrategy);
 SettlementReport report = change.awaitSettled(Duration.ofSeconds(10));
 
@@ -216,6 +220,7 @@ if (report.hasFailedMounts()) {
 ```
 
 ### 场景五：VIP 租户灰度隔离（Context 树）
+
 利用 Knotra 的 Context 树，可以为特定 VIP 租户发布专属折扣，而全局普通用户仍使用默认策略：
 
 ```java
@@ -235,12 +240,20 @@ Receipt regularReceipt = runtime.require(CheckoutService.class).checkout(regular
 
 ---
 
-## 6. 生产监控指标建议
+# 多渠道支付网关动态路由
 
-在生产环境中，建议采集以下指标确保动态策略的安全运行：
+## 业务场景
 
-1. **策略代际变更耗时**：监控 `change.awaitSettled(...)` 的收敛耗时。
-2. **挂载点健康状态**：统计 `ACTIVE` 与 `FAILED` 的挂载点数量。
-3. **动态代理调用失败率**：监控调用时是否存在提供方缺失（`MissingProvider`）。
-4. **固定代际重建次数**：监控 `fixed` 依赖组件的重建频次。
-5. **Context 资源回收情况**：监控灰度 Context 的创建与释放状态，防止内存泄漏。
+平台接入支付宝、微信、银联等多个支付渠道。各渠道 SDK 升级频繁且需动态接入新渠道：
+
+- 渠道组件以 PF4J 插件或独立模块形式部署。
+- 宿主统一网关通过动态路由转发支付请求。
+- 渠道插件升级或卸载时，在途支付请求平滑排空，旧 ClassLoader 完全回收。
+
+```java
+public interface PaymentGatewayRouter {
+    ChargeResult routeAndCharge(String channel, ChargeRequest request);
+}
+```
+
+使用 Knotra 结合 `ContributionRegistry` 或动态代理，新渠道挂载后立即在网关路由中可见，卸载后自动摘除，实现真正的业务不停机演进。

@@ -60,15 +60,15 @@ Knotra 通过**稳定的发布槽位**、**代际一致性**、**非阻塞在途
 
 * **业务应用开发者（初级入门）**：
   1. 阅读本文的 [极速上手](#极速上手)。
-  2. 阅读 [Beans 与 Spring 集成指南](docs/01-初级入门/01-Beans与Spring集成指南.md)。
-  3. 阅读 [实战案例：动态营销折扣引擎](docs/01-初级入门/02-实战案例-动态营销折扣引擎.md)。
+  2. 阅读 [Beans 声明式装配](docs/beans-guide.md) 与 [Spring 容器集成](docs/spring-guide.md)。
+  3. 阅读 [实战案例：动态营销折扣引擎](docs/case-sample.md)。
 * **插件与中间件开发者（中级进阶）**：
-  1. 阅读 [插件工程化手册](docs/02-中级进阶/01-插件工程化手册.md)。
-  2. 阅读 [线程模型与生产实践](docs/02-中级进阶/02-线程模型与生产实践.md)。
+  1. 阅读 [插件工程化手册](docs/plugin-guide.md)。
+  2. 阅读 [线程模型与生产实践](docs/production-practice.md)。
 * **架构师与平台开发者（高级架构）**：
-  1. 阅读 [API 与内核架构指南](docs/03-高级架构/01-API与内核架构指南.md)。
-  2. 阅读 [测试与质量保证指南](docs/03-高级架构/02-测试与质量保证指南.md)。
-  3. 阅读 [FAQ 与故障排查指南](docs/03-高级架构/03-FAQ与故障排查指南.md)。
+  1. 阅读 [API 与内核架构指南](docs/runtime-kernel.md)。
+  2. 阅读 [生产实践与排障指南](docs/production-practice.md)。
+
 
 ---
 
@@ -139,10 +139,11 @@ try (KnotraRuntime runtime = KnotraRuntime.create()) {
     firstChange.awaitSettled(Duration.ofSeconds(10));
 
     // 2. 挂载动态依赖 Greeting 的渲染组件
+    var greetingDep = Beans.dynamic(Greeting.class);
     MountHandle renderer = Beans
             .component("greeting-renderer")
-            .with(Beans.dynamic(Greeting.class))
-            .create((Greeting current) -> new GreetingRenderer(current))
+            .with(greetingDep)
+            .create(deps -> new GreetingRenderer(deps.get(greetingDep)))
             .provideAs(RenderedGreeting.class)
             .mount(runtime);
     renderer.requireActive(Duration.ofSeconds(10));
@@ -177,7 +178,7 @@ renderer instances: 1
 - `Beans.component(...).mount(runtime)`：声明式完成 Bean 的依赖绑定与挂载，返回挂载点句柄 `MountHandle`。
 - `greeting.update(...)`：原地升级槽位实现，返回对应的变更观察句柄，通过 `awaitSettled(timeout)` 等待本次变更在整个运行时的状态收敛。
 - `renderer.requireActive(Duration.ofSeconds(10))`：显式断言挂载点处于 ACTIVE 活跃状态，非活跃时抛出带有精确诊断信息的 `MountNotActiveException`。
-- **生产停机建议**：入门示例使用 `try-with-resources` 进行资源收尾，其 `close()` 方法为无界阻塞等待；生产环境中建议调用 `runtime.closeAsync()` 并配合带超时预算的 `get(timeout)`，详见 [线程模型与生产实践](docs/02-中级进阶/02-线程模型与生产实践.md)。
+- **生产停机建议**：入门示例使用 `try-with-resources` 进行资源收尾，其 `close()` 方法为无界阻塞等待；生产环境中建议调用 `runtime.closeAsync()` 并配合带超时预算的 `get(timeout)`，详见 [线程模型与生产实践](docs/production-practice.md)。
 
 ---
 

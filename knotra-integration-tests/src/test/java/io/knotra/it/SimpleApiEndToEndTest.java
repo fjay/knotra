@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@org.junit.jupiter.api.parallel.ResourceLock(IntegrationTestKit.INTEGRATION_COORDINATOR_LOCK)
 final class SimpleApiEndToEndTest {
 
     interface Gateway {
@@ -66,18 +67,20 @@ final class SimpleApiEndToEndTest {
         assertTrue(firstReport.generation() >= 0);
         assertFalse(firstReport.hasAffectedMounts());
 
+        var dynamicGateway = Beans.dynamic(Gateway.class);
         MountHandle rendererHandle = Beans
                 .component("dynamic-gateway-renderer")
-                .with(Beans.dynamic(Gateway.class))
-                .create(DynamicGatewayRenderer::new)
+                .with(dynamicGateway)
+                .create(deps -> new DynamicGatewayRenderer(deps.get(dynamicGateway)))
                 .provideAs(RenderedGreeting.class)
                 .mount(runtime);
         rendererHandle.requireActive(Duration.ofSeconds(10));
 
+        var fixedGateway = Beans.fixed(Gateway.class);
         MountHandle fixedHandle = Beans
                 .component("fixed-gateway-consumer")
-                .with(Beans.fixed(Gateway.class))
-                .create(FixedGatewayConsumer::new)
+                .with(fixedGateway)
+                .create(deps -> new FixedGatewayConsumer(deps.get(fixedGateway)))
                 .mount(runtime);
         fixedHandle.requireActive(Duration.ofSeconds(10));
 

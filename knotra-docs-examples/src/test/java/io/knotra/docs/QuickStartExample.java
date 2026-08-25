@@ -61,7 +61,7 @@ public final class QuickStartExample {
         AtomicInteger rendererInstances = new AtomicInteger();
 
         // try-with-resources 用于保持示例精简；其 close() 会无界阻塞等待停机。
-        // 生产环境应调用 closeAsync() 并使用有界 get(timeout) 等待，详见 docs/02-中级进阶/02-线程模型与生产实践.md。
+        // 生产环境应调用 closeAsync() 并使用有界 get(timeout) 等待，详见 docs/production-practice.md。
         try (KnotraRuntime runtime = KnotraRuntime.create()) {
             PublicationChange<Greeting> firstChange =
                     runtime.publish(Greeting.class, new ConstantGreeting("v1"));
@@ -71,10 +71,11 @@ public final class QuickStartExample {
             check(!firstReport.hasFailedMounts(), "first publication must not fail a mount");
             check(!firstReport.hasAffectedMounts(), "no mounts exist yet when the first value publishes");
 
+            var greetingDep = Beans.dynamic(Greeting.class);
             MountHandle renderer = Beans
                     .component("greeting-renderer")
-                    .with(Beans.dynamic(Greeting.class))
-                    .create((Greeting greeting) -> new GreetingRenderer(greeting, rendererInstances))
+                    .with(greetingDep)
+                    .create(deps -> new GreetingRenderer(deps.get(greetingDep), rendererInstances))
                     .provideAs(RenderedGreeting.class)
                     .mount(runtime);
             renderer.requireActive(timeout);

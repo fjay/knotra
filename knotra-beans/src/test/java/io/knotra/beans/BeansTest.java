@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -49,6 +50,8 @@ final class BeansTest {
     static final CapabilityKey<String> D2 = CapabilityKey.of("beans-d2", String.class);
     static final CapabilityKey<String> D3 = CapabilityKey.of("beans-d3", String.class);
     static final CapabilityKey<String> D4 = CapabilityKey.of("beans-d4", String.class);
+    static final CapabilityKey<String> D5 = CapabilityKey.of("beans-d5", String.class);
+    static final CapabilityKey<String> D6 = CapabilityKey.of("beans-d6", String.class);
     static final CapabilityKey<String> OPT = CapabilityKey.of("beans-opt", String.class);
     static final Duration WAIT = Duration.ofSeconds(10);
 
@@ -66,10 +69,11 @@ final class BeansTest {
         Publication<String> first = runtime.publish(dep, "one").publication();
         List<Service> beans = new CopyOnWriteArrayList<>();
 
+        var depHandle = Beans.fixed(dep);
         BeanDefinition<Service> definition = Beans.component("rebind-consumer")
-                .with(Beans.fixed(dep))
-                .create(value -> {
-                    Service bean = new Service(value);
+                .with(depHandle)
+                .create(deps -> {
+                    Service bean = new Service(deps.get(depHandle));
                     beans.add(bean);
                     return bean;
                 })
@@ -93,10 +97,11 @@ final class BeansTest {
     @Test
     void optionalDependencyAppearanceAndDisappearanceReactivateBean() throws Exception {
         List<String> observed = new CopyOnWriteArrayList<>();
+        var optHandle = Beans.fixedOptional(OPT);
         BeanDefinition<String> definition = Beans.component("opt-consumer")
-                .with(Beans.fixedOptional(OPT))
-                .create(value -> {
-                    String result = value.map(item -> "present:" + item).orElse("empty");
+                .with(optHandle)
+                .create(deps -> {
+                    String result = deps.get(optHandle).map(item -> "present:" + item).orElse("empty");
                     observed.add(result);
                     return result;
                 })
@@ -240,11 +245,12 @@ final class BeansTest {
     void startFailureRollsBackBeanAndStagedOutputs() throws Exception {
         CapabilityKey<Service> out = CapabilityKey.of("rollback-out", Service.class);
         List<String> readerValues = new CopyOnWriteArrayList<>();
+        var outHandle = Beans.fixed(out);
         BeanDefinition<String> reader = Beans.component("rollback-reader")
-                .with(Beans.fixed(out))
-                .create(value -> {
-                    readerValues.add(value.value);
-                    return value.value;
+                .with(outHandle)
+                .create(deps -> {
+                    readerValues.add(deps.get(outHandle).value);
+                    return deps.get(outHandle).value;
                 })
                 .build();
         MountHandle readerHandle = Beans.mount(runtime, reader);
@@ -275,11 +281,12 @@ final class BeansTest {
         CapabilityKey<Service> primary = CapabilityKey.of("atomic-primary", Service.class);
         CapabilityKey<Integer> derived = CapabilityKey.of("atomic-derived", Integer.class);
         List<String> readerValues = new CopyOnWriteArrayList<>();
+        var primaryHandle = Beans.fixed(primary);
         BeanDefinition<String> reader = Beans.component("atomic-reader")
-                .with(Beans.fixed(primary))
-                .create(value -> {
-                    readerValues.add(value.value);
-                    return value.value;
+                .with(primaryHandle)
+                .create(deps -> {
+                    readerValues.add(deps.get(primaryHandle).value);
+                    return deps.get(primaryHandle).value;
                 })
                 .build();
         MountHandle readerHandle = Beans.mount(runtime, reader);
@@ -321,11 +328,12 @@ final class BeansTest {
         assertTrue(outputError.getMessage().contains("duplicate output name 'dup-out'"));
         assertTrue(outputError.getMessage().contains("component dup-component"));
 
+        var d0Fixed = Beans.fixed(D0);
+        var d0Opt = Beans.fixedOptional(D0);
         IllegalArgumentException dependencyError = assertThrows(IllegalArgumentException.class,
                 () -> Beans.component("dup-dependency")
-                        .with(Beans.fixed(D0))
-                        .with(Beans.fixedOptional(D0))
-                        .create((String value, java.util.Optional<String> ignored) -> value)
+                        .with(d0Fixed, d0Opt)
+                        .create(deps -> deps.get(d0Fixed))
                         .build());
         assertTrue(dependencyError.getMessage().contains("duplicate dependency name 'beans-d0'"));
         assertTrue(dependencyError.getMessage().contains("component dup-dependency"));
@@ -333,8 +341,8 @@ final class BeansTest {
         CapabilityKey<Object> sameAsDependency = CapabilityKey.of("beans-d0", Object.class);
         IllegalArgumentException crossError = assertThrows(IllegalArgumentException.class,
                 () -> Beans.component("cross-name")
-                        .with(Beans.fixed(D0))
-                        .create((String value) -> value)
+                        .with(d0Fixed)
+                        .create(deps -> deps.get(d0Fixed))
                         .provideAs(sameAsDependency, value -> value)
                         .build());
         assertTrue(crossError.getMessage().contains("dependency and output names conflict"));
@@ -444,13 +452,23 @@ final class BeansTest {
     }
 
     @Test
-    void noConfigCreatorAritiesShapesResolveDependenciesInOrder() throws Exception {
+    void noConfigCreatorResolvesArbitraryNumberOfDependenciesInOrder() throws Exception {
         register(D0, "0");
         register(D1, "1");
         register(D2, "2");
         register(D3, "3");
         register(D4, "4");
+        register(D5, "5");
+        register(D6, "6");
         List<String> joined = new CopyOnWriteArrayList<>();
+
+        var d0 = Beans.fixed(D0);
+        var d1 = Beans.fixed(D1);
+        var d2 = Beans.fixed(D2);
+        var d3 = Beans.fixed(D3);
+        var d4 = Beans.fixed(D4);
+        var d5 = Beans.fixed(D5);
+        var d6 = Beans.fixed(D6);
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-0")
                 .create(() -> {
@@ -460,70 +478,80 @@ final class BeansTest {
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-1")
-                .with(Beans.fixed(D0))
-                .create(v1 -> {
-                    joined.add(v1);
-                    return v1;
+                .with(d0)
+                .create(deps -> {
+                    String v = deps.get(d0);
+                    joined.add(v);
+                    return v;
                 })
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-2")
-                .with(Beans.fixed(D0))
-                .with(Beans.fixed(D1))
-                .create((v1, v2) -> {
-                    String value = v1 + v2;
+                .with(d0, d1)
+                .create(deps -> {
+                    String value = deps.get(d0) + deps.get(d1);
                     joined.add(value);
                     return value;
                 })
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-3")
-                .with(Beans.fixed(D0))
-                .with(Beans.fixed(D1))
-                .with(Beans.fixed(D2))
-                .create((v1, v2, v3) -> {
-                    String value = v1 + v2 + v3;
+                .with(d0, d1, d2)
+                .create(deps -> {
+                    String value = deps.get(d0) + deps.get(d1) + deps.get(d2);
                     joined.add(value);
                     return value;
                 })
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-4")
-                .with(Beans.fixed(D0))
-                .with(Beans.fixed(D1))
-                .with(Beans.fixed(D2))
-                .with(Beans.fixed(D3))
-                .create((v1, v2, v3, v4) -> {
-                    String value = v1 + v2 + v3 + v4;
+                .with(d0, d1, d2, d3)
+                .create(deps -> {
+                    String value = deps.get(d0) + deps.get(d1) + deps.get(d2) + deps.get(d3);
                     joined.add(value);
                     return value;
                 })
                 .build())));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-5")
-                .with(Beans.fixed(D0))
-                .with(Beans.fixed(D1))
-                .with(Beans.fixed(D2))
-                .with(Beans.fixed(D3))
-                .with(Beans.fixed(D4))
-                .create((v1, v2, v3, v4, v5) -> {
-                    String value = v1 + v2 + v3 + v4 + v5;
+                .with(d0, d1, d2, d3, d4)
+                .create(deps -> {
+                    String value = deps.get(d0) + deps.get(d1) + deps.get(d2) + deps.get(d3) + deps.get(d4);
                     joined.add(value);
                     return value;
                 })
                 .build())));
 
-        assertEquals(List.of("", "0", "01", "012", "0123", "01234"), joined);
+        // Support beyond 5 dependencies natively!
+        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime, Beans.component("arity-7")
+                .with(d0, d1, d2, d3, d4, d5, d6)
+                .create(deps -> {
+                    String value = deps.get(d0) + deps.get(d1) + deps.get(d2) + deps.get(d3)
+                            + deps.get(d4) + deps.get(d5) + deps.get(d6);
+                    joined.add(value);
+                    return value;
+                })
+                .build())));
+
+        assertEquals(List.of("", "0", "01", "012", "0123", "01234", "0123456"), joined);
     }
 
     @Test
-    void configuredCreatorAritiesShapesReceiveConfigFirst() throws Exception {
+    void configuredCreatorResolvesArbitraryNumberOfDependenciesWithConfig() throws Exception {
         register(D0, "0");
         register(D1, "1");
         register(D2, "2");
         register(D3, "3");
         register(D4, "4");
+        register(D5, "5");
         List<String> joined = new CopyOnWriteArrayList<>();
+
+        var d0 = Beans.fixed(D0);
+        var d1 = Beans.fixed(D1);
+        var d2 = Beans.fixed(D2);
+        var d3 = Beans.fixed(D3);
+        var d4 = Beans.fixed(D4);
+        var d5 = Beans.fixed(D5);
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-0", Prefix.class)
@@ -535,9 +563,9 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-1", Prefix.class)
-                        .with(Beans.fixed(D0))
-                        .create((config, v1) -> {
-                            String value = config.value() + v1;
+                        .with(d0)
+                        .create((config, deps) -> {
+                            String value = config.value() + deps.get(d0);
                             joined.add(value);
                             return value;
                         })
@@ -545,55 +573,26 @@ final class BeansTest {
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
                 Beans.component("cfg-arity-2", Prefix.class)
-                        .with(Beans.fixed(D0))
-                        .with(Beans.fixed(D1))
-                        .create((config, v1, v2) -> {
-                            String value = config.value() + v1 + v2;
+                        .with(d0, d1)
+                        .create((config, deps) -> {
+                            String value = config.value() + deps.get(d0) + deps.get(d1);
                             joined.add(value);
                             return value;
                         })
                         .build(), new Prefix("C"))));
 
         assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
-                Beans.component("cfg-arity-3", Prefix.class)
-                        .with(Beans.fixed(D0))
-                        .with(Beans.fixed(D1))
-                        .with(Beans.fixed(D2))
-                        .create((config, v1, v2, v3) -> {
-                            String value = config.value() + v1 + v2 + v3;
+                Beans.component("cfg-arity-6", Prefix.class)
+                        .with(d0, d1, d2, d3, d4, d5)
+                        .create((config, deps) -> {
+                            String value = config.value() + deps.get(d0) + deps.get(d1)
+                                    + deps.get(d2) + deps.get(d3) + deps.get(d4) + deps.get(d5);
                             joined.add(value);
                             return value;
                         })
                         .build(), new Prefix("C"))));
 
-        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
-                Beans.component("cfg-arity-4", Prefix.class)
-                        .with(Beans.fixed(D0))
-                        .with(Beans.fixed(D1))
-                        .with(Beans.fixed(D2))
-                        .with(Beans.fixed(D3))
-                        .create((config, v1, v2, v3, v4) -> {
-                            String value = config.value() + v1 + v2 + v3 + v4;
-                            joined.add(value);
-                            return value;
-                        })
-                        .build(), new Prefix("C"))));
-
-        assertEquals(ComponentState.ACTIVE, settle(Beans.mount(runtime,
-                Beans.component("cfg-arity-5", Prefix.class)
-                        .with(Beans.fixed(D0))
-                        .with(Beans.fixed(D1))
-                        .with(Beans.fixed(D2))
-                        .with(Beans.fixed(D3))
-                        .with(Beans.fixed(D4))
-                        .create((config, v1, v2, v3, v4, v5) -> {
-                            String value = config.value() + v1 + v2 + v3 + v4 + v5;
-                            joined.add(value);
-                            return value;
-                        })
-                        .build(), new Prefix("C"))));
-
-        assertEquals(List.of("C", "C0", "C01", "C012", "C0123", "C01234"), joined);
+        assertEquals(List.of("C", "C0", "C01", "C012345"), joined);
     }
 
     @Test
@@ -725,10 +724,12 @@ final class BeansTest {
                 "beans-dynamic-output", (Class<Supplier<String>>) (Class<?>) Supplier.class);
         AtomicInteger starts = new AtomicInteger();
 
+        var apiDep = Beans.dynamic(api);
         BeanDefinition<Supplier<String>> definition = Beans.component("beans-dynamic-consumer")
-                .with(Beans.dynamic(api))
-                .<Supplier<String>>create(proxy -> {
+                .with(apiDep)
+                .<Supplier<String>>create(deps -> {
                     starts.incrementAndGet();
+                    Api proxy = deps.get(apiDep);
                     return () -> proxy.value();
                 })
                 .provide(output)
@@ -791,7 +792,8 @@ final class BeansTest {
 
         BeanDefinition<Boolean> definition = Beans.component("beans-explicit-consumer")
                 .with(dependency)
-                .<Boolean>create(capability -> {
+                .<Boolean>create(deps -> {
+                    DynamicCapability<Api> capability = deps.get(dependency);
                     dynamic.set(capability);
                     return capability.available();
                 })
@@ -839,9 +841,10 @@ final class BeansTest {
 
     @Test
     void classShortcutsUseContractBinaryNameForDependenciesAndOutputs() throws Exception {
+        var apiDep = Beans.fixedOptional(Api.class);
         BeanDefinition<String> definition = Beans.component("class-shortcuts")
-                .with(Beans.fixedOptional(Api.class))
-                .create(optional -> optional.map(Api::value).orElse("none"))
+                .with(apiDep)
+                .create(deps -> deps.get(apiDep).map(Api::value).orElse("none"))
                 .provide(String.class)
                 .build();
         assertEquals(String.class.getName(), definition.outputKeys().getFirst().name());
@@ -873,7 +876,8 @@ final class BeansTest {
                     })
                     .toList();
         }
-        assertEquals(List.of("ConfiguredBeanDefinition", "BeanDefinition", "Beans", "BeanDependency"),
+        assertEquals(
+                List.of("BeanDependencies", "ConfiguredBeanDefinition", "BeanDefinition", "Beans", "BeanDependency"),
                 publicTypes);
         assertEquals(MountFactory.class,
                 BeanDefinition.class.getDeclaredMethod("asFactory").getReturnType());
@@ -894,30 +898,75 @@ final class BeansTest {
     }
 
     @Test
-    void everyBuilderExposesExactlyOneSingleDependencyWithMethod() {
-        for (Class<?> builderType : List.of(
-                Beans.Builder0.class,
-                Beans.Builder1.class,
-                Beans.Builder2.class,
-                Beans.Builder3.class,
-                Beans.Builder4.class,
-                Beans.Builder5.class,
-                Beans.ConfigBuilder0.class,
-                Beans.ConfigBuilder1.class,
-                Beans.ConfigBuilder2.class,
-                Beans.ConfigBuilder3.class,
-                Beans.ConfigBuilder4.class,
-                Beans.ConfigBuilder5.class)) {
-            var withMethods = Stream.of(builderType.getDeclaredMethods())
-                    .filter(method -> method.getName().equals("with"))
-                    .toList();
-            boolean canIncreaseArity = !builderType.getSimpleName().endsWith("5");
-            assertEquals(canIncreaseArity ? 1 : 0, withMethods.size(), builderType::toString);
-            if (canIncreaseArity) {
-                assertEquals(1, withMethods.getFirst().getParameterCount(), builderType::toString);
-            }
-        }
+    void builderSupportsChainingVarargsAndCollections() {
+        var d0 = Beans.fixed(D0);
+        var d1 = Beans.fixed(D1);
+        var d2 = Beans.fixed(D2);
+
+        BeanDefinition<String> chained = Beans.component("chained")
+                .with(d0)
+                .with(d1)
+                .with(d2)
+                .create(deps -> "ok")
+                .build();
+        assertEquals(3, chained.dependencies().size());
+
+        BeanDefinition<String> varargs = Beans.component("varargs")
+                .with(d0, d1, d2)
+                .create(deps -> "ok")
+                .build();
+        assertEquals(3, varargs.dependencies().size());
+
+        BeanDefinition<String> collection = Beans.component("collection")
+                .with(List.of(d0, d1, d2))
+                .create(deps -> "ok")
+                .build();
+        assertEquals(3, collection.dependencies().size());
+
+        ConfiguredBeanDefinition<Prefix, String> cfgVarargs = Beans.component("cfg-varargs", Prefix.class)
+                .with(d0, d1, d2)
+                .create((config, deps) -> config.value())
+                .build();
+        assertEquals(3, cfgVarargs.dependencies().size());
     }
+
+    @Test
+    void undeclaredDependencyResolutionThrowsIllegalArgumentException() throws Exception {
+        register(D0, "0");
+        var declared = Beans.fixed(D0);
+        var undeclared = Beans.fixed(D1);
+
+        BeanDefinition<String> definition = Beans.component("undeclared-consumer")
+                .with(declared)
+                .create(deps -> deps.get(undeclared))
+                .build();
+
+        MountHandle handle = definition.mount(runtime);
+        assertEquals(ComponentState.FAILED, settle(handle));
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().anyMatch(d ->
+                d.code() == DiagnosticCode.ACTIVATION_FAILED
+                        && d.message().contains("dependency was not declared in .with(...) for component 'undeclared-consumer'")
+                        && d.message().contains("beans-d1")));
+    }
+
+    @Test
+    void differentDependencyInstanceWithSameKeyIsRejectedIfUndeclared() throws Exception {
+        register(D0, "0");
+        var declared = Beans.fixed(D0);
+        var undeclaredSameKey = Beans.fixed(D0);
+
+        BeanDefinition<String> definition = Beans.component("same-key-diff-instance")
+                .with(declared)
+                .create(deps -> deps.get(undeclaredSameKey))
+                .build();
+
+        MountHandle handle = definition.mount(runtime);
+        assertEquals(ComponentState.FAILED, settle(handle));
+        assertTrue(runtime.advanced().snapshot().diagnostics().stream().anyMatch(d ->
+                d.code() == DiagnosticCode.ACTIVATION_FAILED
+                        && d.message().contains("dependency was not declared in .with(...) for component 'same-key-diff-instance'")));
+    }
+
     @Test
     void happyPathDslAllowsDirectMountAndProvideAsClassAndRuntimeRequire() throws Exception {
         interface Greeting {
@@ -938,10 +987,11 @@ final class BeansTest {
                 .publish(Greeting.class, new ConstantGreeting("Hello"))
                 .publication();
 
+        var greetingDep = Beans.fixed(Greeting.class);
         MountHandle renderer = Beans
                 .component("greeting-renderer")
-                .with(Beans.fixed(Greeting.class))
-                .create(GreetingRenderer::new)
+                .with(greetingDep)
+                .create(deps -> new GreetingRenderer(deps.get(greetingDep)))
                 .provideAs(RenderedGreeting.class)
                 .mount(runtime);
 
@@ -956,7 +1006,6 @@ final class BeansTest {
         assertEquals("Hi Knotra",
                 runtime.root().view().require(RenderedGreeting.class).render("Knotra"));
     }
-
 
     private ComponentState settle(MountHandle handle) throws Exception {
         return handle.whenSettled().toCompletableFuture().get(10, TimeUnit.SECONDS);

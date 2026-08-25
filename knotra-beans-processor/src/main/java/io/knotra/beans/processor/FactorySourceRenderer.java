@@ -5,7 +5,7 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 
-/** 将校验后的 Bean 模型渲染为确定性的工厂源码。 */
+/** 将校验后的 Bean 模型渲染为统一调用 Beans Fluent DSL 的确定性工厂源码。 */
 final class FactorySourceRenderer {
 
     private final ValidationContext context;
@@ -16,8 +16,7 @@ final class FactorySourceRenderer {
 
     String render(BeanModel model, String packageName, String generatedSimpleName) {
         StringBuilder source = renderHeader(model, packageName, generatedSimpleName);
-        renderDependencyConstants(source, model, generatedSimpleName);
-        renderDependencies(source, model);
+        renderDependencyConstants(source, model);
         renderConstructor(source, model, generatedSimpleName);
         renderAccessors(source, model, generatedSimpleName);
         return source.append("}\n").toString();
@@ -38,22 +37,21 @@ final class FactorySourceRenderer {
         if (isConfigured(model)) {
             source.append("import io.knotra.beans.ConfiguredBeanDefinition;\n");
         }
-        source.append("\nimport java.util.List;\n\n");
-        return source.append("public final class ").append(generatedSimpleName).append(" {\n\n");
+        source.append("\npublic final class ").append(generatedSimpleName).append(" {\n\n");
+        return source;
     }
 
     private void renderDependencyConstants(
             StringBuilder source,
-            BeanModel model,
-            String generatedSimpleName) {
-        int dependencyIndex = 0;
+            BeanModel model) {
+        int keyIndex = 0;
         for (ParameterInfo parameter : model.parameters()) {
             if (parameter.kind() == ParameterKind.CONFIG) {
                 continue;
             }
             source.append("    private static final CapabilityKey<")
                     .append(qualifiedTypeName(parameter.keyType()))
-                    .append("> KEY_").append(dependencyIndex++)
+                    .append("> KEY_").append(keyIndex++)
                     .append(" = CapabilityKey.of(")
                     .append(stringLiteral(parameter.name())).append(",\n")
                     .append("            ")
@@ -70,39 +68,41 @@ final class FactorySourceRenderer {
                     .append("            ")
                     .append(erasedClassLiteral(output.contract())).append(");\n");
         }
-    }
 
-    private void renderDependencies(StringBuilder source, BeanModel model) {
-        source.append("\n    private static final List<BeanDependency<?>> DEPENDENCIES = ");
-        if (model.parameters().stream().noneMatch(parameter -> parameter.kind() != ParameterKind.CONFIG)) {
-            source.append("List.of();\n");
-            return;
-        }
-
-        source.append("List.of(\n");
-        boolean first = true;
-        int dependencyIndex = 0;
+        int depIndex = 0;
+        boolean hasDependencies = false;
         for (ParameterInfo parameter : model.parameters()) {
             if (parameter.kind() == ParameterKind.CONFIG) {
                 continue;
             }
-            if (!first) {
-                source.append(",\n");
+            if (!hasDependencies) {
+                source.append("\n");
+                hasDependencies = true;
             }
-            first = false;
-            source.append("            Beans.");
+            source.append("    private static final ");
             if (parameter.kind() == ParameterKind.FIXED) {
-                source.append("fixed");
+                source.append("BeanDependency<")
+                        .append(qualifiedTypeName(parameter.keyType()))
+                        .append("> DEP_").append(depIndex)
+                        .append(" = Beans.fixed(KEY_").append(depIndex).append(");\n");
             } else if (parameter.kind() == ParameterKind.OPTIONAL) {
-                source.append("fixedOptional");
+                source.append("BeanDependency<java.util.Optional<")
+                        .append(qualifiedTypeName(parameter.keyType()))
+                        .append(">> DEP_").append(depIndex)
+                        .append(" = Beans.fixedOptional(KEY_").append(depIndex).append(");\n");
             } else if (parameter.required()) {
-                source.append("dynamic");
+                source.append("BeanDependency<")
+                        .append(qualifiedTypeName(parameter.keyType()))
+                        .append("> DEP_").append(depIndex)
+                        .append(" = Beans.dynamic(KEY_").append(depIndex).append(");\n");
             } else {
-                source.append("dynamicOptional");
+                source.append("BeanDependency<")
+                        .append(qualifiedTypeName(parameter.keyType()))
+                        .append("> DEP_").append(depIndex)
+                        .append(" = Beans.dynamicOptional(KEY_").append(depIndex).append(");\n");
             }
-            source.append("(KEY_").append(dependencyIndex++).append(')');
+            depIndex++;
         }
-        source.append(");\n");
     }
 
     private void renderConstructor(
@@ -114,44 +114,77 @@ final class FactorySourceRenderer {
         boolean configured = isConfigured(model);
         String configName = configured ? qualifiedTypeName(model.configType()) : null;
         String beanTypeName = qualifiedTypeName(type.asType());
+        long depCount = model.parameters().stream()
+                .filter(p -> p.kind() != ParameterKind.CONFIG)
+                .count();
 
         source.append("\n    private final ");
         appendDefinitionType(source, model, configName, beanTypeName);
         source.append(" definition;\n\n");
         source.append("    public ").append(generatedSimpleName).append("() {\n");
-        source.append("        this.definition = ");
-        source.append("Beans.expert(\n");
-        source.append("                ").append(stringLiteral(model.id())).append(",\n");
+        source.append("        this.definition = Beans.component(")
+                .append(stringLiteral(model.id()));
         if (configured) {
-            source.append("                ").append(configName).append(".class,\n");
+            source.append(", ").append(configName).append(".class");
         }
-        source.append("                DEPENDENCIES,\n");
-        source.append("                ");
-        source.append(configured ? "(context, config) -> new " : "context -> new ")
-                .append(beanName).append("(\n");
+        source.append(")\n");
 
-        boolean first = true;
-        int dependencyIndex = 0;
-        for (ParameterInfo parameter : model.parameters()) {
-            if (!first) {
-                source.append(",\n");
-            }
-            first = false;
-            if (parameter.kind() == ParameterKind.CONFIG) {
-                source.append("                        config");
-            } else {
-                String key = "KEY_" + dependencyIndex++;
-                source.append("                        ");
-                if (parameter.kind() == ParameterKind.FIXED) {
-                    source.append("context.require(").append(key).append(')');
-                } else if (parameter.kind() == ParameterKind.OPTIONAL) {
-                    source.append("context.find(").append(key).append(')');
-                } else {
-                    source.append("context.subscribe(").append(key).append(").proxy()");
+        if (depCount > 0) {
+            source.append("                .with(\n");
+            boolean firstDep = true;
+            for (int i = 0; i < depCount; i++) {
+                if (!firstDep) {
+                    source.append(",\n");
                 }
+                firstDep = false;
+                source.append("                        DEP_").append(i);
+            }
+            source.append(")\n");
+        }
+
+        source.append("                .create(");
+        if (configured) {
+            if (depCount == 0) {
+                if (model.parameters().isEmpty()) {
+                    source.append("config -> new ").append(beanName).append("()");
+                } else {
+                    source.append("config -> new ").append(beanName).append("(config)");
+                }
+            } else {
+                source.append("(config, deps) -> new ").append(beanName).append("(\n");
+                boolean first = true;
+                int dependencyIndex = 0;
+                for (ParameterInfo parameter : model.parameters()) {
+                    if (!first) {
+                        source.append(",\n");
+                    }
+                    first = false;
+                    if (parameter.kind() == ParameterKind.CONFIG) {
+                        source.append("                        config");
+                    } else {
+                        source.append("                        deps.get(DEP_").append(dependencyIndex++).append(")");
+                    }
+                }
+                source.append(")");
+            }
+        } else {
+            if (depCount == 0) {
+                source.append("() -> new ").append(beanName).append("()");
+            } else {
+                source.append("deps -> new ").append(beanName).append("(\n");
+                boolean first = true;
+                int dependencyIndex = 0;
+                for (ParameterInfo parameter : model.parameters()) {
+                    if (!first) {
+                        source.append(",\n");
+                    }
+                    first = false;
+                    source.append("                        deps.get(DEP_").append(dependencyIndex++).append(")");
+                }
+                source.append(")");
             }
         }
-        source.append("))\n");
+        source.append(")\n");
 
         for (int index = 0; index < model.outputs().size(); index++) {
             source.append("                .provideAs(OUTPUT_").append(index)
