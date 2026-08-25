@@ -1,8 +1,22 @@
 # 运行时内核架构
 
-本指南面向框架与平台架构师，深入剖析 Knotra 的内核领域模型、代际绑定机制、高级结构事务、Context 树以及事件总线。
+本指南面向框架与平台架构师，深入剖析 Knotra 的架构分层、内核领域模型、与既有方案对比、代际绑定机制、高级结构事务、Context 树以及模块分工。
 
-## 核心领域模型与架构哲学
+---
+
+# 架构对比与领域模型
+
+## 与既有动态化方案对比
+
+| 维度 | Spring 动态配置 / 策略模式 | 传统 PF4J / 自定义 ClassLoader | OSGi 规范体系 | Knotra 动态运行时 |
+|---|---|---|---|---|
+| **热替换粒度** | 依赖配置中心刷新 Bean 内部字段，无法热卸载/替换类 | 插件级粗粒度加载，缺乏组件间微观依赖管理 | 模块（Bundle）级，概念与配置极其繁琐 | **细粒度槽位（Publication）与挂载点（Mount）** |
+| **在途流量保护** | 无原生保护，并发请求可能读到半更新状态 | 强行卸载易引发在途请求异常 | 依赖生命周期钩子，排空逻辑需自行实现 | **原生非阻塞排空（Drain Lease）**：新老流量平滑交接 |
+| **依赖感知与收敛** | 需手写监听器重新注入或刷新 Context | 无法自动感知跨插件细粒度依赖变化 | 依赖解析复杂，状态转换容易卡死 | **代际依赖跟踪**：提供方更新后自动透明路由或原子重建 |
+| **ClassLoader 回收** | 不涉及类卸载 | 极易发生类加载器引用泄漏导致 OOM | 机制沉重，学习曲线陡峭 | **纯数据快照与有界诊断**：框架不持久持有类引用，保证彻底 GC |
+| **上手门槛** | 低 | 中 | 极高 | **低**：提供与 Spring / POJO 高度贴合的 Fluent DSL |
+
+## 四对核心领域模型
 
 在 JVM 动态组件运行时中，核心难题在于**如何调和“长期稳定的服务访问”与“单向演进的不可变代际”之间的矛盾**。Knotra 通过以下四对核心抽象清晰界定了生命周期边界：
 
@@ -31,7 +45,22 @@ graph LR
 * **操作级收敛（Settlement）**：由 `Publication` 以及结构事务返回，递归覆盖本次操作触发的**受管子树与影响集**，确保变更在全局拓扑中平稳收敛。
 * **挂载点自身过渡（Mount Transition）**：`MountHandle.whenSettled()` 仅等待该挂载点自身的状态过渡（返回 `ComponentState`），不等待其拥有的子节点。这种设计允许父挂载点率先进入 ACTIVE 状态，从而让子节点能够及时消费父节点输出的能力，彻底杜绝父子节点互相等待导致的死锁。
 
-## API 三层分层体系
+### 4. 核心概念速查表
+
+| 核心概念 | 官方语义 | 直觉比喻 | 业务理解 |
+|---|---|---|---|
+| **`Capability`** | 类型化命名服务契约 | **电视频道协议** | 定义服务能力，不绑定具体实现。 |
+| **`Publication<T>`** | 稳定发布槽位 | **电视机频道** | 长期存在的稳定槽位，支持随时推送新版本。 |
+| **注册代际（registration generation）** | 内核已提交的具体能力代际 | **当前播放的具体节目** | `Publication.update` 推进代际；旧代际随排空退场。 |
+| **`MountHandle`** | 稳定的逻辑挂载点 | **墙上的多功能插座** | 业务逻辑挂载的位置，多次重启或重配置身份不变。 |
+| **`Activation`** | 一次运行时的激活尝试 | **通电运转的电器** | 每次启动产生的具体实例，捕获当时的依赖与配置。 |
+| **`Settlement`** | 单次操作的传播与排空收敛 | **变更平滑生效并稳定** | 描述单次变更引起的依赖传播、排空与子树初始化全部完成。 |
+| **`Beans.dynamic()`** | 动态接口代理注入 | **前台总机电话** | 自动路由到最新实现；提供方升级时消费方无需重启。 |
+| **`Beans.fixed()`** | 固定代际依赖注入 | **签署固定版本合同** | 绑定提供方特定代际；提供方升级时消费方安全重建。 |
+
+---
+
+# API 三层分层体系
 
 ```mermaid
 graph TD
@@ -43,9 +72,37 @@ graph TD
     I --> C
 ```
 
-1. **Simple API（业务层）**：开箱即用。使用 `Class<T>` 作为能力标识，通过 `Publication<T>` 进行发布与更新，使用 Fluent Beans DSL 挂载组件，通过 `MountHandle` 管理生命周期。
-2. **Advanced API（平台层）**：结构控制。通过 `runtime.advanced()` 进入，提供多操作原子结构事务、多租户 Context 树隔离与无引用的全量纯数据快照（`RuntimeSnapshot`）。
-3. **SPI（扩展层）**：底层插件开发。直接实现 `Component<C>` 与 `ComponentFactory<C>`，通过 `ActivationContext` 注册受控生命周期资源。
+| 层次 | 目标使用者 | 核心类与入口 | 设计边界与原则 |
+|---|---|---|---|
+| **Simple API** | 日常业务开发 | `KnotraRuntime`、`Publication`、`Beans`、`MountHandle` | 零事务概念、无原始代际操纵、无底层配置占位类型，开箱即用。 |
+| **Advanced API** | 平台与框架架构师 | `runtime.advanced()` | 支持多操作结构事务、多租户 Context 树与全量纯数据快照。注册代际是内核概念；发布走 `Publication`，事务内暂存走 `tx.provide`。 |
+| **SPI** | 插件与扩展开发者 | `Component`、`ComponentFactory`、`ActivationContext` | 直接实现底层生命周期，管理原生资源并遵循 ClassLoader 隔离规则。 |
+
+---
+
+# 模块分工全景
+
+| 模块名 | 职责与定位 | 核心特性 |
+|---|---|---|
+| `knotra-bom` | 版本依赖集中管理 BOM | 统一定义组件依赖版本 |
+| `knotra-starter` | 普通应用快速接入 Starter | 聚合 Core 与 Beans 模块 |
+| `knotra-core` | 运行时内核 | Publication、Mount、事务、生命周期与快照 |
+| `knotra-beans` | POJO 声明式装配 Fluent DSL | 6 种依赖模式、生命周期钩子、配置型 Bean |
+| `knotra-beans-processor` | 编译期注解处理器 | 编译期生成工厂代码，零运行时反射 |
+| `knotra-events` | 进程内类型化事件总线 | 5 种分发模式（Sync/Parallel/Serial/Bail/Waterfall）、在途排空 |
+| `knotra-spring` | Spring 容器集成适配器 | 独立子容器隔离挂载、宿主单例动态桥接 |
+| `knotra-spring-starter` | Spring 应用快速接入 Starter | 聚合 Starter 与 Spring 适配 |
+| `knotra-pf4j-spi` | 插件受控工厂 SPI | 插件导出组件工厂契约 |
+| `knotra-pf4j` | PF4J 插件动态加载与隔离 | 插件加载、在途排空、ClassLoader 隔离与回收 |
+| `knotra-loader` | 声明式期望树调和器 | 期望组件拓扑树 Diff 与原子收敛 |
+| `knotra-pf4j-loader` | PF4J 插件目录桥接 | 插件目录解析至 Loader 期望树 |
+| `knotra-pf4j-starter` | 插件化应用一站式 Starter | 聚合 PF4J 与 Loader 模块 |
+| `knotra-integration-tests` | 跨模块全链路集成测试 | 验证跨模块端到端协同与并发排空 |
+| `knotra-docs-examples` | 文档示例代码与权威规范守卫测试 | 保证文档代码即真源，通过单元测试防护 |
+
+---
+
+# 进阶功能实战
 
 ## 高级结构事务
 
