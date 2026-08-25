@@ -90,13 +90,12 @@ Knotra 是面向 Java 21+ 的 JVM 动态组件运行时。应用在运行期间�
 
 # 文档导航
 
-- [快速开始](docs/quick-start.md)：从依赖引入、契约定义、组件装配到平滑热替换的完整路径
-- [Beans 装配](docs/beans-guide.md)：Beans DSL、6 种依赖注入模式、生命周期管理与编译期注解处理器
-- [Spring 集成](docs/spring-guide.md)：Spring 子容器隔离挂载与 Spring Boot 宿主单例动态桥
-- [插件工程](docs/plugin-guide.md)：三层工程结构、受控工厂导出、声明式调和与 ClassLoader 防泄漏红线
-- [运行时内核](docs/runtime-kernel.md)：领域模型、API 三层体系、高级结构事务、Context 树与事件总线
+- [Beans 声明式装配](docs/beans-guide.md)：Beans DSL、6 种依赖注入模式、生命周期管理与编译期注解处理器
+- [Spring 容器集成](docs/spring-guide.md)：Spring 子容器隔离挂载与 Spring Boot 宿主单例动态桥
+- [插件工程化手册](docs/plugin-guide.md)：三层工程结构、受控工厂导出、声明式调和与 ClassLoader 防泄漏红线
+- [运行时内核架构](docs/runtime-kernel.md)：领域模型、API 三层体系、高级结构事务、Context 树与事件总线
 - [生产实践与排障](docs/production-practice.md)：执行边界、超时预算、优雅停机、挂起诊断、测试规范与 FAQ
-- [实战案例](docs/case-sample.md)：动态营销折扣引擎、一致性租约、批量结算与多租户灰度隔离
+- [实战案例](docs/case-sample.md)：动态营销折扣引擎、多渠道支付网关、数据批处理与事件驱动流水线
 
 ---
 
